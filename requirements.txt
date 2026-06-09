@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+pydantic[email]
+google-cloud-bigquery
+google-cloud-aiplatform
+anthropic
+python-dotenv
+requests
+python-jose[cryptography]
+rapidfuzz

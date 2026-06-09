@@ -1,0 +1,24 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Secrets
+.env
+env.yaml
+
+# Logs
+*.log
+uvicorn.log
+
+# VS Code
+.vscode/
+
+# Swap files
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+y/
