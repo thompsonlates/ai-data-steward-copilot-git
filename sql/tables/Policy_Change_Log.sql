@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS `api-project-503305938314.ai_data_steward_mvp.Policy_
   policy_version STRING,
 
   change_type STRING,
+  changed_at TIMESTAMP,
   change_summary STRING,
   change_reason STRING,
   changed_field STRING,
