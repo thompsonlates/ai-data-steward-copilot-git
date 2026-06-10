@@ -20,6 +20,23 @@ AddressValidationStatus = str
 PostalMatchLevel = str
 OverrideReasonCode = str
 
+#-----------------------------------
+# Search result models
+# These models represent the structure of search results returned by the API.
+# They include fields for record identifiers, domain, display name, source system, and golden record flag.
+#-------------------------------------
+
+class RecordSearchResult(BaseModel):
+    record_id: str
+    mdm_id: str | None = None
+    domain: str
+    display_name: str | None = None
+    source_system: str | None = None
+    golden_record_flag: bool | None = None
+    record: dict | None = None  # Optional full record data for advanced use cases
+
+class RecordSearchResponse(BaseModel):
+    results: list[RecordSearchResult]
 
 # -------------------------------------------------------------------
 # Base reusable models

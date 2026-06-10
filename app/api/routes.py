@@ -5,6 +5,10 @@ from difflib import SequenceMatcher
 from typing import Optional
 import logging
 
+from app.services.record_search_service import RecordSearchService
+from app.api.schemas import RecordSearchResponse
+record_search_service = RecordSearchService()
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 router = APIRouter()
 
@@ -693,6 +697,55 @@ def get_dq_metrics_overview(
             status_code=500,
             detail=f"Failed to load DQ overview: {str(e)}",
         )
+
+@router.get("/records/search",
+    response_model=RecordSearchResponse,
+)
+async def search_records(
+    domain: str,
+    q: str,
+):
+
+    rows = record_search_service.search_records(
+        domain=domain,
+        search_text=q,
+    )
+
+    return {
+        "results": [
+            {
+                "record_id": row["record_id"],
+                "mdm_id": row["mdm_id"],
+                "domain": row["domain"],
+                "display_name": row["display_name"],
+                "source_system": row["source_system"],
+                "golden_record_flag": row["golden_record_flag"],
+                "record": {
+                    "member_id": row.get("member_id"),
+                    "patient_id": row.get("patient_id"),
+                    "provider_id": row.get("provider_id"),
+                    "supplier_id": row.get("supplier_id"),
+                    "product_id": row.get("product_id"),
+                    "first_name": row.get("first_name"),
+                    "last_name": row.get("last_name"),
+                    "email": row.get("email"),
+                    "address": row.get("address"),
+                    "dob": row.get("dob"),
+                    "npi": row.get("npi"),
+                    "specialty": row.get("specialty"),
+                    "tax_id": row.get("tax_id"),
+                    "gtin": row.get("gtin"),
+                    "sku": row.get("sku"),
+                    "product_name": row.get("product_name"),
+                    "product_variant": row.get("product_variant"),
+                    "effective_lot_date": row.get("effective_lot_date"),
+                    "source_system": row.get("source_system"),
+    },
+
+            }
+            for row in rows
+        ]
+    }
 
 
 @router.get("/policy/config", response_model=PolicyConfigResponse)
