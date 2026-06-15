@@ -1,4 +1,4 @@
-CREATE OR REPLACE VIEW `api-project-503305938314.ai_data_steward_mvp.<VIEW_NAME>` AS
+CREATE OR REPLACE VIEW `api-project-503305938314.ai_data_steward_mvp.V_GOVERNANCE_INTELLIGENCE` AS
 WITH latest_certification AS (
   SELECT
     dataset_id,

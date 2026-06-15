@@ -67,11 +67,14 @@ class EntityResolutionEngine:
         "PIM": 0.85,
         "SUPPLIER_PORTAL": 0.75,
         "LEGACY": 0.60,
+        "BOCA SOUTH": 0.85,
+        "BOCA WEST": 0.85,
+        "CERNER SOUTH": 0.90,
     }
 
     DEFAULT_AUTOMATION_THRESHOLDS = {
-        "auto_merge_ready_min": 92,
-        "suggested_merge_min": 82,
+        "auto_merge_ready_min": 95,
+        "suggested_merge_min": 85,
         "review_advised_min": 65,
     }
 
@@ -92,9 +95,9 @@ class EntityResolutionEngine:
 
     DOMAIN_SIGNAL_WEIGHTS = {
         "CUSTOMER": {
-           "member_id_match": 0.30,
+           "member_id_match": 0.25,
             "name_similarity": 0.10,
-            "dob_match": 0.20,
+            "dob_match": 0.25,
             "email_match": 0.20,
             "address_similarity": 0.10,
             "source_trust": 0.05,
@@ -109,7 +112,7 @@ class EntityResolutionEngine:
             "source_trust": 0.05,
             "steward_learning": 0.05,
         },
-       "PRODUCT": {
+        "PRODUCT": {
             "product_id_match": 0.20,
             "gtin_match": 0.25,
             "sku_match": 0.15,
@@ -119,7 +122,7 @@ class EntityResolutionEngine:
             "source_trust": 0.05,
             "steward_learning": 0.05,
         },
-       "PROVIDER": {
+        "PROVIDER": {
             "provider_id_match": 0.25,
             "npi_match": 0.25,
             "name_similarity": 0.10,
@@ -132,10 +135,12 @@ class EntityResolutionEngine:
         "PATIENT": {
             "patient_id_match": 0.25,
             "human_id_match": 0.05,
-            "dob_match": 0.15,
-            "name_similarity": 0.15,
+            "dob_match": 0.20,
+            "name_similarity": 0.20,
             "address_similarity": 0.15,
-            "email_match": 0.25,
+            "email_match": 0.10,
+            "source_trust": 0.05,
+            "steward_learning": 0.00,
         },
     }
 
@@ -521,13 +526,21 @@ class EntityResolutionEngine:
             else 0.0
         )
 
-        patient_id_score = (
-            1.0
-            if self._normalize_text(getattr(record_a, "patient_id", None))
-            and self._normalize_text(getattr(record_a, "patient_id", None))
-            == self._normalize_text(getattr(record_b, "patient_id", None))
-            else 0.0
-        )
+        patient_id_a = getattr(record_a, "patient_id", None)
+        patient_id_b = getattr(record_b, "patient_id", None)
+
+        patient_id_a_norm = self._normalize_text(patient_id_a)
+        patient_id_b_norm = self._normalize_text(patient_id_b)
+
+        patient_id_a_base = patient_id_a_norm.split("-")[0]
+        patient_id_b_base = patient_id_b_norm.split("-")[0]
+
+        if patient_id_a_norm and patient_id_a_norm == patient_id_b_norm:
+            patient_id_score = 1.0
+        elif patient_id_a_base and patient_id_a_base == patient_id_b_base:
+            patient_id_score = 0.90
+        else:
+            patient_id_score = self._similarity(patient_id_a, patient_id_b)
 
         human_id_a = getattr(record_a, "human_id", None)
         human_id_b = getattr(record_b, "human_id", None)
@@ -598,15 +611,28 @@ class EntityResolutionEngine:
             None,
             full_name_a,
             full_name_b,
-        ).ratio()
+        )   .ratio()
 
             match_score = (
-            name_similarity_score * 0.30 +
-            email_score * 0.25 +
+            name_similarity_score * 0.25 +
+            email_score * 0.15 +
             address_score * 0.20 +
-            dob_score * 0.15 +
-            member_id_score * 0.10
+            dob_score * 0.25 +
+            member_id_score * 0.10 +
+            source_score * 0.05
         )
+            if (
+            dob_score == 1.0
+            and address_score >= 0.95
+            and name_similarity_score >= 0.85
+            ):
+                match_score = max(match_score, 0.82)
+
+            elif (
+            dob_score == 1.0
+            and name_similarity_score >= 0.90
+        ):
+                match_score = max(match_score, 0.78)
             
             signals.append(
                 self._build_signal(
@@ -646,11 +672,11 @@ class EntityResolutionEngine:
             )
 
             signals.append(
-                    self._build_signal(
-                        "address_similarity",
-                        address_score,
-                        domain_weights.get("address_similarity", 0.0),
-                        self._address_detail(
+                self._build_signal(
+                    "address_similarity",
+                    address_score,
+                    domain_weights.get("address_similarity", 0.0),
+                    self._address_detail(
                             record_a.address,
                             record_b.address,
                             address_score,
@@ -667,11 +693,24 @@ class EntityResolutionEngine:
                     email_score,
                     domain_weights.get("email_match", 0.0),
                     self._email_detail(
-                        record_a.email,
-                        record_b.email,
+                            record_a.email,
+                            record_b.email,
+                        ),
+                        match_level=email_match_level,
+                        domain_trust=domain_trust_score,
+                        signal_type="probabilistic",
+                )
+            )
+
+            signals.append(
+                self._build_signal(
+                    "source_trust",
+                    source_score,
+                    domain_weights.get("source_trust", 0.0),
+                    self._source_detail(
+                        record_a.source_system,
+                        record_b.source_system,
                     ),
-                    match_level=email_match_level,
-                    domain_trust=domain_trust_score,
                     signal_type="probabilistic",
                 )
             )
@@ -679,84 +718,155 @@ class EntityResolutionEngine:
 
         elif normalized_domain == "PRODUCT":
 
+            signals = []
+
+            product_id_a = getattr(record_a, "product_id", None)
+            product_id_b = getattr(record_b, "product_id", None)
+
+            product_name_a = getattr(record_a, "product_name", None)
+            product_name_b = getattr(record_b, "product_name", None)
+
+            product_variant_a = getattr(record_a, "product_variant", None)
+            product_variant_b = getattr(record_b, "product_variant", None)
+
+            effective_lot_date_a = getattr(record_a, "effective_lot_date", None)
+            effective_lot_date_b = getattr(record_b, "effective_lot_date", None)
+
+            gtin_a = getattr(record_a, "gtin", None)
+            gtin_b = getattr(record_b, "gtin", None)
+
+            sku_a = getattr(record_a, "sku", None)
+            sku_b = getattr(record_b, "sku", None)
+
+            product_id_score = self._similarity(product_id_a, product_id_b)
+
+            product_name_score = self._similarity(product_name_a, product_name_b)
+
+            gtin_score = (
+                    1.0
+                    if self._normalize_text(gtin_a)
+                    and self._normalize_text(gtin_a) == self._normalize_text(gtin_b)
+                    else 0.0
+                )
+
+            sku_score = self._similarity(sku_a, sku_b)
+
+            effective_lot_date_score = (
+                    1.0
+                    if self._normalize_text(effective_lot_date_a)
+                    and self._normalize_text(effective_lot_date_a)
+                    == self._normalize_text(effective_lot_date_b)
+                    else 0.0
+                )
+
             attribute_similarity_score = self._product_attribute_similarity(
-                        record_a,
-                        record_b,
-    )
-            
+                    record_a,
+                    record_b,
+                )
+
+    # Use product name score as the domain-specific name signal
+            name_score = product_name_score
+
             match_score = (
-                    gtin_score * 0.25 +
-                    product_id_score * 0.20 +
-                    sku_score * 0.15 +
-                    attribute_similarity_score * 0.25 +
-                    effective_lot_date_score * 0.15
-                )
-            
-            product_id_score = self._similarity(
-            getattr(record_a, "product_id", None),
-            getattr(record_b, "product_id", None),
-        )
-        
-            signals.append(
-                self._build_signal(
-                    "product_id_match",
-                    product_id_score,
-                    domain_weights.get("product_id_match", 0.0),
-                    self._product_id_detail(
-                        getattr(record_a, "product_id", None),
-                        getattr(record_b, "product_id", None),
-                    ),
-                )
-            )
-
-            signals.append(
-                self._build_signal(
-                    "gtin_match",
-                    gtin_score,
-                    domain_weights.get("gtin_match", 0.0),
-                    self._gtin_detail(
-                        getattr(record_a, "gtin", None),
-                        getattr(record_b, "gtin", None),
-                    ),
-                )
-            )
-
-            signals.append(
-                self._build_signal(
-                    "effective_lot_date_match",
-                    effective_lot_date_score,
-                    domain_weights.get("effective_lot_date_match", 0.0),
-                    self._effective_lot_date_detail(
-                        getattr(record_a, "effective_lot_date", None),
-                        getattr(record_b, "effective_lot_date", None),
-                    ),
-                )
-            )
-
-            signals.append(
-                self._build_signal(
-                    "sku_match",
-                    sku_score,
-                    domain_weights.get("sku_match", 0.0),
-                    self._sku_detail(
-                        getattr(record_a, "sku", None),
-                        getattr(record_b, "sku", None),
-        ),
-    )
-)
-
-            signals.append(
-                self._build_signal(
+                product_id_score * domain_weights.get("product_id_match", 0.0)
+                        + gtin_score * domain_weights.get("gtin_match", 0.0)
+                        + sku_score * domain_weights.get("sku_match", 0.0)
+                        + product_name_score * domain_weights.get("name_similarity", 0.0)
+                        + effective_lot_date_score * domain_weights.get(
+                            "effective_lot_date_match",
+                                0.0,
+                            )
+                + attribute_similarity_score * domain_weights.get(
                     "attribute_similarity",
-                    attribute_similarity_score,
-                    domain_weights.get("attribute_similarity", 0.0),
-                    self._attribute_similarity_detail(
-                        record_a,
-                        record_b,
-                    ),
+                    0.0,
+                )
+                + source_score * domain_weights.get("source_trust", 0.0)
+                + learning_score * domain_weights.get("steward_learning", 0.0)
+            )
+
+            match_score = round(match_score, 4)
+
+            signals.append(
+                    self._build_signal(
+                        "product_id_match",
+                        product_id_score,
+                        domain_weights.get("product_id_match", 0.0),
+                        self._product_id_detail(product_id_a, product_id_b),
+                        signal_type="deterministic",
+                    )
+                )
+
+            signals.append(
+                    self._build_signal(
+                        "gtin_match",
+                        gtin_score,
+                        domain_weights.get("gtin_match", 0.0),
+                        self._gtin_detail(gtin_a, gtin_b),
+                        signal_type="deterministic",
+                    )
+                )
+
+            signals.append(
+                    self._build_signal(
+                        "sku_match",
+                        sku_score,
+                        domain_weights.get("sku_match", 0.0),
+                        self._sku_detail(sku_a, sku_b),
+                        signal_type="deterministic",
+                    )
+                )
+
+            signals.append(
+                    self._build_signal(
+                        "name_similarity",
+                        product_name_score,
+                        domain_weights.get("name_similarity", 0.0),
+                        self._name_detail(
+                            product_name_a,
+                            product_variant_a,
+                            product_name_b,
+                            product_variant_b,
+                        ),
+                signal_type="probabilistic",
                 )
             )
-           
+
+            signals.append(
+                self._build_signal(
+                        "effective_lot_date_match",
+                        effective_lot_date_score,
+                        domain_weights.get("effective_lot_date_match", 0.0),
+                        self._effective_lot_date_detail(
+                            effective_lot_date_a,
+                            effective_lot_date_b,
+                        ),
+                    signal_type="deterministic",
+                    )
+                )
+
+            signals.append(
+                    self._build_signal(
+                        "attribute_similarity",
+                        attribute_similarity_score,
+                        domain_weights.get("attribute_similarity", 0.0),
+                        self._attribute_similarity_detail(record_a, record_b),
+                        signal_type="probabilistic",
+                    )
+                )
+
+            signals.append(
+                    self._build_signal(
+                        "source_trust",
+                        source_score,
+                        domain_weights.get("source_trust", 0.0),
+                        self._source_detail(
+                            record_a.source_system,
+                            record_b.source_system,
+                        ),
+                        signal_type="probabilistic",
+                    )
+                )
+
             raw_entity_score = round(match_score * risk_multiplier, 4)
             
 
@@ -768,13 +878,12 @@ class EntityResolutionEngine:
             supplier_address_similarity_score = address_score
 
             match_score = (
-                supplier_id_score * 0.60 +
-                tax_id_score * 0.20 +
-                name_score * 0.05 +
-                email_score * 0.03 +
-                supplier_address_similarity_score * 0.02 +
-                source_score * 0.05 +
-                learning_score * 0.05
+                supplier_id_score     * 0.50 +
+                tax_id_score          * 0.25 +
+                name_score            * 0.10 +
+                email_score           * 0.05 +
+                address_score         * 0.05 +
+                source_score          * 0.05
             )
             match_score = round(match_score, 2)
 
@@ -897,15 +1006,15 @@ class EntityResolutionEngine:
                     or ""
             ).strip().lower()
 
-            if provider_email_a and provider_email_b:
+        if provider_email_a and provider_email_b:
                     
-                provider_email_similarity = (SimilarityEngine.email_similarity(
+            provider_email_similarity = (SimilarityEngine.email_similarity(
                     provider_email_a,
                     provider_email_b,
                     )
                 )
-                provider_email_score = round(
-                provider_email_similarity,
+            provider_email_score = round(
+            provider_email_similarity,
                     4,
     )
                 
@@ -914,95 +1023,102 @@ class EntityResolutionEngine:
             # Domain Extraction
             # -----------------------------------------------------
 
-                provider_domain_a = ""
-                provider_domain_b = ""
+            provider_domain_a = ""
+            provider_domain_b = ""
 
-                if "@" in provider_email_a:
+            if "@" in provider_email_a:
                     provider_domain_a = provider_email_a.split("@")[1]
 
-                if "@" in provider_email_b:
+            if "@" in provider_email_b:
                         provider_domain_b = provider_email_b.split("@")[1]
 
-                # -----------------------------------------------------
-                # Domain Trust Evaluation
-                # -----------------------------------------------------
+            # -----------------------------------------------------
+            # Domain Trust Evaluation
+            # -----------------------------------------------------
 
-                provider_domain_trust_a = email_domain_trust(provider_domain_a)
-                provider_domain_trust_b = email_domain_trust(provider_domain_b)
+            provider_domain_trust_a = email_domain_trust(provider_domain_a)
+            provider_domain_trust_b = email_domain_trust(provider_domain_b)
 
                 # Conservative trust model
-                provider_domain_trust_score = min(
-                provider_domain_trust_a,
-                provider_domain_trust_b,
+            provider_domain_trust_score = min(
+            provider_domain_trust_a,
+            provider_domain_trust_b,
                 )
 
-                # -----------------------------------------------------
-                # Composite Email Score
-                # -----------------------------------------------------
+            # -----------------------------------------------------
+            # Composite Email Score
+            # -----------------------------------------------------
 
-                provider_email_score = min(
+            provider_email_score = min(
                 provider_email_similarity * provider_domain_trust_score,
                 1.0,
                 )
 
-                # -----------------------------------------------------
-                # Explainability Classification
-                # -----------------------------------------------------
+            # -----------------------------------------------------
+            # Explainability Classification
+            # -----------------------------------------------------
 
-                if provider_email_score >= 0.99:
+            if provider_email_score >= 0.99:
                                 provider_email_match_level = "EXACT"
 
-                elif provider_email_score >= 0.90:
+            elif provider_email_score >= 0.90:
                                 provider_email_match_level = "SIMILAR"
 
-                elif provider_email_score >= 0.70:
+            elif provider_email_score >= 0.70:
                                 provider_email_match_level = "FUZZY" 
 
-                provider_name_a = " ".join([
+            provider_name_a = " ".join([
                     getattr(record_a, "provider_first_name", "") or "",
                     getattr(record_a, "provider_last_name", "") or "",
                 ]).strip()
 
-                provider_name_b = " ".join([
+            provider_name_b = " ".join([
                     getattr(record_b, "provider_first_name", "") or "",
                     getattr(record_b, "provider_last_name", "") or "",
                 ]).strip()
 
-                name_score = self._similarity(
+            name_score = self._similarity(
                     provider_name_a,
                     provider_name_b,
                 )
 
-                print("PROVIDER FIELD DEBUG")
-                print("provider_name_a:", provider_name_a)
-                print("provider_name_b:", provider_name_b)
-                print("OVERRIDDEN name_score:", name_score)
+            print("PROVIDER FIELD DEBUG")
+            print("provider_name_a:", provider_name_a)
+            print("provider_name_b:", provider_name_b)
+            print("OVERRIDDEN name_score:", name_score)
 
-                print(
+            print(
                     "provider_address_a:",
                     getattr(record_a, "provider_address", None),
                 )
 
-                print(
+            print(
                     "provider_address_b:",
                     getattr(record_b, "provider_address", None),
                 )
 
-                print("OVERRIDDEN address_score:", address_score)
-                print("PROVIDER ADDRESS SCORE:", address_score)
-                print("RECORD A ADDRESS:", record_a.address)
-                print("RECORD B ADDRESS:", record_b.address)
+            print("OVERRIDDEN address_score:", address_score)
+            print("PROVIDER ADDRESS SCORE:", address_score)
+            print("RECORD A ADDRESS:", record_a.address)
+            print("RECORD B ADDRESS:", record_b.address)
                                 
                 #specialty score----------------------------
-                specialty_score = self._similarity(
+            specialty_score = self._similarity(
                 getattr(record_a, "specialty", None),
                 getattr(record_b, "specialty", None),
                 )
                 #----------------------------------------------------
-                provider_address_a = getattr(record_a, "address", None)
-                provider_address_b = getattr(record_b, "address", None)
+            provider_address_a = (
+                    getattr(record_a, "provider_address", None)
+                    or getattr(record_a, "address", None)
+                )
 
-                address_score = self._similarity(
+            provider_address_b = (
+                    getattr(record_b, "provider_address", None)
+                    or getattr(record_b, "address", None)
+                )
+
+            address_score = self._similarity(
                         provider_address_a,
                         provider_address_b,
                 )
@@ -1056,8 +1172,8 @@ class EntityResolutionEngine:
                             address_score,
                             domain_weights.get("address_similarity", 0.0),
                             self._address_detail(
-                                record_a.address,
-                                record_b.address,
+                                provider_address_a,
+                                provider_address_b,
                                 address_score,
                                 domain,
                                 address_match_insight,
@@ -1127,7 +1243,7 @@ class EntityResolutionEngine:
                                 None,
             ),
         ),
-        signal_type="probabilistic",
+            signal_type="probabilistic",
     )
 )
             
@@ -1182,23 +1298,139 @@ class EntityResolutionEngine:
     
             
         elif normalized_domain == "PATIENT":
-          
-            patient_identity_score = (patient_id_score if patient_id_score is not None else 0.0
-        )
+
+            signals = []
+
+            patient_first_name_a = (
+                getattr(record_a, "patient_first_name", None)
+                or getattr(record_a, "first_name", None)
+            )
+            patient_first_name_b = (
+                getattr(record_b, "patient_first_name", None)
+                or getattr(record_b, "first_name", None)
+            )
+
+            patient_last_name_a = (
+                getattr(record_a, "patient_last_name", None)
+                or getattr(record_a, "last_name", None)
+            )
+            patient_last_name_b = (
+                getattr(record_b, "patient_last_name", None)
+                or getattr(record_b, "last_name", None)
+            )
+
+            patient_dob_a = (
+                getattr(record_a, "patient_dob", None)
+                or getattr(record_a, "dob", None)
+            )
+            patient_dob_b = (
+                getattr(record_b, "patient_dob", None)
+                or getattr(record_b, "dob", None)
+            )
+
+            patient_email_a = (
+                getattr(record_a, "patient_email", None)
+                or getattr(record_a, "email", None)
+                or ""
+            ).strip().lower()
+
+            patient_email_b = (
+                getattr(record_b, "patient_email", None)
+                or getattr(record_b, "email", None)
+                or ""
+            ).strip().lower()
+
+            patient_address_a = (
+                getattr(record_a, "patient_address", None)
+                or getattr(record_a, "address", None)
+            )
+            patient_address_b = (
+                getattr(record_b, "patient_address", None)
+                or getattr(record_b, "address", None)
+            )
+
+            name_score = self._name_similarity(
+                patient_first_name_a,
+                patient_last_name_a,
+                patient_first_name_b,
+                patient_last_name_b,
+            )
+
+            dob_score = self._dob_match(patient_dob_a, patient_dob_b)
+
+            patient_email_similarity = SimilarityEngine.email_similarity(
+                patient_email_a,
+                patient_email_b,
+            )
+
+            patient_domain_a = (
+                patient_email_a.split("@")[1]
+                if "@" in patient_email_a
+                else ""
+            )
+            patient_domain_b = (
+                patient_email_b.split("@")[1]
+                if "@" in patient_email_b
+                else ""
+            )
+
+            patient_domain_trust_score = min(
+                email_domain_trust(patient_domain_a),
+                email_domain_trust(patient_domain_b),
+            )
+
+            email_score = min(
+                patient_email_similarity * patient_domain_trust_score,
+                1.0,
+            )
+
+            email_match_level = "DIFFERENT"
+            if email_score >= 0.99:
+                email_match_level = "EXACT"
+            elif email_score >= 0.90:
+                email_match_level = "SIMILAR"
+            elif email_score >= 0.70:
+                email_match_level = "FUZZY"
+
+            address_score = SimilarityEngine.address_similarity(
+                patient_address_a,
+                patient_address_b,
+            )
+
+            patient_identity_score = (
+                patient_id_score if patient_id_score is not None else 0.0
+            )
+
             human_identity_component = (
-                human_id_score
-                if human_id_score is not None
-                else 0.5
+                human_id_score if human_id_score is not None else 0.5
             )
 
             match_score = (
-            patient_identity_score * 0.30 +
-            human_identity_component * 0.10 +
-            dob_score * 0.20 +
-            name_score * 0.20 +
-            address_score * 0.10 +
-            email_score * 0.10
-)
+                patient_identity_score * 0.30
+                + human_identity_component * 0.05
+                + dob_score * 0.20
+                + name_score * 0.20
+                + address_score * 0.15
+                + email_score * 0.10
+                + source_score * 0.10
+            )
+
+            if (
+                patient_identity_score >= 0.90
+                and dob_score == 1.0
+                and name_score >= 0.90
+                and address_score >= 0.95
+            ):
+                match_score = min(max(match_score, 0.90), 0.92)
+
+            elif (
+                patient_identity_score >= 0.90
+                and dob_score == 1.0
+                and name_score >= 0.85
+            ):
+                 match_score = min(max(match_score, 0.86), 0.90)
+
+            match_score = min(match_score, 0.92)
 
             signals.append(
                 self._build_signal(
@@ -1209,31 +1441,45 @@ class EntityResolutionEngine:
                         getattr(record_a, "patient_id", None),
                         getattr(record_b, "patient_id", None),
                     ),
+                    signal_type="deterministic",
                 )
             )
 
             signals.append(
-                    self._build_signal(
-                        "human_id_match",
-                        human_id_score,
-                        domain_weights.get("human_id_match", 0.0),
-                        self._human_id_detail(
-                            getattr(record_a, "human_id", None),
-                            getattr(record_b, "human_id", None),
-                        ),
-                        signal_type="deterministic",
-    )                   
-)
+                self._build_signal(
+                    "human_id_match",
+                    human_id_score,
+                    domain_weights.get("human_id_match", 0.0),
+                    self._human_id_detail(
+                        getattr(record_a, "human_id", None),
+                        getattr(record_b, "human_id", None),
+                    ),
+                    signal_type="deterministic",
+                )
+            )
 
             signals.append(
                 self._build_signal(
                     "dob_match",
                     dob_score,
                     domain_weights.get("dob_match", 0.0),
-                    self._dob_detail(
-                        record_a.dob,
-                        record_b.dob,
+                    self._dob_detail(patient_dob_a, patient_dob_b),
+                    signal_type="deterministic",
+                )
+            )
+
+            signals.append(
+                self._build_signal(
+                    "name_similarity",
+                    name_score,
+                    domain_weights.get("name_similarity", 0.0),
+                    self._name_detail(
+                        patient_first_name_a,
+                        patient_last_name_a,
+                        patient_first_name_b,
+                        patient_last_name_b,
                     ),
+                    signal_type="probabilistic",
                 )
             )
 
@@ -1242,25 +1488,42 @@ class EntityResolutionEngine:
                     "email_match",
                     email_score,
                     domain_weights.get("email_match", 0.0),
-                    self._email_detail(
-                        record_a.email,
-                        record_b.email,
-                    ),
+                    self._email_detail(patient_email_a, patient_email_b),
+                    match_level=email_match_level,
+                    domain_trust=patient_domain_trust_score,
+                    signal_type="probabilistic",
                 )
             )
+
             signals.append(
                 self._build_signal(
                     "address_similarity",
                     address_score,
                     domain_weights.get("address_similarity", 0.0),
                     self._address_detail(
-                        record_a.address,
-                        record_b.address,
-                        address_score
+                        patient_address_a,
+                        patient_address_b,
+                        address_score,
+                        domain,
+                        address_match_insight,
                     ),
                     signal_type="probabilistic",
-                 )
+                )
             )
+
+            signals.append(
+                self._build_signal(
+                    "source_trust",
+                    source_score,
+                    domain_weights.get("source_trust", 0.0),
+                    self._source_detail(
+                        record_a.source_system,
+                        record_b.source_system,
+                    ),
+                    signal_type="probabilistic",
+                )
+            )
+
             raw_entity_score = round(match_score * risk_multiplier, 4)
             
         
@@ -1637,6 +1900,8 @@ class EntityResolutionEngine:
             "supplier_id_match",
             "product_id_match",
             "gtin_match",
+            "sku_match",
+            "effective_lot_date_match",
             "npi_match",
             "tax_id_match",
             "dob_match",
@@ -1649,6 +1914,7 @@ class EntityResolutionEngine:
             "name_similarity",
             "specialty_similarity",
             "source_trust",
+            "attribute_similarity",
         }
 
         signal_display_map = {
@@ -1660,6 +1926,9 @@ class EntityResolutionEngine:
             "gtin_match": "GTIN",
             "npi_match": "NPI",
             "human_id_match": "Human ID",
+            "sku_match": "SKU",
+            "effective_lot_date_match": "Effective / Lot Date",
+            "attribute_similarity": "Product Attribute Similarity",
             "member_id_match": "Member ID",
             "dob_match": "Date of Birth",
             "email_match": "Email",
@@ -1690,7 +1959,7 @@ class EntityResolutionEngine:
                 else signal.get("score") or 0
             )
 
-            if signal_name == "product_id_match":
+            if signal_name in {"product_id_match","patient_id_match","provider_id_match",}:
 
                 if signal_score >= 0.99:
                     title = f"{display_name} Exact Match"
@@ -1755,8 +2024,7 @@ class EntityResolutionEngine:
                     "signal_name": signal_name,
                     "signal_score": signal_score,
                 }
-            )
-        
+            )    
         
         if address_match_insight:
             events.append(
@@ -2060,9 +2328,11 @@ class EntityResolutionEngine:
             match_level
                 or (
                 "EXACT"
-                if name in {"product_id_match", "sku_match"} and safe_score >= 0.999
+                if name in {"product_id_match","sku_match","patient_id_match","provider_id_match",
+            } and safe_score >= 0.999
                 else "SIMILAR"
-                if name in {"product_id_match", "sku_match"} and safe_score >= 0.85
+                if name in {"product_id_match","sku_match","patient_id_match","provider_id_match",
+            } and safe_score >= 0.85
                 else "DIFFERENT"
                     if name in {"product_id_match", "sku_match"}
                 else SimilarityEngine.similarity_band(safe_score)

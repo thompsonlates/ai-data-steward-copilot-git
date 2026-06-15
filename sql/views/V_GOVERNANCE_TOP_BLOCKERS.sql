@@ -1,31 +1,32 @@
-CREATE OR REPLACE VIEW `api-project-503305938314.ai_data_steward_mvp.<VIEW_NAME>` AS
-WITH readiness_blockers AS (
+CREATE OR REPLACE VIEW `api-project-503305938314.ai_data_steward_mvp.V_GOVERNANCE_TOP_BLOCKERS` AS
+WITH blockers AS (
   SELECT
-    certification_blocker_reason AS blocker_reason,
-    COUNT(*) AS blocker_count
-  FROM `api-project-503305938314.ai_data_steward_mvp.V_CERTIFICATION_READINESS`
-  WHERE COALESCE(ready_for_certification, FALSE) = FALSE
-    AND certification_blocker_reason IS NOT NULL
-    AND TRIM(certification_blocker_reason) != ''
-  GROUP BY certification_blocker_reason
-),
-
-failed_check_categories AS (
-  SELECT
-    CONCAT('FAILED CHECK: ', check_category) AS blocker_reason,
-    COUNT(*) AS blocker_count
-  FROM `api-project-503305938314.ai_data_steward_mvp.DG_CERTIFICATION_CHECK_RESULTS`
-  WHERE UPPER(result_status) = 'FAIL'
-  GROUP BY check_category
+    CASE
+      WHEN failed_checks > 0 THEN 'FAILED_CERTIFICATION_CHECKS'
+      WHEN critical_findings > 0 THEN 'CRITICAL_FINDINGS'
+      WHEN high_findings > 0 THEN 'HIGH_FINDINGS'
+      WHEN certification_readiness_score < 90 THEN 'READINESS_BELOW_THRESHOLD'
+      WHEN fair_overall_score < 80 THEN 'FAIR_SCORE_BELOW_THRESHOLD'
+      ELSE 'NO_BLOCKER'
+    END AS blocker_reason,
+    CASE
+      WHEN critical_findings > 0 THEN 'CRITICAL'
+      WHEN failed_checks > 0 OR high_findings > 0 THEN 'HIGH'
+      WHEN certification_readiness_score < 90 THEN 'MEDIUM'
+      WHEN fair_overall_score < 80 THEN 'LOW'
+      ELSE 'NONE'
+    END AS blocker_severity
+  FROM `api-project-503305938314.ai_data_steward_mvp.V_GOVERNANCE_DATASET_DETAIL`
+  WHERE
+    failed_checks > 0
+    OR critical_findings > 0
+    OR high_findings > 0
+    OR certification_readiness_score < 90
+    OR fair_overall_score < 80
 )
-
 SELECT
   blocker_reason,
-  SUM(blocker_count) AS blocker_count
-FROM (
-  SELECT * FROM readiness_blockers
-  UNION ALL
-  SELECT * FROM failed_check_categories
-)
-GROUP BY blocker_reason
-ORDER BY blocker_count DESC
+  blocker_severity,
+  COUNT(*) AS blocker_count
+FROM blockers
+GROUP BY blocker_reason, blocker_severity;

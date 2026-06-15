@@ -919,8 +919,22 @@ async def match_explain(
 
         address_service = AddressIntelligenceService()
 
-        record_a_address_intelligence = address_service.validate(req.record_a.address)
-        record_b_address_intelligence = address_service.validate(req.record_b.address)
+        domain = (req.domain or "CUSTOMER").upper()
+
+        address_a = (
+            getattr(req.record_a, "provider_address", None)
+            if domain == "PROVIDER"
+            else getattr(req.record_a, "address", None)
+        )
+
+        address_b = (
+            getattr(req.record_b, "provider_address", None)
+            if domain == "PROVIDER"
+            else getattr(req.record_b, "address", None)
+        )
+
+        record_a_address_intelligence = address_service.validate(address_a)
+        record_b_address_intelligence = address_service.validate(address_b)
 
         address_match_insight = address_service.compare(
             record_a_address_intelligence,
@@ -1172,9 +1186,9 @@ async def match_explain(
             entity_resolution.get("match_score", 0.0),
             ),
             primary_signal=entity_resolution.get("primary_signal"),
-            entity_resolution_signals=normalize_entity_resolution_signals(
+            signal_packets=normalize_entity_resolution_signals(
             entity_resolution.get("signals")
-            ),
+        ),
             entity_resolution_summary=entity_resolution.get("entity_resolution_summary"),
             match_evidence_timeline=normalize_match_evidence_timeline(
             entity_resolution.get("match_evidence_timeline")
@@ -1183,6 +1197,10 @@ async def match_explain(
             entity_resolution.get("timeline_events")
             ),
             ai_insight=ai_insight,
+            entity_resolution_signals=normalize_entity_resolution_signals(
+            entity_resolution.get("signals")
+            ),
+            
             signal_weights=entity_resolution.get("signal_weights"),
             signal_contributions=entity_resolution.get("signal_contributions"),
             timeline_version="v2",

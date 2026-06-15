@@ -67,10 +67,11 @@ def _domain_guidance(domain: str | None) -> str:
 
     if d == "PRODUCT":
         return (
-            "Use product/item master language only. Never refer to people, patients, members, or customer identity. "
-            "Treat GTIN, SKU, UPC, product ID, item description, brand, UOM, pack size, and source-system trust "
-            "as product match evidence. Use phrases like same-product match, product similarity, item match "
-            "confidence, and catalog alignment."
+            "Use product/entity resolution language. Treat GTIN as the strongest "
+            "deterministic product identifier. Treat SKU, Product ID, Product Name, "
+            "Product Variant, Pack Size, Effective/Lot Date, and Source System as "
+            "product evidence. Do not use or mention DOB, email, address, NPI, "
+            "patient/member identity, or provider identity for Product decisions."
         )
 
     return (
@@ -155,47 +156,91 @@ def build_match_explain_prompt(
 
     if domain == "PROVIDER":
         record_evidence = f"""
-Record A:
-- source_system: {_fmt(source_system_a)}
-- provider_id: {_fmt(_get_value(record_a, "provider_id"))}
-- npi: {_fmt(_get_value(record_a, "npi"))}
-- provider_first_name: {_fmt(first_name_a)}
-- provider_last_name: {_fmt(last_name_a)}
-- specialty: {_fmt(_get_value(record_a, "specialty"))}
-- provider_email: {_fmt(email_a)}
-- practice_address: {_fmt(address_a)}
+    Record A Provider Evidence:
+    - provider_id: {_fmt(_get_value(record_a, "provider_id"))}
+    - npi: {_fmt(_get_value(record_a, "npi"))}
+    - provider_first_name: {_fmt(_get_value(record_a, "provider_first_name") or _get_value(record_a, "first_name"))}
+    - provider_last_name: {_fmt(_get_value(record_a, "provider_last_name") or _get_value(record_a, "last_name"))}
+    - provider_email: {_fmt(_get_value(record_a, "provider_email") or _get_value(record_a, "email"))}
+    - specialty: {_fmt(_get_value(record_a, "specialty"))}
+    - practice_address: {_fmt(_get_value(record_a, "provider_address") or _get_value(record_a, "address"))}
+    - source_system: {_fmt(_get_value(record_a, "source_system"))}
 
-Record B:
-- source_system: {_fmt(source_system_b)}
-- provider_id: {_fmt(_get_value(record_b, "provider_id"))}
-- npi: {_fmt(_get_value(record_b, "npi"))}
-- provider_first_name: {_fmt(first_name_b)}
-- provider_last_name: {_fmt(last_name_b)}
-- specialty: {_fmt(_get_value(record_b, "specialty"))}
-- provider_email: {_fmt(email_b)}
-- practice_address: {_fmt(address_b)}
-""".strip()
+    Record B Provider Evidence:
+    - provider_id: {_fmt(_get_value(record_b, "provider_id"))}
+    - npi: {_fmt(_get_value(record_b, "npi"))}
+    - provider_first_name: {_fmt(_get_value(record_b, "provider_first_name") or _get_value(record_b, "first_name"))}
+    - provider_last_name: {_fmt(_get_value(record_b, "provider_last_name") or _get_value(record_b, "last_name"))}
+    - provider_email: {_fmt(_get_value(record_b, "provider_email") or _get_value(record_b, "email"))}
+    - specialty: {_fmt(_get_value(record_b, "specialty"))}
+    - practice_address: {_fmt(_get_value(record_b, "provider_address") or _get_value(record_b, "address"))}
+    - source_system: {_fmt(_get_value(record_b, "source_system"))}
+    """
+
+    elif domain == "PRODUCT":
+     record_evidence = f"""
+    Record A Product Evidence:
+    - product_id: {_fmt(_get_value(record_a, "product_id"))}
+    - product_name: {_fmt(_get_value(record_a, "product_name"))}
+    - product_variant: {_fmt(_get_value(record_a, "product_variant"))}
+    - pack_size: {_fmt(_get_value(record_a, "pack_size"))}
+    - effective_lot_date: {_fmt(_get_value(record_a, "effective_lot_date"))}
+    - gtin: {_fmt(_get_value(record_a, "gtin"))}
+    - sku: {_fmt(_get_value(record_a, "sku"))}
+    - source_system: {_fmt(_get_value(record_a, "source_system"))}
+
+    Record B Product Evidence:
+    - product_id: {_fmt(_get_value(record_b, "product_id"))}
+    - product_name: {_fmt(_get_value(record_b, "product_name"))}
+    - product_variant: {_fmt(_get_value(record_b, "product_variant"))}
+    - pack_size: {_fmt(_get_value(record_b, "pack_size"))}
+    - effective_lot_date: {_fmt(_get_value(record_b, "effective_lot_date"))}
+    - gtin: {_fmt(_get_value(record_b, "gtin"))}
+    - sku: {_fmt(_get_value(record_b, "sku"))}
+    - source_system: {_fmt(_get_value(record_b, "source_system"))}
+    """
+    elif domain == "PATIENT":
+        record_evidence = f"""
+    Record A Patient Evidence:
+    - patient_id: {_fmt(_get_value(record_a, "patient_id"))}
+    - first_name: {_fmt(_get_value(record_a, "patient_first_name") or _get_value(record_a, "first_name"))}
+    - last_name: {_fmt(_get_value(record_a, "patient_last_name") or _get_value(record_a, "last_name"))}
+    - dob: {_fmt(_get_value(record_a, "patient_dob") or _get_value(record_a, "dob"))}
+    - email: {_fmt(_get_value(record_a, "patient_email") or _get_value(record_a, "email"))}
+    - address: {_fmt(_get_value(record_a, "patient_address") or _get_value(record_a, "address"))}
+    - source_system: {_fmt(_get_value(record_a, "source_system"))}
+
+    Record B Patient Evidence:
+    - patient_id: {_fmt(_get_value(record_b, "patient_id"))}
+    - first_name: {_fmt(_get_value(record_b, "patient_first_name") or _get_value(record_b, "first_name"))}
+    - last_name: {_fmt(_get_value(record_b, "patient_last_name") or _get_value(record_b, "last_name"))}
+    - dob: {_fmt(_get_value(record_b, "patient_dob") or _get_value(record_b, "dob"))}
+    - email: {_fmt(_get_value(record_b, "patient_email") or _get_value(record_b, "email"))}
+    - address: {_fmt(_get_value(record_b, "patient_address") or _get_value(record_b, "address"))}
+    - source_system: {_fmt(_get_value(record_b, "source_system"))}
+    """
+
+
     else:
         record_evidence = f"""
-Record A:
-- source_system: {_fmt(source_system_a)}
-- entity_id: {_fmt(entity_id_a)}
-- first_name: {_fmt(first_name_a)}
-- last_name: {_fmt(last_name_a)}
-- dob: {_fmt(dob_a)}
-- email: {_fmt(email_a)}
-- address: {_fmt(address_a)}
+        Record A Evidence:
+        - entity_id: {_fmt(entity_id_a)}
+        - first_name: {_fmt(first_name_a)}
+        - last_name: {_fmt(last_name_a)}
+        - dob: {_fmt(dob_a)}
+        - email: {_fmt(email_a)}
+        - address: {_fmt(address_a)}
+        - source_system: {_fmt(source_system_a) }
 
-Record B:
-- source_system: {_fmt(source_system_b)}
-- entity_id: {_fmt(entity_id_b)}
-- first_name: {_fmt(first_name_b)}
-- last_name: {_fmt(last_name_b)}
-- dob: {_fmt(dob_b)}
-- email: {_fmt(email_b)}
-- address: {_fmt(address_b)}
-""".strip()
-    print("PROMPT_BUILDER VERSION: provider_evidence_no_dob_v2")
+        Record B Evidence:
+        - entity_id: {_fmt(entity_id_b)}
+        - first_name: {_fmt(first_name_b)}
+        - last_name: {_fmt(last_name_b)}
+        - dob: {_fmt(dob_b)}
+        - email: {_fmt(email_b)}
+        - address: {_fmt(address_b)}
+        - source_system: {_fmt(source_system_b) }
+        """
     prompt = f"""
 You are AI Data Steward Copilot, an explainable AI assistant for MDM match, merge, survivorship, and governance decisions.
 
@@ -223,6 +268,9 @@ Core instructions:
 13. For PRODUCT, only treat GTIN_MATCH as positive evidence when Record A gtin and Record B gtin are identical.
 14. If PRODUCT gtin values differ, do not cite GTIN_MATCH as a valid matching rule even if it appears in triggered_rules.
 15. If PRODUCT gtin differs but SKU, product name, or product ID are similar, describe those as supporting but non-deterministic evidence.
+16. For PATIENT, use patient_id, patient_first_name, patient_last_name, patient_dob, patient_email, patient_address, and source_system as evidence.
+17. For PATIENT, do not say DOB, name, email, or address are missing when patient_* fields are present.
+18. For PATIENT, if patient_id base value matches but suffix differs, describe it as strong but not exact identifier evidence.
 
 Decision calibration:
 - AUTO_MERGE: deterministic identifiers or highly aligned evidence with low risk and no conflicting identity attributes.

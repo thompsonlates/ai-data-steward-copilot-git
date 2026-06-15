@@ -27,3 +27,7 @@ steward-copilot-ui/node_modules/
 tmp/
 .cache/
 .gcloudignore
+y/
+sql/
+scripts/
+*.json

@@ -47,33 +47,54 @@ class FlexibleBaseModel(BaseModel):
 
 
 class MemberRecord(FlexibleBaseModel):
+    # Shared / legacy identifier
     member_id: Optional[str] = Field(
-    None,
-    description="Unique member or patient identifier",
-)
+        None,
+        description="Legacy/shared member, entity, or source identifier",
+    )
+
+    # Customer / Patient fields
+    patient_id: Optional[str] = None
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     dob: Optional[str] = None
     email: Optional[str] = None
     address: Optional[str] = None
+
+    # Provider fields
+    provider_id: Optional[str] = None
+    npi: Optional[str] = None
+    specialty: Optional[str] = None
+    provider_first_name: Optional[str] = None
+    provider_last_name: Optional[str] = None
+    provider_email: Optional[str] = None
+    provider_address: Optional[str] = None
+
+    # Supplier fields
+    supplier_id: Optional[str] = None
+    supplier_name: Optional[str] = None
+    tax_id: Optional[str] = None
+    contact_email: Optional[str] = None
+    supplier_address: Optional[str] = None
+
+    # Product fields
+    product_id: Optional[str] = None
+    product_name: Optional[str] = None
+    product_variant: Optional[str] = None
+    effective_lot_date: Optional[str] = None
+    gtin: Optional[str] = None
+    sku: Optional[str] = None
+    upc: Optional[str] = None
+    brand: Optional[str] = None
+    uom: Optional[str] = None
+    pack_size: Optional[str] = None
+    product_description: Optional[str] = None
+
+    # Source / audit fields
     source_system: Optional[str] = None
     source_id: Optional[str] = None
     record_version: Optional[str] = None
     record_hash: Optional[str] = None
-    patient_id: Optional[str] = None
-    provider_id: Optional[str] = None
-    npi: Optional[str] = None
-    supplier_id: Optional[str] = None
-    vendor_id: Optional[str] = None
-    tax_id: Optional[str] = None
-    product_id: Optional[str] = None
-    gtin: Optional[str] = None
-    sku: Optional[str] = None
-    upc: Optional[str] = None
-    product_name: Optional[str] = None
-    brand: Optional[str] = None
-    uom: Optional[str] = None
-    pack_size: Optional[str] = None
 
 
 # -------------------------------------------------------------------
