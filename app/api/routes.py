@@ -921,17 +921,20 @@ async def match_explain(
 
         domain = (req.domain or "CUSTOMER").upper()
 
-        address_a = (
-            getattr(req.record_a, "provider_address", None)
-            if domain == "PROVIDER"
-            else getattr(req.record_a, "address", None)
-        )
+        address_field = {
+            "PROVIDER": "provider_address",
+            "SUPPLIER": "supplier_address",
+            "PATIENT": "patient_address",
+        }.get(domain, "address")
 
-        address_b = (
-            getattr(req.record_b, "provider_address", None)
-            if domain == "PROVIDER"
-            else getattr(req.record_b, "address", None)
-        )
+        address_a = getattr(req.record_a, address_field, None)
+        address_b = getattr(req.record_b, address_field, None)
+
+        logger.info(
+        f"[ADDRESS DEBUG] domain={domain} "
+        f"address_a={address_a} "
+        f"address_b={address_b}"
+)
 
         record_a_address_intelligence = address_service.validate(address_a)
         record_b_address_intelligence = address_service.validate(address_b)

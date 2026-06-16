@@ -942,12 +942,12 @@ class EntityResolutionEngine:
 
             supplier_address_a = (
                 getattr(record_a, "supplier_address", None)
-                or getattr(record_a, "address", None)
+                or getattr(record_a, "address", None) or ""
             )
 
             supplier_address_b = (
                 getattr(record_b, "supplier_address", None)
-                or getattr(record_b, "address", None)
+                or getattr(record_b, "address", None) or ""
             )
 
             supplier_address_similarity_score = SimilarityEngine.address_similarity(
@@ -1027,19 +1027,22 @@ class EntityResolutionEngine:
 )
 
             signals.append(
-                self._build_signal(
-                    "address_similarity",
-                    supplier_address_similarity_score,
-                    domain_weights.get("address_similarity", 0.0),
-                    self._address_detail(
-                    supplier_address_a,
-                    supplier_address_b,
-                    supplier_address_similarity_score,
-                    domain,
-                    address_match_insight,
-                )
-            )
-        )
+                    self._build_signal(
+                        "address_similarity",
+                        supplier_address_similarity_score,
+                        domain_weights.get("address_similarity", 0.0),
+                        self._address_detail(
+                            supplier_address_a,
+                            supplier_address_b,
+                            supplier_address_similarity_score,
+                            domain,
+                            address_match_insight,
+                        ),
+
+                    signal_type="probabilistic",
+    )
+)
+
 
             signals.append(
                 self._build_signal(
