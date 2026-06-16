@@ -874,14 +874,116 @@ class EntityResolutionEngine:
 
             signals = []
 
-            
             supplier_address_similarity_score = address_score
 
+            supplier_email_a = (
+                getattr(record_a, "contact_email", None)
+                or getattr(record_a, "email", None)
+                or ""
+            ).strip().lower()
+
+            supplier_email_b = (
+                getattr(record_b, "contact_email", None)
+                or getattr(record_b, "email", None)
+                or ""
+            ).strip().lower()
+
+            print("SUPPLIER EMAIL A:", supplier_email_a)
+            print("SUPPLIER EMAIL B:", supplier_email_b)
+
+            supplier_email_similarity = SimilarityEngine.email_similarity(
+                supplier_email_a,
+                supplier_email_b,
+            )
+
+            supplier_domain_a = (
+                supplier_email_a.split("@")[1]
+                if "@" in supplier_email_a
+                else ""
+            )
+
+            supplier_domain_b = (
+                supplier_email_b.split("@")[1]
+                if "@" in supplier_email_b
+                else ""
+            )
+
+            supplier_domain_trust_score = min(
+                email_domain_trust(supplier_domain_a),
+                email_domain_trust(supplier_domain_b),
+            )
+
+            email_score = min(
+                supplier_email_similarity * supplier_domain_trust_score,
+                1.0,
+            )
+            supplier_email_match_level = "DIFFERENT"
+
+            if email_score >= 0.99:
+                supplier_email_match_level = "EXACT"
+            elif email_score >= 0.90:
+                supplier_email_match_level = "SIMILAR"
+            elif email_score >= 0.70:
+                supplier_email_match_level = "FUZZY"
+
+            supplier_name_a = (
+            getattr(record_a, "supplier_name", None)
+            or getattr(record_a, "first_name", None)
+            or ""
+            )
+
+            supplier_name_b = (
+                getattr(record_b, "supplier_name", None)
+                or getattr(record_b, "first_name", None)
+                or ""
+            )
+
+            name_score = self._similarity(supplier_name_a, supplier_name_b)
+
+            supplier_address_a = (
+                getattr(record_a, "supplier_address", None)
+                or getattr(record_a, "address", None)
+            )
+
+            supplier_address_b = (
+                getattr(record_b, "supplier_address", None)
+                or getattr(record_b, "address", None)
+            )
+
+            supplier_address_similarity_score = SimilarityEngine.address_similarity(
+                supplier_address_a,
+                supplier_address_b,
+            )
+
+            supplier_name_a = (
+                getattr(record_a, "supplier_name", None)
+                or getattr(record_a, "first_name", None)
+                or ""
+            )
+
+            supplier_name_b = (
+                getattr(record_b, "supplier_name", None)
+                or getattr(record_b, "first_name", None)
+                or ""
+            )
+
+            name_score = self._similarity(
+                supplier_name_a,
+                supplier_name_b,
+            )
+
+            address_score = supplier_address_similarity_score
+
+
+
+            print("SUPPLIER EMAIL SCORE:", email_score)
+
+   
             match_score = (
-                supplier_id_score     * 0.50 +
+                supplier_id_score     * 0.40 +
                 tax_id_score          * 0.25 +
                 name_score            * 0.10 +
-                email_score           * 0.05 +
+                email_score           * 0.15 +
                 address_score         * 0.05 +
                 source_score          * 0.05
             )
@@ -908,6 +1010,21 @@ class EntityResolutionEngine:
                 ),
             )
         )
+            
+            signals.append(
+                self._build_signal(
+                    "name_similarity",
+                    name_score,
+                    domain_weights.get("name_similarity", 0.0),
+                    self._name_detail(
+                        supplier_name_a,
+                        None,
+                        supplier_name_b,
+                        None,
+                    ),
+                    signal_type="probabilistic",
+    )
+)
 
             signals.append(
                 self._build_signal(
@@ -915,9 +1032,9 @@ class EntityResolutionEngine:
                     supplier_address_similarity_score,
                     domain_weights.get("address_similarity", 0.0),
                     self._address_detail(
-                    record_a.address,
-                    record_b.address,
-                    address_score,
+                    supplier_address_a,
+                    supplier_address_b,
+                    supplier_address_similarity_score,
                     domain,
                     address_match_insight,
                 )
@@ -942,12 +1059,12 @@ class EntityResolutionEngine:
                     email_score,
                     domain_weights.get("contact_email_match", 0.0),
                     self._contact_email_detail(
-                        record_a.email,
-                        record_b.email,
+                        supplier_email_a,
+                        supplier_email_b,
                     ),
 
-                    match_level=email_match_level,
-                    domain_trust=domain_trust_score,
+                    match_level=supplier_email_match_level,
+                    domain_trust=supplier_domain_trust_score,
                     signal_type="probabilistic",
                 )
             )
@@ -1905,7 +2022,7 @@ class EntityResolutionEngine:
             "npi_match",
             "tax_id_match",
             "dob_match",
-            "email_match",
+            "contact_email_match",
             "provider_email_match",
         }
 
@@ -1931,7 +2048,7 @@ class EntityResolutionEngine:
             "attribute_similarity": "Product Attribute Similarity",
             "member_id_match": "Member ID",
             "dob_match": "Date of Birth",
-            "email_match": "Email",
+            "contact_email_match": "Contact Email",
             "provider_email_match": "Provider Email",
             "address_similarity": "Address Similarity",
             "name_similarity": "Name Similarity",

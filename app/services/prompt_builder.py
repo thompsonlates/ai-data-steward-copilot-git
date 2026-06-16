@@ -199,6 +199,26 @@ def build_match_explain_prompt(
     - sku: {_fmt(_get_value(record_b, "sku"))}
     - source_system: {_fmt(_get_value(record_b, "source_system"))}
     """
+     
+    elif domain == "SUPPLIER":
+        record_evidence = f"""
+    Record A Supplier Evidence:
+    - supplier_id: {_fmt(_get_value(record_a, "supplier_id") or entity_id_a)}
+    - tax_id: {_fmt(_get_value(record_a, "tax_id"))}
+    - supplier_name: {_fmt(_get_value(record_a, "supplier_name") or _get_value(record_a, "first_name"))}
+    - contact_email: {_fmt(_get_value(record_a, "contact_email") or _get_value(record_a, "email"))}
+    - supplier_address: {_fmt(_get_value(record_a, "supplier_address") or _get_value(record_a, "address"))}
+    - source_system: {_fmt(_get_value(record_a, "source_system"))}
+
+    Record B Supplier Evidence:
+    - supplier_id: {_fmt(_get_value(record_b, "supplier_id") or entity_id_b)}
+    - tax_id: {_fmt(_get_value(record_b, "tax_id"))}
+    - supplier_name: {_fmt(_get_value(record_b, "supplier_name") or _get_value(record_b, "first_name"))}
+    - contact_email: {_fmt(_get_value(record_b, "contact_email") or _get_value(record_b, "email"))}
+    - supplier_address: {_fmt(_get_value(record_b, "supplier_address") or _get_value(record_b, "address"))}
+    - source_system: {_fmt(_get_value(record_b, "source_system"))}
+    """
+
     elif domain == "PATIENT":
         record_evidence = f"""
     Record A Patient Evidence:
@@ -271,6 +291,9 @@ Core instructions:
 16. For PATIENT, use patient_id, patient_first_name, patient_last_name, patient_dob, patient_email, patient_address, and source_system as evidence.
 17. For PATIENT, do not say DOB, name, email, or address are missing when patient_* fields are present.
 18. For PATIENT, if patient_id base value matches but suffix differs, describe it as strong but not exact identifier evidence.
+19. For SUPPLIER, use supplier_id, tax_id, supplier_name, contact_email, supplier_address, and source_system as evidence.
+20. For SUPPLIER, do not say email, name, or address are missing when contact_email, supplier_name, or supplier_address are present.
+21. For SUPPLIER, treat same-domain contact emails as supporting but non-deterministic evidence unless the full email matches exactly.
 
 Decision calibration:
 - AUTO_MERGE: deterministic identifiers or highly aligned evidence with low risk and no conflicting identity attributes.
