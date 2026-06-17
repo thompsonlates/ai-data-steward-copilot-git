@@ -87,7 +87,10 @@ class WorkflowOrchestrator:
 
         return GovernanceWorkflowResult(
             created=True,
-            reason="Governance workflow ticket created.",
+            reason=(
+                "Governance workflow ticket created because a high-risk or "
+                "policy-governed condition was detected."
+            ),
             jira_key=jira_key,
             jira_url=jira_url,
         )
@@ -100,31 +103,32 @@ class WorkflowOrchestrator:
         primary_risk_driver: str,
         automation_readiness_score: Optional[int],
     ) -> bool:
-        high_risk_drivers = {
-            "NPI_REUSE_DETECTED",
-            "IDENTIFIER_COLLISION",
-            "ADDRESS_MATCH",
-            "CROSS_SYSTEM_IDENTITY_COLLISION",
-            "REGISTRY_TRUST_DEGRADED",
-            "DEA_CONFLICT",
-        }
+            high_risk_drivers = {
+                "NPI_REUSE_DETECTED",
+                "IDENTIFIER_COLLISION",
+                "CROSS_SYSTEM_IDENTITY_COLLISION",
+                "REGISTRY_TRUST_DEGRADED",
+                "DEA_CONFLICT",
+                "POLICY_EXCEPTION",
+                "GOVERNANCE_POLICY_REQUIRED",
+            }
 
-        if risk_flag in {"HIGH", "SEVERE", "CRITICAL"}:
-            return True
+            if risk_flag in {"HIGH", "SEVERE", "CRITICAL"}:
+                return True
 
-        if recommended_action in {"REVIEW_REQUIRED", "BLOCK_MERGE", "REJECT_MERGE"}:
-            return True
+            if recommended_action in {"BLOCK_MERGE", "REJECT_MERGE"}:
+                return True
 
-        if ai_decision in {"REVIEW_REQUIRED", "BLOCK_MERGE", "REJECT_MERGE"}:
-            return True
+            if ai_decision in {"BLOCK_MERGE", "REJECT_MERGE"}:
+                return True
 
-        if primary_risk_driver in high_risk_drivers:
-            return True
+            if primary_risk_driver in high_risk_drivers:
+                return True
 
-        if automation_readiness_score is not None and automation_readiness_score < 50:
-            return True
+            if automation_readiness_score is not None and automation_readiness_score < 50:
+                return True
 
-        return False
+            return False
 
     def _build_summary(
         self,
@@ -190,5 +194,6 @@ Record B:
 {record_b}
 
 Governance Action Required:
+This workflow was created due to a high-risk or policy-governed condition. It is independent of the AI confidence score.
 Please review the AI decision, validate the identity evidence, and confirm whether this case should be approved, rejected, merged, unmerged, or escalated for policy review.
 """.strip()
