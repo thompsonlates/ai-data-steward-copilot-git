@@ -48,4 +48,3 @@ class GeminiService:
             raw_retry = self.ask(retry_prompt)
             return json.loads(raw_retry)
         
-        print("USING GEMINI PATH")

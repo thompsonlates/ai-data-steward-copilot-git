@@ -1,11 +1,34 @@
-from app.workflow.connectors.jira_connector import JiraConnector
+from __future__ import annotations
 
-jira = JiraConnector()
+import os
 
-response = jira.create_issue(
-    summary="AI Copilot Governance Workflow Test",
-    description="Testing AI Data Steward Copilot Jira integration.",
-    issue_type="Idea",
-)
+from dotenv import load_dotenv
 
-print(response)
+
+def require_env(name: str) -> str:
+    value = (os.getenv(name) or "").strip()
+
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+
+    return value
+
+
+def main() -> None:
+    load_dotenv()
+
+    # This test file does not query tenant data directly, so there is no
+    # database WHERE organization_id filter to apply here. We still require
+    # ORGANIZATION_ID so any downstream Jira test can carry an explicit
+    # tenant context.
+    organization_id = require_env("ORGANIZATION_ID")
+
+    google_client_id = require_env("GOOGLE_CLIENT_ID")
+
+    print("Tenant context loaded.")
+    print(f"ORGANIZATION_ID: {organization_id}")
+    print(f"GOOGLE_CLIENT_ID configured: {bool(google_client_id)}")
+
+
+if __name__ == "__main__":
+    main()

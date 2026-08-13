@@ -68,6 +68,13 @@ class BigQueryMetrics:
     def _has_column(self, table_id: str, column_name: str) -> bool:
         return column_name in self._get_table_columns(table_id)
 
+    @staticmethod
+    def _require_organization_id(organization_id: str) -> str:
+        normalized = organization_id.strip()
+        if not normalized:
+            raise ValueError("organization_id is required")
+        return normalized
+
     def _explain_action_expr(self) -> str:
         if self._has_column(self.explain_table_id, "final_recommended_action"):
             return "COALESCE(e.final_recommended_action, e.recommended_action)"
@@ -118,128 +125,181 @@ class BigQueryMetrics:
         return "CURRENT_TIMESTAMP()"
 
     def get_dq_dashboard_overview(
-        self,
-        days: int = 30,
-        domain: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        query = f"""
-        SELECT
-          metric_date,
-          domain,
-          total_records,
-          avg_record_score,
-          records_below_threshold,
-          records_below_threshold_rate,
-          dq_health_score,
-          dq_risk_score,
-          automation_readiness_score,
-          avg_completeness_score,
-          avg_validity_score,
-          avg_standardization_score,
-          avg_consistency_score,
-          avg_uniqueness_score,
-          total_findings,
-          critical_findings,
-          high_findings,
-          medium_findings,
-          low_findings,
-          open_findings_count,
-          accepted_findings_count,
-          resolved_findings_count,
-          waived_findings_count,
-          records_with_findings,
-          failed_rule_count,
-          duplicate_record_count,
-          scored_critical_issue_count,
-          scored_high_issue_count,
-          scored_medium_issue_count,
-          scored_low_issue_count,
-          scored_total_issue_count,
-          records_flagged_by_ai,
-          ai_recommendations_generated,
-          open_ai_recommendations,
-          accepted_ai_recommendations,
-          rejected_ai_recommendations,
-          implemented_ai_recommendations,
-          high_priority_recommendations,
-          medium_priority_recommendations,
-          low_priority_recommendations,
-          avg_ai_recommendation_confidence,
-          ai_rules_flagged_count,
-          steward_actions_taken,
-          automated_fixes_applied,
-          scored_record_count,
-          min_record_score,
-          max_record_score,
-          very_low_score_count,
-          low_score_count,
-          medium_score_count,
-          high_score_count,
-          total_rules_executed,
-          rules_triggered,
-          configured_rule_count,
-          active_rule_count,
-          inactive_rule_count,
-          configured_critical_rules,
-          configured_high_rules,
-          configured_medium_rules,
-          configured_low_rules,
-          validity_rule_count,
-          completeness_rule_count,
-          standardization_rule_count,
-          uniqueness_rule_count,
-          consistency_rule_count,
-          avg_rule_weight,
-          findings_per_record_rate,
-          duplicate_rate,
-          ai_flagged_record_rate,
-          automated_fix_rate,
-          steward_action_rate,
-          findings_resolution_rate,
-          ai_recommendation_acceptance_rate,
-          ai_recommendation_implementation_rate,
-          impacted_record_rate,
-          summary_created_at
-        FROM `{self.dq_dashboard_view_id}`
-        WHERE metric_date >= DATE_SUB(CURRENT_DATE(), INTERVAL @days DAY)
-          AND (@domain IS NULL OR domain = @domain)
-        ORDER BY metric_date DESC, domain
-        """
+      self,
+      days: int = 30,
+      domain: Optional[str] = None,
+      *,
+      organization_id: str,
+  ) -> Dict[str, Any]:
+      organization_id = self._require_organization_id(
+          organization_id
+      )
 
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter("days", "INT64", days),
-                bigquery.ScalarQueryParameter("domain", "STRING", domain),
-            ]
+      query = f"""
+      SELECT
+        organization_id,
+        metric_date,
+        domain,
+        total_records,
+        avg_record_score,
+        records_below_threshold,
+        records_below_threshold_rate,
+        dq_health_score,
+        dq_risk_score,
+        automation_readiness_score,
+        avg_completeness_score,
+        avg_validity_score,
+        avg_standardization_score,
+        avg_consistency_score,
+        avg_uniqueness_score,
+        total_findings,
+        critical_findings,
+        high_findings,
+        medium_findings,
+        low_findings,
+        open_findings_count,
+        accepted_findings_count,
+        resolved_findings_count,
+        waived_findings_count,
+        records_with_findings,
+        failed_rule_count,
+        duplicate_record_count,
+        scored_critical_issue_count,
+        scored_high_issue_count,
+        scored_medium_issue_count,
+        scored_low_issue_count,
+        scored_total_issue_count,
+        records_flagged_by_ai,
+        ai_recommendations_generated,
+        open_ai_recommendations,
+        accepted_ai_recommendations,
+        rejected_ai_recommendations,
+        implemented_ai_recommendations,
+        high_priority_recommendations,
+        medium_priority_recommendations,
+        low_priority_recommendations,
+        avg_ai_recommendation_confidence,
+        ai_rules_flagged_count,
+        steward_actions_taken,
+        automated_fixes_applied,
+        scored_record_count,
+        min_record_score,
+        max_record_score,
+        very_low_score_count,
+        low_score_count,
+        medium_score_count,
+        high_score_count,
+        total_rules_executed,
+        rules_triggered,
+        configured_rule_count,
+        active_rule_count,
+        inactive_rule_count,
+        configured_critical_rules,
+        configured_high_rules,
+        configured_medium_rules,
+        configured_low_rules,
+        validity_rule_count,
+        completeness_rule_count,
+        standardization_rule_count,
+        uniqueness_rule_count,
+        consistency_rule_count,
+        avg_rule_weight,
+        findings_per_record_rate,
+        duplicate_rate,
+        ai_flagged_record_rate,
+        automated_fix_rate,
+        steward_action_rate,
+        findings_resolution_rate,
+        ai_recommendation_acceptance_rate,
+        ai_recommendation_implementation_rate,
+        impacted_record_rate,
+        summary_created_at
+      FROM `{self.dq_dashboard_view_id}` AS d
+      WHERE d.organization_id = @organization_id
+        AND d.metric_date >= DATE_SUB(
+            CURRENT_DATE(),
+            INTERVAL @days DAY
         )
+        AND (
+            @domain IS NULL
+            OR d.domain = @domain
+        )
+      ORDER BY metric_date DESC, domain
+      """
 
-        query_job = self.client.query(query, job_config=job_config)
-        results = query_job.result()
+      job_config = bigquery.QueryJobConfig(
+          query_parameters=[
+              bigquery.ScalarQueryParameter(
+                  "organization_id",
+                  "STRING",
+                  organization_id,
+              ),
+              bigquery.ScalarQueryParameter(
+                  "days",
+                  "INT64",
+                  days,
+              ),
+              bigquery.ScalarQueryParameter(
+                  "domain",
+                  "STRING",
+                  domain,
+              ),
+          ]
+      )
 
-        rows: List[Dict[str, Any]] = []
-        for row in results:
-            item = dict(row.items())
+      query_job = self.client.query(
+          query,
+          job_config=job_config,
+      )
 
-            if item.get("summary_created_at") is not None:
-                item["summary_created_at"] = item["summary_created_at"].isoformat()
+      results = query_job.result()
 
-            for key, value in list(item.items()):
-                if hasattr(value, "item"):
-                    item[key] = value.item()
+      rows: List[Dict[str, Any]] = []
 
-            rows.append(item)
+      for row in results:
+          item = dict(row.items())
 
-        latest = rows[0] if rows else None
+          returned_organization_id = str(
+              item.get("organization_id") or ""
+          ).strip()
 
-        return {
-            "days": days,
-            "domain": domain,
-            "rows": rows,
-            "latest": latest,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-        }
+          if returned_organization_id != organization_id:
+              raise RuntimeError(
+                  "DQ dashboard query returned data for "
+                  "a different organization."
+              )
 
-    def overview(self, days: int) -> Dict[str, Any]:
+          if item.get("summary_created_at") is not None:
+              item["summary_created_at"] = (
+                  item["summary_created_at"].isoformat()
+              )
+
+          for key, value in list(item.items()):
+              if hasattr(value, "item"):
+                  item[key] = value.item()
+
+          rows.append(item)
+
+      latest = rows[0] if rows else None
+
+      return {
+          "days": days,
+          "domain": domain,
+          "rows": rows,
+          "latest": latest,
+          "generated_at": (
+              datetime.now(timezone.utc).isoformat()
+          ),
+      }
+
+    def overview(
+        self,
+        days: int,
+        *,
+        organization_id: str,
+    ) -> Dict[str, Any]:
+        organization_id = self._require_organization_id(organization_id)
+
         action_expr = self._explain_action_expr()
         feedback_reason_expr = self._feedback_override_reason_expr("lf")
         feedback_flag_expr = self._feedback_override_flag_expr("lf")
@@ -247,9 +307,10 @@ class BigQueryMetrics:
 
         query = f"""
         WITH base_explain AS (
-          SELECT *
-          FROM `{self.explain_table_id}`
-          WHERE created_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
+          SELECT e.*
+          FROM `{self.explain_table_id}` AS e
+          WHERE e.organization_id = @organization_id
+            AND e.created_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
         ),
 
         base_explain_bucketed AS (
@@ -267,9 +328,10 @@ class BigQueryMetrics:
         ),
 
         base_feedback AS (
-          SELECT *
-          FROM `{self.feedback_table_id}` f
-          WHERE {feedback_ts_expr.replace('f.', '')} >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
+          SELECT f.*
+          FROM `{self.feedback_table_id}` AS f
+          WHERE f.organization_id = @organization_id
+            AND {feedback_ts_expr} >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
         ),
 
         latest_feedback AS (
@@ -519,7 +581,12 @@ class BigQueryMetrics:
             query,
             job_config=bigquery.QueryJobConfig(
                 query_parameters=[
-                    bigquery.ScalarQueryParameter("days", "INT64", days)
+                    bigquery.ScalarQueryParameter(
+                        "organization_id",
+                        "STRING",
+                        organization_id,
+                    ),
+                    bigquery.ScalarQueryParameter("days", "INT64", days),
                 ]
             ),
         )
@@ -615,7 +682,14 @@ class BigQueryMetrics:
             "learning_timeline": to_learning_timeline(r.get("learning_timeline")),
         }
 
-    def get_recommended_action(self, explanation_id: str) -> Optional[str]:
+    def get_recommended_action(
+        self,
+        explanation_id: str,
+        *,
+        organization_id: str,
+    ) -> Optional[str]:
+        organization_id = self._require_organization_id(organization_id)
+
         action_expr = (
             "COALESCE(final_recommended_action, recommended_action)"
             if self._has_column(self.explain_table_id, "final_recommended_action")
@@ -624,9 +698,10 @@ class BigQueryMetrics:
 
         query = f"""
         SELECT {action_expr} AS recommended_action
-        FROM `{self.explain_table_id}`
-        WHERE explanation_id = @explanation_id
-        ORDER BY created_at DESC
+        FROM `{self.explain_table_id}` AS e
+        WHERE e.explanation_id = @explanation_id
+          AND e.organization_id = @organization_id
+        ORDER BY e.created_at DESC
         LIMIT 1
         """
         job = self.client.query(
@@ -634,8 +709,15 @@ class BigQueryMetrics:
             job_config=bigquery.QueryJobConfig(
                 query_parameters=[
                     bigquery.ScalarQueryParameter(
-                        "explanation_id", "STRING", explanation_id
-                    )
+                        "explanation_id",
+                        "STRING",
+                        explanation_id,
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "organization_id",
+                        "STRING",
+                        organization_id,
+                    ),
                 ]
             ),
         )
@@ -663,7 +745,11 @@ class BigQueryMetrics:
         record_a_source_system: str | None = None,
         record_b_source_system: str | None = None,
         limit: int = 5,
+        *,
+        organization_id: str,
     ) -> dict:
+        organization_id = self._require_organization_id(organization_id)
+
         empty_result = {
             "summary_patterns": [],
             "score_band_patterns": [],
@@ -690,7 +776,8 @@ class BigQueryMetrics:
         WITH latest_feedback AS (
           SELECT AS VALUE
             ARRAY_AGG(f ORDER BY {feedback_ts_expr} DESC LIMIT 1)[OFFSET(0)]
-          FROM `{self.feedback_table_id}` f
+          FROM `{self.feedback_table_id}` AS f
+          WHERE f.organization_id = @organization_id
           GROUP BY f.explanation_id
         ),
 
@@ -720,7 +807,9 @@ class BigQueryMetrics:
           FROM `{self.explain_table_id}` e
           JOIN latest_feedback lf
             ON lf.explanation_id = e.explanation_id
-          WHERE e.domain = @domain
+           AND lf.organization_id = e.organization_id
+          WHERE e.organization_id = @organization_id
+            AND e.domain = @domain
             AND EXISTS (
               SELECT 1
               FROM UNNEST(e.triggered_rules) rule
@@ -864,6 +953,11 @@ class BigQueryMetrics:
             query,
             job_config=bigquery.QueryJobConfig(
                 query_parameters=[
+                    bigquery.ScalarQueryParameter(
+                        "organization_id",
+                        "STRING",
+                        organization_id,
+                    ),
                     bigquery.ScalarQueryParameter("domain", "STRING", domain),
                     bigquery.ArrayQueryParameter(
                         "triggered_rules", "STRING", triggered_rules

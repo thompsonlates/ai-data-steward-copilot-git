@@ -111,6 +111,13 @@ class PolicyIntelligenceEngine:
     def _normalize_policy_version(self, policy_version: Optional[str]) -> str:
         return (policy_version or self.default_policy_version).strip()
 
+    @staticmethod
+    def _require_organization_id(organization_id: str) -> str:
+        normalized = str(organization_id or "").strip()
+        if not normalized:
+            raise ValueError("organization_id is required for tenant-scoped policy operations")
+        return normalized
+
     def _safe_float(
         self,
         value: Any,
@@ -150,13 +157,15 @@ class PolicyIntelligenceEngine:
             "default_decision_mode": "REVIEW",
             "review_required_flag": "Y",
             "allow_auto_merge_flag": "N",
+            "organization_id": None,
         }
 
     def _default_policy_thresholds(
-        self,
-        domain: str,
-        policy_version: str,
-    ) -> dict[str, Any]:
+            self,
+            organization_id: str,
+            domain: str,
+            policy_version: str,
+        ) -> dict[str, Any]:
         print(f"[WARNING] USING DEFAULT POLICY THRESHOLDS FOR DOMAIN={domain}")
         print( f"[WARNING] USING DEFAULT POLICY THRESHOLDS "f"FOR DOMAIN={domain}, POLICY_VERSION={policy_version}"
 )
@@ -164,6 +173,7 @@ class PolicyIntelligenceEngine:
             "threshold_id": None,
             "policy_id": None,
             "domain": domain,
+            "organization_id": organization_id,
             "policy_version": policy_version,
             "min_review_score": 0.90,
             "min_approve_merge_score": 0.95,
@@ -178,7 +188,6 @@ class PolicyIntelligenceEngine:
             "active_flag": 'Y',
             "effective_from": None,
             "effective_to": None,
-            
         }
 
     def _format_override_learning_context(self, rows: list[dict[str, Any]]) -> str:
@@ -201,9 +210,14 @@ class PolicyIntelligenceEngine:
 
         return "\n".join(lines)
 
-    def _get_active_policy_config(self, domain: str) -> tuple[dict[str, Any], bool]:
+    def _get_active_policy_config(
+        self,
+        domain: str,
+        organization_id: str,
+    ) -> tuple[dict[str, Any], bool]:
         effective_domain = self._normalize_domain(domain)
-        cache_key = f"policy_config:{effective_domain}"
+        effective_organization_id = self._require_organization_id(organization_id)
+        cache_key = f"policy_config:{effective_organization_id}:{effective_domain}"
         cached = self._cache_get(cache_key)
         if cached is not None:
             return cached, True
@@ -220,9 +234,11 @@ class PolicyIntelligenceEngine:
             effective_to,
             default_decision_mode,
             review_required_flag,
-            allow_auto_merge_flag
+            allow_auto_merge_flag,
+            organization_id
         FROM `{self.policy_config_table}`
-        WHERE domain = @domain
+        WHERE organization_id = @organization_id
+          AND domain = @domain
           AND active_flag = 'Y'
           AND (effective_from IS NULL OR effective_from <= CURRENT_TIMESTAMP())
           AND (effective_to IS NULL OR effective_to >= CURRENT_TIMESTAMP())
@@ -234,6 +250,11 @@ class PolicyIntelligenceEngine:
             query,
             job_config=bigquery.QueryJobConfig(
                 query_parameters=[
+                    bigquery.ScalarQueryParameter(
+                        "organization_id",
+                        "STRING",
+                        effective_organization_id,
+                    ),
                     bigquery.ScalarQueryParameter(
                         "domain",
                         "STRING",
@@ -259,11 +280,16 @@ class PolicyIntelligenceEngine:
         self,
         domain: str,
         policy_version: str,
+        organization_id: str,
     ) -> tuple[dict[str, Any], bool]:
         effective_domain = self._normalize_domain(domain)
         effective_policy_version = self._normalize_policy_version(policy_version)
+        effective_organization_id = self._require_organization_id(organization_id)
 
-        cache_key = f"policy_thresholds:{effective_domain}:{effective_policy_version}"
+        cache_key = (
+            f"policy_thresholds:{effective_organization_id}:"
+            f"{effective_domain}:{effective_policy_version}"
+        )
         cached = self._cache_get(cache_key)
         if cached is not None:
             return cached, True
@@ -272,6 +298,7 @@ class PolicyIntelligenceEngine:
         SELECT
             threshold_id,
             policy_id,
+            organization_id,
             domain,
             policy_version,
             min_review_score,
@@ -286,9 +313,11 @@ class PolicyIntelligenceEngine:
             require_manual_review_on_conflict_flag,
             active_flag,
             effective_from,
-            effective_to
+            effective_to,
+            organization_id
         FROM `{self.policy_thresholds_table}`
-        WHERE domain = @domain
+        WHERE organization_id = @organization_id
+          AND domain = @domain
           AND policy_version = @policy_version
           AND active_flag = 'Y'
           AND (effective_from IS NULL OR effective_from <= CURRENT_TIMESTAMP())
@@ -301,6 +330,11 @@ class PolicyIntelligenceEngine:
             query,
             job_config=bigquery.QueryJobConfig(
                 query_parameters=[
+                    bigquery.ScalarQueryParameter(
+                        "organization_id",
+                        "STRING",
+                        effective_organization_id,
+                    ),
                     bigquery.ScalarQueryParameter(
                         "domain",
                         "STRING",
@@ -336,15 +370,18 @@ class PolicyIntelligenceEngine:
         domain: str,
         policy_version: str,
         triggered_rules: list[str],
+        organization_id: str,
     ) -> tuple[list[dict[str, Any]], bool]:
         if not triggered_rules:
             return [], False
 
         effective_domain = self._normalize_domain(domain)
         effective_policy_version = self._normalize_policy_version(policy_version)
+        effective_organization_id = self._require_organization_id(organization_id)
         rules_key = "|".join(sorted(triggered_rules))
         cache_key = (
-            f"policy_risk_rules:{effective_domain}:{effective_policy_version}:{rules_key}"
+            f"policy_risk_rules:{effective_organization_id}:"
+            f"{effective_domain}:{effective_policy_version}:{rules_key}"
         )
         cached = self._cache_get(cache_key)
         if cached is not None:
@@ -365,9 +402,11 @@ class PolicyIntelligenceEngine:
             active_flag,
             effective_from,
             effective_to,
-            notes
+            notes,
+            organization_id
         FROM `{self.policy_risk_rules_table}`
-        WHERE domain = @domain
+        WHERE organization_id = @organization_id
+          AND domain = @domain
           AND policy_version = @policy_version
           AND active_flag = 'Y'
           AND triggered_rule IN UNNEST(@triggered_rules)
@@ -380,6 +419,11 @@ class PolicyIntelligenceEngine:
             query,
             job_config=bigquery.QueryJobConfig(
                 query_parameters=[
+                    bigquery.ScalarQueryParameter(
+                        "organization_id",
+                        "STRING",
+                        effective_organization_id,
+                    ),
                     bigquery.ScalarQueryParameter(
                         "domain",
                         "STRING",
@@ -800,12 +844,17 @@ class PolicyIntelligenceEngine:
 
     def get_policy_config_bundle(
         self,
+        organization_id: str,
         domain: Optional[str] = None,
         policy_version: Optional[str] = None,
     ) -> dict[str, Any]:
         effective_domain = self._normalize_domain(domain)
+        effective_organization_id = self._require_organization_id(organization_id)
 
-        active_cfg, _ = self._get_active_policy_config(effective_domain)
+        active_cfg, _ = self._get_active_policy_config(
+            effective_domain,
+            effective_organization_id,
+        )
         effective_policy_version = (
             self._normalize_policy_version(policy_version)
             if policy_version
@@ -824,9 +873,11 @@ class PolicyIntelligenceEngine:
           effective_to,
           default_decision_mode,
           review_required_flag,
-          allow_auto_merge_flag
+          allow_auto_merge_flag,
+          organization_id
         FROM `{self.policy_config_table}`
-        WHERE domain = @domain
+        WHERE organization_id = @organization_id
+          AND domain = @domain
           AND policy_version = @policy_version
         ORDER BY effective_from DESC, policy_id DESC
         LIMIT 1
@@ -850,9 +901,11 @@ class PolicyIntelligenceEngine:
           require_manual_review_on_conflict_flag,
           active_flag,
           effective_from,
-          effective_to
+          effective_to,
+          organization_id
         FROM `{self.policy_thresholds_table}`
-        WHERE domain = @domain
+        WHERE organization_id = @organization_id
+          AND domain = @domain
           AND policy_version = @policy_version
         ORDER BY effective_from DESC, threshold_id DESC
         LIMIT 1
@@ -873,15 +926,22 @@ class PolicyIntelligenceEngine:
           active_flag,
           effective_from,
           effective_to,
-          notes
+          notes,
+          organization_id
         FROM `{self.policy_risk_rules_table}`
-        WHERE domain = @domain
+        WHERE organization_id = @organization_id
+          AND domain = @domain
           AND policy_version = @policy_version
         ORDER BY risk_weight DESC, triggered_rule
         """
 
         job_config = bigquery.QueryJobConfig(
             query_parameters=[
+                bigquery.ScalarQueryParameter(
+                    "organization_id",
+                    "STRING",
+                    effective_organization_id,
+                ),
                 bigquery.ScalarQueryParameter(
                     "domain",
                     "STRING",
@@ -912,6 +972,7 @@ class PolicyIntelligenceEngine:
             self._row_to_plain_dict(threshold_rows[0])
             if threshold_rows
             else self._default_policy_thresholds(
+                organization_id,
                 effective_domain,
                 effective_policy_version,
             )
@@ -919,6 +980,7 @@ class PolicyIntelligenceEngine:
         risk_rules = [self._row_to_plain_dict(r) for r in risk_rule_rows]
 
         return {
+            "organization_id": effective_organization_id,
             "domain": effective_domain,
             "policy_version": effective_policy_version,
             "config": config_row,
@@ -927,13 +989,39 @@ class PolicyIntelligenceEngine:
             "generated_at": self._utc_now_iso(),
         }
 
-    def save_policy_draft(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def save_policy_draft(
+        self,
+        payload: dict[str, Any],
+        organization_id: str,
+    ) -> dict[str, Any]:
+        effective_organization_id = self._require_organization_id(organization_id)
         domain = self._normalize_domain(payload.get("domain"))
         policy_version = self._normalize_policy_version(payload.get("policy_version"))
-        updated_by = str(payload.get("updated_by") or "system").strip()
+        created_by = str(
+        payload.get("created_by")
+        or payload.get("updated_by")
+        or "system"
+        ).strip()
+
+        updated_by = str(
+        payload.get("updated_by")
+        or created_by
+        ).strip()
         now_ts = datetime.now(timezone.utc)
 
+        requested_active_flag = str(
+            payload.get("active_flag") or "N"
+        ).strip().upper()
+
+        active_flag = (
+            "Y"
+            if requested_active_flag == "Y"
+            else "N"
+        )
+    
+
         current_bundle = self.get_policy_config_bundle(
+            organization_id=effective_organization_id,
             domain=domain,
             policy_version=policy_version,
         )
@@ -950,17 +1038,23 @@ class PolicyIntelligenceEngine:
                 or f"pol_{uuid.uuid4().hex[:12]}"
             ),
             "domain": domain,
+            "organization_id": effective_organization_id,
+            "created_by": created_by,
+            "created_at": now_ts,
+            "updated_by": updated_by,
+            "updated_at": now_ts,
             "policy_version": policy_version,
             "policy_name": payload.get("policy_name", current_config.get("policy_name")),
             "policy_description": payload.get(
                 "policy_description",
                 current_config.get("policy_description"),
             ),
-            "active_flag": 'N',
-            "effective_from": payload.get(
-                "effective_from",
-                current_config.get("effective_from"),
-            ),
+           "active_flag": active_flag,
+
+           "effective_from": payload.get(
+            "effective_from",
+            current_config.get("effective_from"),
+        ),
             "effective_to": payload.get(
                 "effective_to",
                 current_config.get("effective_to"),
@@ -992,6 +1086,7 @@ class PolicyIntelligenceEngine:
                 or f"thr_{uuid.uuid4().hex[:12]}"
             ),
             "policy_id": config_row["policy_id"],
+            "organization_id": effective_organization_id,
             "domain": domain,
             "policy_version": policy_version,
             "min_review_score": self._safe_float(
@@ -1067,11 +1162,12 @@ class PolicyIntelligenceEngine:
                     ),
                 )
             ),
-            "active_flag": 'N',
-            "effective_from": payload.get(
-                "effective_from",
-                current_thresholds.get("effective_from"),
-            ),
+          "active_flag": active_flag,
+
+          "effective_from": payload.get(
+            "effective_from",
+            current_thresholds.get("effective_from"),
+        ),
             "effective_to": payload.get(
                 "effective_to",
                 current_thresholds.get("effective_to"),
@@ -1079,10 +1175,11 @@ class PolicyIntelligenceEngine:
         }
 
         merge_config_sql = f"""
-        MERGE `{self.policy_config_table}` T
-        USING (
-          SELECT
+    MERGE `{self.policy_config_table}` T
+    USING (
+        SELECT
             @policy_id AS policy_id,
+            @organization_id AS organization_id,
             @domain AS domain,
             @policy_version AS policy_version,
             @policy_name AS policy_name,
@@ -1092,12 +1189,19 @@ class PolicyIntelligenceEngine:
             @effective_to AS effective_to,
             @default_decision_mode AS default_decision_mode,
             @review_required_flag AS review_required_flag,
-            @allow_auto_merge_flag AS allow_auto_merge_flag
-        ) S
-        ON T.domain = S.domain
-           AND T.policy_version = S.policy_version
-        WHEN MATCHED THEN
-          UPDATE SET
+            @allow_auto_merge_flag AS allow_auto_merge_flag,
+            @created_by AS created_by,
+            @created_at AS created_at,
+            @updated_by AS updated_by,
+            @updated_at AS updated_at
+    ) S
+
+    ON T.organization_id = S.organization_id
+    AND T.domain = S.domain
+    AND T.policy_version = S.policy_version
+
+    WHEN MATCHED THEN
+        UPDATE SET
             policy_name = S.policy_name,
             policy_description = S.policy_description,
             active_flag = S.active_flag,
@@ -1105,10 +1209,14 @@ class PolicyIntelligenceEngine:
             effective_to = S.effective_to,
             default_decision_mode = S.default_decision_mode,
             review_required_flag = S.review_required_flag,
-            allow_auto_merge_flag = S.allow_auto_merge_flag
-        WHEN NOT MATCHED THEN
-          INSERT (
+            allow_auto_merge_flag = S.allow_auto_merge_flag,
+            updated_by = S.updated_by,
+            updated_at = S.updated_at
+
+    WHEN NOT MATCHED THEN
+        INSERT (
             policy_id,
+            organization_id,
             domain,
             policy_version,
             policy_name,
@@ -1118,10 +1226,15 @@ class PolicyIntelligenceEngine:
             effective_to,
             default_decision_mode,
             review_required_flag,
-            allow_auto_merge_flag
-          )
-          VALUES (
+            allow_auto_merge_flag,
+            created_by,
+            created_at,
+            updated_by,
+            updated_at
+        )
+        VALUES (
             S.policy_id,
+            S.organization_id,
             S.domain,
             S.policy_version,
             S.policy_name,
@@ -1131,9 +1244,13 @@ class PolicyIntelligenceEngine:
             S.effective_to,
             S.default_decision_mode,
             S.review_required_flag,
-            S.allow_auto_merge_flag
-          )
-        """
+            S.allow_auto_merge_flag,
+            S.created_by,
+            S.created_at,
+            S.updated_by,
+            S.updated_at
+        )
+    """
 
         merge_thresholds_sql = f"""
         MERGE `{self.policy_thresholds_table}` T
@@ -1141,6 +1258,7 @@ class PolicyIntelligenceEngine:
           SELECT
             @threshold_id AS threshold_id,
             @policy_id AS policy_id,
+            @organization_id AS organization_id,
             @domain AS domain,
             @policy_version AS policy_version,
             @min_review_score AS min_review_score,
@@ -1157,7 +1275,8 @@ class PolicyIntelligenceEngine:
             @effective_from AS effective_from,
             @effective_to AS effective_to
         ) S
-        ON T.domain = S.domain
+        ON T.organization_id = S.organization_id
+           AND T.domain = S.domain
            AND T.policy_version = S.policy_version
         WHEN MATCHED THEN
           UPDATE SET
@@ -1178,6 +1297,7 @@ class PolicyIntelligenceEngine:
           INSERT (
             threshold_id,
             policy_id,
+            organization_id,
             domain,
             policy_version,
             min_review_score,
@@ -1197,6 +1317,7 @@ class PolicyIntelligenceEngine:
           VALUES (
             S.threshold_id,
             S.policy_id,
+            S.organization_id,
             S.domain,
             S.policy_version,
             S.min_review_score,
@@ -1214,11 +1335,20 @@ class PolicyIntelligenceEngine:
             S.effective_to
           )
         """
-
+        print(
+            "POLICY THRESHOLDS MERGE TARGET:",
+            self.policy_thresholds_table,
+            flush=True,
+        )
         self.client.query(
             merge_config_sql,
             job_config=bigquery.QueryJobConfig(
                 query_parameters=[
+                    bigquery.ScalarQueryParameter(
+                        "organization_id",
+                        "STRING",
+                        effective_organization_id,
+                    ),
                     bigquery.ScalarQueryParameter(
                         "policy_id",
                         "STRING",
@@ -1274,14 +1404,56 @@ class PolicyIntelligenceEngine:
                         "STRING",
                         config_row["allow_auto_merge_flag"],
                     ),
+
+                    bigquery.ScalarQueryParameter(
+                        "created_by",
+                        "STRING",
+                        config_row["created_by"],
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "created_at",
+                        "TIMESTAMP",
+                        config_row["created_at"],
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "updated_by",
+                        "STRING",
+                        config_row["updated_by"],
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "updated_at",
+                        "TIMESTAMP",
+                        config_row["updated_at"],
+                    ),
                 ]
             ),
         ).result()
+
+        runtime_table = self.client.get_table(
+            self.policy_thresholds_table
+        )
+
+        print(
+            "POLICY THRESHOLDS RUNTIME SCHEMA:",
+            [field.name for field in runtime_table.schema],
+            flush=True,
+        )
+
+        print(
+            "POLICY THRESHOLDS TABLE TYPE:",
+            runtime_table.table_type,
+            flush=True,
+        )
 
         self.client.query(
             merge_thresholds_sql,
             job_config=bigquery.QueryJobConfig(
                 query_parameters=[
+                    bigquery.ScalarQueryParameter(
+                        "organization_id",
+                        "STRING",
+                        effective_organization_id,
+                    ),
                     bigquery.ScalarQueryParameter(
                         "threshold_id",
                         "STRING",
@@ -1375,6 +1547,7 @@ class PolicyIntelligenceEngine:
 
         return {
             "status": "DRAFT_SAVED",
+            "organization_id": effective_organization_id,
             "domain": domain,
             "policy_version": policy_version,
             "updated_by": updated_by,
@@ -1387,8 +1560,10 @@ class PolicyIntelligenceEngine:
         self,
         domain: Optional[str],
         policy_version: str,
+        organization_id: str,
         published_by: str = "system",
     ) -> dict[str, Any]:
+        effective_organization_id = self._require_organization_id(organization_id)
         effective_domain = self._normalize_domain(domain)
         effective_policy_version = self._normalize_policy_version(policy_version)
         publisher = str(published_by or "system").strip()
@@ -1399,7 +1574,8 @@ class PolicyIntelligenceEngine:
         SET
           active_flag = 'N',
           effective_to = CURRENT_TIMESTAMP()
-        WHERE domain = @domain
+        WHERE organization_id = @organization_id
+          AND domain = @domain
           AND active_flag = 'Y'
         """
 
@@ -1408,7 +1584,8 @@ class PolicyIntelligenceEngine:
         SET
           active_flag = 'N',
           effective_to = CURRENT_TIMESTAMP()
-        WHERE domain = @domain
+        WHERE organization_id = @organization_id
+          AND domain = @domain
           AND active_flag = 'Y'
         """
 
@@ -1417,7 +1594,8 @@ class PolicyIntelligenceEngine:
         SET
           active_flag = 'N',
           effective_to = CURRENT_TIMESTAMP()
-        WHERE domain = @domain
+        WHERE organization_id = @organization_id
+          AND domain = @domain
           AND active_flag = 'Y'
           AND policy_version != @policy_version
         """
@@ -1428,7 +1606,8 @@ class PolicyIntelligenceEngine:
           active_flag = 'Y',
           effective_from = COALESCE(effective_from, CURRENT_TIMESTAMP()),
           effective_to = NULL
-        WHERE domain = @domain
+        WHERE organization_id = @organization_id
+          AND domain = @domain
           AND policy_version = @policy_version
         """
 
@@ -1438,7 +1617,8 @@ class PolicyIntelligenceEngine:
           active_flag = 'Y',
           effective_from = COALESCE(effective_from, CURRENT_TIMESTAMP()),
           effective_to = NULL
-        WHERE domain = @domain
+        WHERE organization_id = @organization_id
+          AND domain = @domain
           AND policy_version = @policy_version
         """
 
@@ -1448,12 +1628,18 @@ class PolicyIntelligenceEngine:
           active_flag = 'Y',
           effective_from = COALESCE(effective_from, CURRENT_TIMESTAMP()),
           effective_to = NULL
-        WHERE domain = @domain
+        WHERE organization_id = @organization_id
+          AND domain = @domain
           AND policy_version = @policy_version
         """
 
         base_job_config = bigquery.QueryJobConfig(
             query_parameters=[
+                bigquery.ScalarQueryParameter(
+                    "organization_id",
+                    "STRING",
+                    effective_organization_id,
+                ),
                 bigquery.ScalarQueryParameter(
                     "domain",
                     "STRING",
@@ -1517,6 +1703,7 @@ class PolicyIntelligenceEngine:
 
         return {
             "status": "PUBLISHED",
+            "organization_id": effective_organization_id,
             "domain": effective_domain,
             "policy_version": effective_policy_version,
             "published_by": publisher,
@@ -1524,16 +1711,24 @@ class PolicyIntelligenceEngine:
             "config_rows_activated": cfg_affected,
             "threshold_rows_activated": thr_affected,
             "risk_rule_rows_activated": risk_affected,
-        }
+              }
 
-    def build_decision_context(self, req: MatchExplainRequest) -> dict[str, Any]:
+    def build_decision_context(
+        self,
+        req: MatchExplainRequest,
+        organization_id: str,
+    ) -> dict[str, Any]:
         start_time = time.perf_counter()
+        effective_organization_id = self._require_organization_id(organization_id)
 
         domain = self._normalize_domain(req.domain)
         request_id = self._ensure_request_id(req.request_id)
         audit_packet_id = self._build_audit_packet_id()
 
-        policy_cfg, policy_cfg_cache_hit = self._get_active_policy_config(domain)
+        policy_cfg, policy_cfg_cache_hit = self._get_active_policy_config(
+            domain,
+            effective_organization_id,
+        )
 
         policy_version = (
             self._normalize_policy_version(req.policy_version)
@@ -1544,15 +1739,18 @@ class PolicyIntelligenceEngine:
         thresholds, thresholds_cache_hit = self._get_active_policy_thresholds(
             domain,
             policy_version,
+            effective_organization_id,
         )
 
         risk_rules, risk_rules_cache_hit = self._get_active_policy_risk_rules(
             domain,
             policy_version,
             req.triggered_rules,
+            effective_organization_id,
         )
 
         learning_data = self.metrics.get_override_learning_context(
+            organization_id=effective_organization_id,
             domain=domain,
             triggered_rules=req.triggered_rules,
             match_score=req.match_score,
@@ -1599,6 +1797,7 @@ class PolicyIntelligenceEngine:
         )
 
         return {
+            "organization_id": effective_organization_id,
             "domain": domain,
             "policy_version": policy_version,
             "request_id": request_id,

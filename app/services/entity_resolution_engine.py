@@ -7,6 +7,7 @@ from typing import Any, Optional
 from app.services.similarity_engine import (SimilarityEngine,email_domain_trust,)
 
 from app.api.schemas import MatchExplainRequest
+from datetime import datetime
 
 
 @dataclass
@@ -117,31 +118,32 @@ class EntityResolutionEngine:
             "gtin_match": 0.25,
             "sku_match": 0.15,
             "name_similarity": 0.10,
-            "effective_lot_date_match": 0.10,
-            "attribute_similarity": 0.10,
+            "item_category_similarity": 0.10,
+            "product_variant_similarity": 0.10,
             "source_trust": 0.05,
             "steward_learning": 0.05,
         },
         "PROVIDER": {
             "provider_id_match": 0.25,
             "npi_match": 0.25,
+            "phone_match": 0.15,
             "name_similarity": 0.10,
             "provider_email_match": 0.10,
-            "address_similarity": 0.20,
+            "address_similarity": 0.05,
             "specialty_similarity": 0.05,
             "source_trust": 0.03,
             "steward_learning": 0.02,
 },
-        "PATIENT": {
-            "patient_id_match": 0.25,
-            "human_id_match": 0.05,
+       "PATIENT": {
+            "patient_id_match": 0.20,
+            "human_id_match": 0.10,
             "dob_match": 0.20,
             "name_similarity": 0.20,
             "address_similarity": 0.15,
-            "email_match": 0.10,
+            "email_match": 0.05,
             "source_trust": 0.05,
-            "steward_learning": 0.00,
-        },
+            "steward_learning": 0.05,
+},
     }
 
     def _gtin_detail(
@@ -238,6 +240,73 @@ class EntityResolutionEngine:
             "Immutable identity anchors differed."
         )
     
+    def _normalize_phone(self, value: Optional[str]) -> str:
+        digits = "".join(
+            character
+        for character in str(value or "")
+        if character.isdigit()
+        )
+
+    # Normalize US country code: 1-904-555-1212 -> 9045551212
+        if len(digits) == 11 and digits.startswith("1"):
+            digits = digits[1:]
+
+        return digits
+
+
+    def _phone_score(
+        self,
+        phone_a: Optional[str],
+        phone_b: Optional[str],
+    ) -> Optional[float]:
+        normalized_a = self._normalize_phone(phone_a)
+        normalized_b = self._normalize_phone(phone_b)
+
+        # Missing phone evidence is unavailable, not a mismatch.
+        if not normalized_a or not normalized_b:
+            return None
+
+        return 1.0 if normalized_a == normalized_b else 0.0
+
+
+    def _phone_detail(
+        self,
+        phone_a: Optional[str],
+        phone_b: Optional[str],
+    ) -> str:
+        normalized_a = self._normalize_phone(phone_a)
+        normalized_b = self._normalize_phone(phone_b)
+
+        if not normalized_a and not normalized_b:
+            return "Provider phone evidence was unavailable for both records."
+
+        if not normalized_a or not normalized_b:
+            return "Provider phone evidence was unavailable for one record."
+
+        if normalized_a == normalized_b:
+            return "Provider phone numbers match after normalization."
+
+        return "Provider phone numbers differ after normalization."
+
+    
+    def _is_valid_dob(self, value):
+
+        if value in (None, ""):
+            return False
+
+        text = str(value).strip()
+
+        for fmt in ("%Y-%m-%d",
+                    "%m/%d/%Y",
+                    "%Y/%m/%d"):
+            try:
+                datetime.strptime(text, fmt)
+                return True
+            except ValueError:
+                pass
+
+        return False
+    
     def _npi_detail( 
         self, 
         npi_a: str | None, 
@@ -257,18 +326,122 @@ class EntityResolutionEngine:
             f"Compared provider NPIs '{npi_a}' and '{npi_b}'. "
             "Provider registry identifiers did not align."
         )
-    
-    def _effective_lot_date_detail(self, a, b):
-       return f"Compared effective / lot dates '{a}' and '{b}'."
-    
+        
     def _attribute_similarity_detail(self, a, b):
         return ("Compared product descriptors, classifications, and attributes"
                 "to assess overall product similarity beyond exact identifier matches."
-            )   
+        )   
+    
     def _address_similarity_detail(self, a, b):
         return ("Addresses normalized to the same standardized location "
                 "with high similarity confidence."
-            )   
+        )
+    
+    
+    def _product_variant_detail(self, variant_a, variant_b) -> str:
+        return (
+            f"Compared product variant / pack size "
+            f"'{variant_a or 'UNKNOWN'}' and "
+            f"'{variant_b or 'UNKNOWN'}'."
+        )
+    
+    def _item_category_detail(self, category_a, category_b) -> str:
+        return (
+            f"Compared item categories "
+            f"'{category_a or 'UNKNOWN'}' and "
+            f"'{category_b or 'UNKNOWN'}'."
+        )
+
+    @staticmethod
+    def _require_organization_id(
+        organization_id: str,
+    ) -> str:
+        normalized = str(
+            organization_id or ""
+        ).strip()
+
+        if not normalized:
+            raise ValueError(
+                "organization_id is required for "
+                "tenant-isolated entity resolution."
+            )
+
+        if not normalized.startswith("org_"):
+            raise ValueError(
+                "organization_id must use the org_ identifier standard."
+            )
+
+        return normalized
+
+    @staticmethod
+    def _record_organization_id(
+        record: Any,
+    ) -> str:
+        if record is None:
+            return ""
+
+        if isinstance(record, dict):
+            value = record.get("organization_id")
+        else:
+            value = getattr(
+                record,
+                "organization_id",
+                None,
+            )
+
+        return str(value or "").strip()
+
+    @classmethod
+    def _assert_record_tenant(
+        cls,
+        *,
+        record: Any,
+        organization_id: str,
+        record_name: str,
+    ) -> None:
+        record_organization_id = (
+            cls._record_organization_id(
+                record
+            )
+        )
+
+        if (
+            record_organization_id
+            and record_organization_id
+            != organization_id
+        ):
+            raise ValueError(
+                f"{record_name} does not belong to "
+                "the authenticated organization."
+            )
+
+    @staticmethod
+    def _assert_policy_tenant(
+        *,
+        policy_config: Optional[
+            dict[str, Any]
+        ],
+        organization_id: str,
+    ) -> None:
+        if not policy_config:
+            return
+
+        policy_organization_id = str(
+            policy_config.get(
+                "organization_id"
+            )
+            or ""
+        ).strip()
+
+        if (
+            policy_organization_id
+            and policy_organization_id
+            != organization_id
+        ):
+            raise ValueError(
+                "Policy configuration does not "
+                "belong to the authenticated organization."
+            )
 
     def __init__(self) -> None:
         self.default_weights = self.DEFAULT_WEIGHTS.copy()
@@ -325,10 +498,10 @@ class EntityResolutionEngine:
 
         fields_by_domain = {
             "CUSTOMER": ["member_id"],
-            "PATIENT": ["patient_id", "member_id"],
-            "PROVIDER": ["provider_id", "npi", "member_id"],
+            "PATIENT":  ["patient_id", "member_id"],
+            "PROVIDER": ["human_id", "provider_id", "npi", "member_id", "phone_number  "],
             "SUPPLIER": ["supplier_id", "vendor_id", "tax_id", "member_id"],
-            "PRODUCT": ["product_id", "gtin", "sku", "upc", "member_id"],
+            "PRODUCT":  ["product_id", "gtin", "sku", "item_category", "member_id"],
         }
 
         for field in fields_by_domain.get(domain, ["member_id"]):
@@ -339,9 +512,12 @@ class EntityResolutionEngine:
         return ""
             
 
+
     def score(
         self,
         req: MatchExplainRequest,
+        *,
+        organization_id: str,
         address_similarity_score: Optional[float] = None,
         override_rate_estimate: Optional[float] = None,
         composite_risk_score: Optional[int] = None,
@@ -353,20 +529,54 @@ class EntityResolutionEngine:
         policy_config: Optional[dict[str, Any]] = None,
         
 
-    ) -> dict[str, Any]:   
+    ) -> dict[str, Any]:
+        effective_organization_id = (
+            self._require_organization_id(
+                organization_id
+            )
+        )
+
+        record_a = req.record_a
+        record_b = req.record_b
+
+        self._assert_record_tenant(
+            record=record_a,
+            organization_id=(
+                effective_organization_id
+            ),
+            record_name="Record A",
+        )
+
+        self._assert_record_tenant(
+            record=record_b,
+            organization_id=(
+                effective_organization_id
+            ),
+            record_name="Record B",
+        )
+
+        self._assert_policy_tenant(
+            policy_config=policy_config,
+            organization_id=(
+                effective_organization_id
+            ),
+        )
+
         provider_email_score = 0.0
         provider_email_a = None
         provider_email_b = None
         specialty_score = 0.0
+        phone_score: Optional[float] = None
+        
+        product_variant_score = 0.0
+        item_category_score = 0.0
+        attribute_similarity_score = 0.0
 
         source_trust_map = self._resolve_source_trust_map(policy_config)
         automation_thresholds = self._resolve_automation_thresholds(policy_config)
         signal_tone_thresholds = self._resolve_signal_tone_thresholds(policy_config)
         readiness_label_thresholds = self._resolve_readiness_label_thresholds(policy_config
         )
-        record_a = req.record_a
-        record_b = req.record_b
-
         domain = (req.domain or "CUSTOMER").upper()
         normalized_domain = domain.strip().upper()
         domain_weights = self.get_domain_signal_weights(domain)
@@ -564,14 +774,7 @@ class EntityResolutionEngine:
         else:
             human_id_score = 0.0
         
-        effective_lot_date_score = (
-                1.0
-                if self._normalize_text(getattr(record_a, "effective_lot_date", None))
-                and self._normalize_text(getattr(record_a, "effective_lot_date", None))
-                == self._normalize_text(getattr(record_b, "effective_lot_date", None))
-                else 0.0
-            )
-        
+      
         normalized_domain = (domain or "").strip().upper()
         
         match_score = (
@@ -729,8 +932,9 @@ class EntityResolutionEngine:
             product_variant_a = getattr(record_a, "product_variant", None)
             product_variant_b = getattr(record_b, "product_variant", None)
 
-            effective_lot_date_a = getattr(record_a, "effective_lot_date", None)
-            effective_lot_date_b = getattr(record_b, "effective_lot_date", None)
+            item_category_a = getattr(record_a, "item_category", None)
+            item_category_b = getattr(record_b, "item_category", None)
+
 
             gtin_a = getattr(record_a, "gtin", None)
             gtin_b = getattr(record_b, "gtin", None)
@@ -741,7 +945,7 @@ class EntityResolutionEngine:
             product_id_score = self._similarity(product_id_a, product_id_b)
 
             product_name_score = self._similarity(product_name_a, product_name_b)
-
+            
             gtin_score = (
                     1.0
                     if self._normalize_text(gtin_a)
@@ -751,13 +955,14 @@ class EntityResolutionEngine:
 
             sku_score = self._similarity(sku_a, sku_b)
 
-            effective_lot_date_score = (
+            item_category_score = (
                     1.0
-                    if self._normalize_text(effective_lot_date_a)
-                    and self._normalize_text(effective_lot_date_a)
-                    == self._normalize_text(effective_lot_date_b)
+                    if self._normalize_text(item_category_a)
+                    and self._normalize_text(item_category_a)
+                    == self._normalize_text(item_category_b)
                     else 0.0
-                )
+)
+            product_variant_score = self._similarity(product_variant_a, product_variant_b)
 
             attribute_similarity_score = self._product_attribute_similarity(
                     record_a,
@@ -769,15 +974,12 @@ class EntityResolutionEngine:
 
             match_score = (
                 product_id_score * domain_weights.get("product_id_match", 0.0)
-                        + gtin_score * domain_weights.get("gtin_match", 0.0)
-                        + sku_score * domain_weights.get("sku_match", 0.0)
-                        + product_name_score * domain_weights.get("name_similarity", 0.0)
-                        + effective_lot_date_score * domain_weights.get(
-                            "effective_lot_date_match",
-                                0.0,
-                            )
-                + attribute_similarity_score * domain_weights.get(
-                    "attribute_similarity",
+                    + gtin_score * domain_weights.get("gtin_match", 0.0)
+                    + sku_score * domain_weights.get("sku_match", 0.0)
+                    + product_name_score * domain_weights.get("name_similarity", 0.0)
+                    + product_variant_score * domain_weights.get("product_variant_similarity", 0.0)
+                    + item_category_score * domain_weights.get("item_category_similarity",0.0,)
+                    + attribute_similarity_score * domain_weights.get("attribute_similarity",
                     0.0,
                 )
                 + source_score * domain_weights.get("source_trust", 0.0)
@@ -832,28 +1034,26 @@ class EntityResolutionEngine:
             )
 
             signals.append(
-                self._build_signal(
-                        "effective_lot_date_match",
-                        effective_lot_date_score,
-                        domain_weights.get("effective_lot_date_match", 0.0),
-                        self._effective_lot_date_detail(
-                            effective_lot_date_a,
-                            effective_lot_date_b,
-                        ),
-                    signal_type="deterministic",
+                    self._build_signal(
+                        "product_variant_similarity",
+                        product_variant_score,
+                        domain_weights.get("product_variant_similarity", 0.0),
+                        self._product_variant_detail(product_variant_a, product_variant_b),
+                        signal_type="probabilistic",
                     )
                 )
-
+            
             signals.append(
                     self._build_signal(
-                        "attribute_similarity",
-                        attribute_similarity_score,
-                        domain_weights.get("attribute_similarity", 0.0),
-                        self._attribute_similarity_detail(record_a, record_b),
+                        "item_category_similarity",
+                        item_category_score,
+                        domain_weights.get("item_category_similarity", 0.0),
+                        self._item_category_detail(item_category_a, item_category_b),
                         signal_type="probabilistic",
                     )
                 )
 
+          
             signals.append(
                     self._build_signal(
                         "source_trust",
@@ -888,8 +1088,6 @@ class EntityResolutionEngine:
                 or ""
             ).strip().lower()
 
-            print("SUPPLIER EMAIL A:", supplier_email_a)
-            print("SUPPLIER EMAIL B:", supplier_email_b)
 
             supplier_email_similarity = SimilarityEngine.email_similarity(
                 supplier_email_a,
@@ -976,7 +1174,6 @@ class EntityResolutionEngine:
 
 
 
-            print("SUPPLIER EMAIL SCORE:", email_score)
 
    
             match_score = (
@@ -1088,17 +1285,6 @@ class EntityResolutionEngine:
             
             signals = []
 
-            print("===== PROVIDER RECORD A =====")
-            print(record_a)
-
-            print("===== PROVIDER RECORD B =====")
-            print(record_b)
-
-            print("===== PROVIDER RECORD A DICT =====")
-            print(vars(record_a))
-
-            print("===== PROVIDER RECORD B DICT =====")
-            print(vars(record_b))
       
             provider_email_score = 0.0
 
@@ -1201,26 +1387,6 @@ class EntityResolutionEngine:
                     provider_name_a,
                     provider_name_b,
                 )
-
-            print("PROVIDER FIELD DEBUG")
-            print("provider_name_a:", provider_name_a)
-            print("provider_name_b:", provider_name_b)
-            print("OVERRIDDEN name_score:", name_score)
-
-            print(
-                    "provider_address_a:",
-                    getattr(record_a, "provider_address", None),
-                )
-
-            print(
-                    "provider_address_b:",
-                    getattr(record_b, "provider_address", None),
-                )
-
-            print("OVERRIDDEN address_score:", address_score)
-            print("PROVIDER ADDRESS SCORE:", address_score)
-            print("RECORD A ADDRESS:", record_a.address)
-            print("RECORD B ADDRESS:", record_b.address)
                                 
                 #specialty score----------------------------
             specialty_score = self._similarity(
@@ -1242,25 +1408,45 @@ class EntityResolutionEngine:
                         provider_address_a,
                         provider_address_b,
                 )
+            provider_phone_a = getattr(record_a, "phone_number", None)
+            provider_phone_b = getattr(record_b, "phone_number", None)
 
+            phone_score = SimilarityEngine.phone_similarity(
+            provider_phone_a,
+            provider_phone_b,
+        )
+
+            phone_weight = (
+                domain_weights.get("phone_match", 0.0)
+                if phone_score is not None
+                else 0.0
+            )
+
+            phone_score_value = (
+                phone_score
+                if phone_score is not None
+                else 0.0
+            )
 
             match_score = (
-                    provider_id_score * 0.25 +
-                    npi_score * 0.25 +
-                    name_score * 0.10 +
-                    provider_email_score * 0.10 +
-                    address_score * 0.20 +
-                    specialty_score * 0.05 +
-                    source_score * 0.03 +
-                    learning_score * 0.02
-                )
+                provider_id_score * domain_weights.get("provider_id_match", 0.0) +
+                npi_score * domain_weights.get("npi_match", 0.0) +
+                phone_score_value * domain_weights.get("phone_match", 0.0) +
+                name_score * domain_weights.get("name_similarity", 0.0) +
+                provider_email_score * domain_weights.get("provider_email_match", 0.0) +
+                address_score * domain_weights.get("address_similarity", 0.0) +
+                specialty_score * domain_weights.get("specialty_similarity", 0.0) +
+                source_score * domain_weights.get("source_trust", 0.0) +
+                learning_score * domain_weights.get("steward_learning", 0.0)
+        )
 
+   
                 # -----------------------------------------------------
                 # Signal Registration
                 # -----------------------------------------------------
 
             signals.append(
-                            self._build_signal(
+                    self._build_signal(
                                 "provider_id_match",
                                 provider_id_score,
                                 domain_weights.get("provider_id_match", 0.0),
@@ -1272,7 +1458,7 @@ class EntityResolutionEngine:
                         )
 
             signals.append(
-                        self._build_signal(
+                    self._build_signal(
                             "provider_email_match",
                             provider_email_score,
                             domain_weights.get("provider_email_match", 0.0),
@@ -1287,7 +1473,7 @@ class EntityResolutionEngine:
                     )
          
             signals.append(
-                        self._build_signal(
+                    self._build_signal(
                             "address_similarity",
                             address_score,
                             domain_weights.get("address_similarity", 0.0),
@@ -1299,6 +1485,23 @@ class EntityResolutionEngine:
                                 address_match_insight,
                             ),
                             signal_type="probabilistic",
+                        )
+                    )
+            
+            signals.append(
+                    self._build_signal(
+                            "phone_match",
+                                (
+                                phone_score
+                                if phone_score is not None
+                                else 0.5
+                                ),
+                                phone_weight,
+                                self._phone_detail(
+                                    provider_phone_a,
+                                    provider_phone_b,
+                                ),
+                                signal_type="probabilistic",
                         )
                     )
                 
@@ -1367,14 +1570,7 @@ class EntityResolutionEngine:
     )
 )
             
-            print(vars(record_a))
-            print(vars(record_b))
-            print("PROVIDER RECORD A:")
-            print(vars(record_a))
-
-            print("PROVIDER RECORD B:")
-            print(vars(record_b))
-
+           
             signals.append(
                         self._build_signal(
                             "source_trust",
@@ -1392,30 +1588,32 @@ class EntityResolutionEngine:
             # Composite Signal Reinforcement
             # ----------------------------------------
 
-            if (
-                            provider_email_score >= 1.0
-                            and name_score >= 0.85
-                            and address_score >= 0.90
-                        ):
-                        match_score += 0.15
 
-            elif (
-                name_score >= 0.90
-                and address_score >= 0.90
-            ):
-                match_score += 0.10
 
-            elif (
-                provider_email_score >= 1.0
-                and name_score >= 0.80
-            ):
-                match_score += 0.08
+            if phone_score is None or phone_score != 0.0:
+                if (
+                    provider_email_score >= 1.0
+                    and name_score >= 0.85
+                    and address_score >= 0.90
+                ):
+                    match_score += 0.15
+
+                elif (
+                    name_score >= 0.90
+                    and address_score >= 0.90
+                ):
+                    match_score += 0.10
+
+                elif (
+                    provider_email_score >= 1.0
+                    and name_score >= 0.80
+                ):
+                    match_score += 0.08
 
             # Prevent overflow
             match_score = min(match_score, 1.0)
                         
             raw_entity_score = round(match_score * risk_multiplier,4,)
-    
             
         elif normalized_domain == "PATIENT":
 
@@ -1476,7 +1674,24 @@ class EntityResolutionEngine:
                 patient_last_name_b,
             )
 
-            dob_score = self._dob_match(patient_dob_a, patient_dob_b)
+            dob_a_valid = self._is_valid_dob(patient_dob_a)
+            dob_b_valid = self._is_valid_dob(patient_dob_b)
+
+            if patient_dob_a and not dob_a_valid:
+                dob_score = 0.0
+                dob_detail = f"Record A DOB value '{patient_dob_a}' is invalid for a DOB field."
+
+            elif patient_dob_b and not dob_b_valid:
+                dob_score = 0.0
+                dob_detail = f"Record B DOB value '{patient_dob_b}' is invalid for a DOB field."
+
+            elif dob_a_valid and dob_b_valid:
+                dob_score = self._dob_match(patient_dob_a, patient_dob_b)
+                dob_detail = self._dob_detail(patient_dob_a, patient_dob_b)
+
+            else:
+                dob_score = 0.0
+                dob_detail = "DOB evidence is unavailable or incomplete."
 
             patient_email_similarity = SimilarityEngine.email_similarity(
                 patient_email_a,
@@ -1520,20 +1735,39 @@ class EntityResolutionEngine:
             patient_identity_score = (
                 patient_id_score if patient_id_score is not None else 0.0
             )
-
-            human_identity_component = (
-                human_id_score if human_id_score is not None else 0.5
+           
+            phone_weight = (
+                domain_weights.get("phone_match", 0.0)
+                if phone_score is not None
+                else 0.0
             )
 
+            phone_score = phone_score or 0.0
             match_score = (
-                patient_identity_score * 0.30
-                + human_identity_component * 0.05
-                + dob_score * 0.20
+                patient_identity_score * 0.20
+                + phone_score * phone_weight
+                + dob_score * 0.25
                 + name_score * 0.20
                 + address_score * 0.15
                 + email_score * 0.10
-                + source_score * 0.10
             )
+
+            total_weight = (
+                0.20 +      # patient id
+                phone_weight +
+                0.25 +      # dob
+                0.20 +      # name
+                0.15 +      # address
+                0.10        # email
+            )
+
+            match_score /= total_weight
+
+            match_score = round(min(match_score, 0.95), 4)
+            raw_entity_score = match_score
+
+            if patient_identity_score >= 0.90:
+                match_score = min(match_score + 0.10, 1.0)
 
             if (
                 patient_identity_score >= 0.90
@@ -1548,9 +1782,17 @@ class EntityResolutionEngine:
                 and dob_score == 1.0
                 and name_score >= 0.85
             ):
-                 match_score = min(max(match_score, 0.86), 0.90)
+                 
+                phone_a = getattr(record_a, "phone", None)
+                phone_b = getattr(record_b, "phone", None)
+
+               
+                match_score = min(max(match_score, 0.86), 0.90)
 
             match_score = min(match_score, 0.92)
+
+            raw_entity_score = round(match_score * risk_multiplier, 4)
+
 
             signals.append(
                 self._build_signal(
@@ -1565,14 +1807,26 @@ class EntityResolutionEngine:
                 )
             )
 
+            signal_score = (
+                phone_score
+                if phone_score is not None
+                else 0.5
+            )
+
+            signal_weight = (
+                domain_weights.get("phone_match",0.0)
+                if phone_score is not None
+                else 0.0
+            )
+
             signals.append(
                 self._build_signal(
-                    "human_id_match",
-                    human_id_score,
-                    domain_weights.get("human_id_match", 0.0),
-                    self._human_id_detail(
-                        getattr(record_a, "human_id", None),
-                        getattr(record_b, "human_id", None),
+                    "phone_match",
+                    signal_score,
+                    signal_weight,
+                    self._phone_detail(
+                        provider_phone_a,
+                        provider_phone_b,
                     ),
                     signal_type="deterministic",
                 )
@@ -1583,7 +1837,7 @@ class EntityResolutionEngine:
                     "dob_match",
                     dob_score,
                     domain_weights.get("dob_match", 0.0),
-                    self._dob_detail(patient_dob_a, patient_dob_b),
+                    dob_detail,
                     signal_type="deterministic",
                 )
             )
@@ -1657,15 +1911,15 @@ class EntityResolutionEngine:
             source_score=source_score,
             learning_score=learning_score,
             product_id_score=product_id_score,
+            product_variant_score=product_variant_score,
             gtin_score=gtin_score,
-            effective_lot_date_score=effective_lot_date_score,
-            attribute_similarity_score=attribute_similarity_score,
+            item_category_score=item_category_score,
             supplier_id_score=supplier_id_score,
             tax_id_score=tax_id_score,
             provider_id_score=provider_id_score,
             npi_score=npi_score,
             patient_id_score=patient_id_score,
-            human_id_score=human_id_score,
+            phone_score=phone_score,
             provider_email_score=provider_email_score,
             specialty_score=specialty_score,
             sku_score=sku_score,
@@ -1681,7 +1935,7 @@ class EntityResolutionEngine:
 
         effective_multiplier = risk_multiplier
 
-        if domain in {"SUPPLIER", "PRODUCT", "PROVIDER"}:
+        if domain in {"SUPPLIER", "PRODUCT", "PROVIDER", "PATIENT"}:
             effective_multiplier = max(risk_multiplier, 0.90)
 
         if domain in {"SUPPLIER", "PRODUCT", "PROVIDER", "PATIENT"}:
@@ -1732,6 +1986,79 @@ class EntityResolutionEngine:
             if recommended_action
             else self._recommended_action_from_tier(automation_tier)
         )
+        signal_packets = [
+            {
+                "signal_name": s.get("signal_name"),
+                "signal_score": round(float(s.get("signal_score", 0)), 4),
+                "signal_weight": s.get("signal_weight"),
+                "weighted_score": round(float(s.get("weighted_score", 0)), 4),
+                "detail": s.get("detail") or "",
+                "signal_band": s.get("signal_band"),
+                "tone": self._signal_tone(
+                    s.get("signal_name"),
+                    s.get("signal_score"),
+                    thresholds=signal_tone_thresholds,
+                ),
+            }
+            for s in signals
+        ]
+
+        # Risk values may be supplied by routes.py / risk_engine.py.
+        # If not supplied, derive conservative risk inside this engine
+        # so summary + timeline do not use stale LOW/default values.
+        derived_risk_score = composite_risk_score
+        derived_risk_flag = risk_flag
+        derived_primary_risk_driver = primary_risk_driver
+        derived_risk_band = composite_risk_band
+
+        if derived_risk_score is None:
+            derived_risk_score = 0
+
+            high_risk_drivers = []
+
+            for packet in signal_packets:
+                signal_name = str(packet.get("signal_name") or "").lower()
+                score = float(packet.get("signal_score") or 0)
+                detail = str(packet.get("detail") or "").lower()
+
+                if signal_name in {
+                    "patient_id_match",
+                    "human_id_match",
+                    "member_id_match",
+                    "npi_match",
+                    "tax_id_match",
+                    "provider_id_match",
+                } and score == 0.0:
+                    high_risk_drivers.append(signal_name)
+
+                if signal_name == "dob_match" and (
+                    "invalid" in detail
+                    or "not a valid" in detail
+                    or "data quality" in detail
+                ):
+                    high_risk_drivers.append("dob_invalid_format")
+
+            if high_risk_drivers:
+                derived_risk_score = 90
+                derived_risk_flag = "HIGH"
+                derived_primary_risk_driver = (
+                    derived_primary_risk_driver
+                    or f"{high_risk_drivers[0].upper()}_CONFLICT"
+                )
+                derived_risk_band = "HIGH"
+            else:
+                derived_risk_score = 12
+                derived_risk_flag = derived_risk_flag or "LOW"
+                derived_primary_risk_driver = (
+                    derived_primary_risk_driver or "NO_MAJOR_CONFLICT"
+                )
+                derived_risk_band = derived_risk_band or "LOW"
+
+        composite_risk_score = int(derived_risk_score)
+        risk_flag = derived_risk_flag or "LOW"
+        primary_risk_driver = derived_primary_risk_driver
+        composite_risk_band = derived_risk_band or risk_flag
+
 
         automation_readiness_score = self._automation_readiness_score(
             decision_confidence_score=decision_confidence_score,
@@ -1778,6 +2105,7 @@ class EntityResolutionEngine:
     }
     for s in signals
 ]
+        
 
         summary = self._summary(
             raw_entity_score=raw_entity_score,
@@ -1787,7 +2115,10 @@ class EntityResolutionEngine:
             automation_readiness_score=automation_readiness_score,
             final_recommended_action=final_recommended_action,
             composite_risk_score=composite_risk_score,
+            domain=domain,
         )
+
+        
 
         match_evidence_timeline = self.build_match_evidence_timeline(
             signals=signal_packets,
@@ -1805,23 +2136,11 @@ class EntityResolutionEngine:
             composite_risk_band=composite_risk_band,
             effective_email_score=round(email_score, 4),
 )
-        print("========== PROVIDER DEBUG ==========")
-        print("provider_id_score:", provider_id_score)
-        print("npi_score:", npi_score)
-        print("name_score:", name_score)
-        print("provider_email_score:", provider_email_score)
-        print("address_score:", address_score)
-        print("specialty_score:", specialty_score)
-        print("source_score:", source_score)
-        print("learning_score:", learning_score)
 
-        print("match_score:", match_score)
-        print("raw_entity_score:", raw_entity_score)
-        print("adjusted_entity_score:", adjusted_entity_score)
-        print("decision_confidence_score:", decision_confidence_score)
-        print("====================================")
         return {
-
+            "organization_id": (
+                effective_organization_id
+            ),
             "signal_contributions": signal_contributions,
             "effective_email_score": round(email_score, 4),
             "email_match_level": SimilarityEngine.similarity_band(
@@ -1872,15 +2191,15 @@ class EntityResolutionEngine:
         source_score: float,
         learning_score: float,
         product_id_score: float = 0.0,
+        product_variant_score: float = 0.0,
         gtin_score: float = 0.0,
-        effective_lot_date_score: float = 0.0,
-        attribute_similarity_score: float = 0.0,
+        item_category_score: float = 0.0,
         supplier_id_score: float = 0.0,
         tax_id_score: float = 0.0,
         provider_id_score: float = 0.0,
         npi_score: float = 0.0,
         patient_id_score: float = 0.0,
-        human_id_score: float = 0.0,
+        phone_score: float = 0.0,
         provider_email_score: float = 0.0,
         specialty_score: float = 0.0,
         sku_score: float = 0.0,
@@ -1905,8 +2224,7 @@ class EntityResolutionEngine:
                 "gtin_match": gtin_score,
                 "name_similarity": name_score,
                 "sku_match": sku_score,
-                "effective_lot_date_match": effective_lot_date_score,
-                "attribute_similarity": attribute_similarity_score,
+                "item_category_similarity": item_category_score,
                 "source_trust": source_score,
                 "steward_learning": learning_score,
             }
@@ -1915,6 +2233,7 @@ class EntityResolutionEngine:
             return {
                 "provider_id_match": provider_id_score,
                 "npi_match": npi_score,
+                "phone_match": phone_score,
                 "name_similarity": name_score,
                 "address_similarity": address_score,
                 "source_trust": source_score,
@@ -1926,7 +2245,7 @@ class EntityResolutionEngine:
         if normalized_domain == "PATIENT":
             return {
                 "patient_id_match": patient_id_score,
-                "human_id_match": human_id_score,
+                "phone_match": phone_score,
                 "name_similarity": name_score,
                 "dob_match": dob_score,
                 "email_match": email_score,
@@ -1953,9 +2272,15 @@ class EntityResolutionEngine:
         contributions: list[dict[str, float | str]] = []
 
         for signal_key, score in signal_scores.items():
-            safe_score = self._safe_score(score)
             weight = self._safe_score(signal_weights.get(signal_key, 0.0))
+
+            # Ignore unavailable evidence
+            if score is None or weight == 0:
+                continue
+
+            safe_score = self._safe_score(score)
             contribution = safe_score * weight
+
             contributions.append(
                 {
                     "signal_name": signal_key,
@@ -2015,7 +2340,7 @@ class EntityResolutionEngine:
         deterministic_signal_names = {
             "member_id_match",
             "patient_id_match",
-            "human_id_match",
+            "phone_match",
             "provider_id_match",
             "supplier_id_match",
             "product_id_match",
@@ -2035,6 +2360,9 @@ class EntityResolutionEngine:
             "specialty_similarity",
             "source_trust",
             "attribute_similarity",
+            "item_category_similarity",
+            "product_variant_similarity",
+            "phone_match",
         }
 
         signal_display_map = {
@@ -2045,10 +2373,12 @@ class EntityResolutionEngine:
             "product_id_match": "Product ID",
             "gtin_match": "GTIN",
             "npi_match": "NPI",
-            "human_id_match": "Human ID",
+            "phone_match": "Phone",
             "sku_match": "SKU",
             "effective_lot_date_match": "Effective / Lot Date",
             "attribute_similarity": "Product Attribute Similarity",
+            "product_variant_similarity": "Product Variant / Pack Size",
+            "item_category_similarity": "Item Category",
             "member_id_match": "Member ID",
             "dob_match": "Date of Birth",
             "contact_email_match": "Contact Email",
@@ -2375,11 +2705,6 @@ class EntityResolutionEngine:
             score: float
         ) -> str:
 
-        print(
-            "SIMILARITY_BAND INPUT:", 
-            score, 
-            type(score)
-        )
 
         score = float(score or 0)
 
@@ -2448,7 +2773,7 @@ class EntityResolutionEngine:
             match_level
                 or (
                 "EXACT"
-                if name in {"product_id_match","sku_match","patient_id_match","provider_id_match",
+                if name in {"product_id_match","sku_match","patient_id_match","provider_id_match", "human_id_match",
             } and safe_score >= 0.999
                 else "SIMILAR"
                 if name in {"product_id_match","sku_match","patient_id_match","provider_id_match",
@@ -2479,7 +2804,6 @@ class EntityResolutionEngine:
         safe_score = float(score or 0)
         safe_score = self._safe_score(score)
 
-        print("SIGNAL_TONE INPUT:", safe_score, type(safe_score))
 
         strong_positive = thresholds.get("strong_positive", 0.92)
         positive = thresholds.get("positive", 0.85)
@@ -2497,6 +2821,7 @@ class EntityResolutionEngine:
             "member_id_match",
             "tax_id_match",
             "gtin_match",
+            "item_category_match",
             "npi_match",
             "human_id_match",
             "email_match",
@@ -2731,10 +3056,6 @@ class EntityResolutionEngine:
     ) -> str:
         
 
-        print("READINESS INPUT:",
-                readiness_score,
-                type(readiness_score)
-            )
         if readiness_score >= thresholds["high"]:
             return "HIGH_AUTOMATION_READINESS"
         if readiness_score >= thresholds["moderate"]:
@@ -2780,7 +3101,42 @@ class EntityResolutionEngine:
         automation_readiness_score: int,
         final_recommended_action: str,
         composite_risk_score: Optional[int],
+        domain: str = "CUSTOMER",
     ) -> str:
+        
+        normalized_domain = (domain or "CUSTOMER").upper()
+
+        if normalized_domain == "SUPPLIER":
+            return (
+                "Supplier identity evidence strongly supports this match. "
+                "Current governance policy requires steward review before automated merge."
+            )
+
+        elif normalized_domain == "PRODUCT":
+            return (
+                "Product identifiers, classifications, and descriptive attributes "
+                "were evaluated to determine merge suitability."
+            )
+
+        elif normalized_domain == "PROVIDER":
+            return (
+                "Provider identity evidence strongly supports this match. "
+                "Governance policy requires steward confirmation before automation."
+            )
+
+        elif normalized_domain == "PATIENT":
+            return (
+                "Patient identity evidence supports this match. "
+                "Governance policy requires steward validation before automated merge."
+            )
+
+        elif normalized_domain == "CUSTOMER":
+            return (
+                "Customer identity evidence supports this match. "
+                "Governance policy requires steward validation before automated merge."
+            )
+
+            
         risk_text = (
             f"{composite_risk_score}/100"
             if composite_risk_score is not None
@@ -2792,6 +3148,7 @@ class EntityResolutionEngine:
             f"automation readiness {automation_readiness_score}%, final action {final_recommended_action}, "
             f"composite risk {risk_text}."
         )
+    
 
     def _name_detail(
         self,
@@ -2895,4 +3252,3 @@ class EntityResolutionEngine:
             f"Source trust evaluated for '{source_a or 'UNKNOWN'}' and "
             f"'{source_b or 'UNKNOWN'}'."            
         )
-    

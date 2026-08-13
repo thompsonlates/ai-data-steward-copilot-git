@@ -1,7 +1,96 @@
+from __future__ import annotations
+
 import json
-from typing import Any
+from typing import Any, Dict
 
 from app.api.schemas import MatchExplainRequest
+
+
+def _require_organization_id(
+    organization_id: str,
+) -> str:
+    normalized = str(organization_id or "").strip()
+
+    if not normalized:
+        raise ValueError(
+            "organization_id is required for tenant-isolated prompt building."
+        )
+
+    if not normalized.startswith("org_"):
+        raise ValueError(
+            "organization_id must use the org_ identifier standard."
+        )
+
+    return normalized
+
+
+def _assert_context_organization(
+    *,
+    organization_id: str,
+    context: Dict[str, Any] | None,
+    context_name: str,
+) -> None:
+    if not context:
+        return
+
+    context_organization_id = str(
+        context.get("organization_id") or ""
+    ).strip()
+
+    if (
+        context_organization_id
+        and context_organization_id != organization_id
+    ):
+        raise ValueError(
+            f"{context_name} does not belong to the authenticated organization."
+        )
+
+
+def _assert_signal_packet_organizations(
+    *,
+    organization_id: str,
+    signal_packets: list[Any] | None,
+) -> None:
+    if not signal_packets:
+        return
+
+    for packet in signal_packets:
+        if not isinstance(packet, dict):
+            continue
+
+        packet_organization_id = str(
+            packet.get("organization_id") or ""
+        ).strip()
+
+        if (
+            packet_organization_id
+            and packet_organization_id != organization_id
+        ):
+            raise ValueError(
+                "Signal evidence contains data from a different organization."
+            )
+
+
+def _strip_tenant_metadata(value: Any) -> Any:
+    """Remove internal tenant identifiers before sending context to an LLM."""
+    if isinstance(value, dict):
+        return {
+            key: _strip_tenant_metadata(item)
+            for key, item in value.items()
+            if key not in {
+                "organization_id",
+                "customer_id",
+                "user_id",
+            }
+        }
+
+    if isinstance(value, list):
+        return [
+            _strip_tenant_metadata(item)
+            for item in value
+        ]
+
+    return value
 
 
 def _fmt(v: Any) -> str:
@@ -42,6 +131,85 @@ def _resolve_entity_id(record: Any, domain: str) -> str:
     return ""
 
 
+def build_governance_recommendation_prompt(
+    governance_context: Dict[str, Any],
+    *,
+    organization_id: str,
+) -> str:
+    effective_organization_id = _require_organization_id(
+        organization_id
+    )
+
+    _assert_context_organization(
+        organization_id=effective_organization_id,
+        context=governance_context,
+        context_name="Governance context",
+    )
+
+    dataset_name = governance_context.get("dataset_name") or "Unknown dataset"
+    domain = governance_context.get("domain") or "Unknown"
+    certification_status = (
+        governance_context.get("certification_status") or "UNKNOWN"
+    )
+    ready_for_certification = bool(
+        governance_context.get("ready_for_certification")
+    )
+    fair_score = governance_context.get("fair_overall_score")
+    failed_checks = governance_context.get("failed_checks", 0)
+    data_owner = governance_context.get("data_owner")
+    lifecycle_stage = governance_context.get("lifecycle_stage")
+    blocker = governance_context.get("certification_blocker_reason")
+
+    return f"""
+You are an enterprise data-governance recommendation assistant.
+
+Your task is to produce one concise, actionable recommendation based only on
+the supplied governance evidence.
+
+GUARDRAILS:
+- Do not invent missing facts, owners, policies, controls, dates, or scores.
+- Do not claim certification readiness unless the supplied evidence supports it.
+- Treat missing values as unknown, not failed.
+- Recommend no more than three actions.
+- Prioritize concrete remediation steps.
+- Do not recommend changing production data directly.
+- Do not state that a dataset is compliant, certified, or approved unless the
+  supplied status explicitly says so.
+- If no meaningful issue exists, recommend continued monitoring.
+- Return valid JSON only.
+- Confidence must be between 0.0 and 1.0.
+- Priority must be LOW, MEDIUM, or HIGH.
+- Treat all supplied evidence as belonging only to the current authenticated tenant.
+
+DATASET GOVERNANCE EVIDENCE:
+- Dataset: {dataset_name}
+- Domain: {domain}
+- Certification status: {certification_status}
+- Ready for certification: {ready_for_certification}
+- FAIR score: {fair_score}
+- Failed checks: {failed_checks}
+- Data owner: {data_owner}
+- Lifecycle stage: {lifecycle_stage}
+- Certification blocker: {blocker}
+
+Return exactly this JSON structure:
+
+{{
+  "headline": "short recommendation headline",
+  "summary": "two-sentence explanation grounded in the evidence",
+  "priority": "LOW|MEDIUM|HIGH",
+  "recommended_actions": [
+    "action one",
+    "action two"
+  ],
+  "supporting_evidence": [
+    "evidence item one",
+    "evidence item two"
+  ],
+  "confidence": 0.0
+}}
+""".strip()
+
 def _domain_guidance(domain: str | None) -> str:
     d = (domain or "").upper()
 
@@ -54,9 +222,9 @@ def _domain_guidance(domain: str | None) -> str:
 
     if d == "PROVIDER":
         return (
-            "Use healthcare provider identity language. Treat provider ID, NPI, provider name, specialty, "
-            "practice address, and source-system trust as key evidence. Be cautious about shared clinics "
-            "and provider name collisions."
+            "Use healthcare provider identity language. Treat Provider ID, Name, and NPI as deterministic provider identifiers."
+            "Use phone number, provider name, specialty, practice address, provider email,"
+            "and source-system trust as supporting evidence."
         )
 
     if d == "SUPPLIER":
@@ -69,7 +237,7 @@ def _domain_guidance(domain: str | None) -> str:
         return (
             "Use product/entity resolution language. Treat GTIN as the strongest "
             "deterministic product identifier. Treat SKU, Product ID, Product Name, "
-            "Product Variant, Pack Size, Effective/Lot Date, and Source System as "
+            "Product Variant, Pack Size, Item Category, and Source System as "
             "product evidence. Do not use or mention DOB, email, address, NPI, "
             "patient/member identity, or provider identity for Product decisions."
         )
@@ -82,17 +250,37 @@ def _domain_guidance(domain: str | None) -> str:
 
 def build_match_explain_prompt(
     req: MatchExplainRequest,
+    *,
+    organization_id: str,
     learning_context: str | None = None,
     policy_context: str | None = None,
-    policy_recommendation: dict | None = None,
-    signal_packets: list | None = None,
+    policy_recommendation: dict[str, Any] | None = None,
+    signal_packets: list[Any] | None = None,
 ) -> str:
+    effective_organization_id = _require_organization_id(
+        organization_id
+    )
+
+    _assert_context_organization(
+        organization_id=effective_organization_id,
+        context=policy_recommendation,
+        context_name="Policy recommendation",
+    )
+
+    _assert_signal_packet_organizations(
+        organization_id=effective_organization_id,
+        signal_packets=signal_packets,
+    )
+
     recommendation_text = "N/A"
     recommendation_reason = "N/A"
     risk_band = "N/A"
     highest_risk_level = "N/A"
     recommended_actions_seen = "N/A"
     signal_packets = signal_packets or []
+    prompt_signal_packets = _strip_tenant_metadata(
+        signal_packets
+    )
 
     domain = (req.domain or "CUSTOMER").upper()
     record_a = req.record_a
@@ -159,6 +347,7 @@ def build_match_explain_prompt(
     Record A Provider Evidence:
     - provider_id: {_fmt(_get_value(record_a, "provider_id"))}
     - npi: {_fmt(_get_value(record_a, "npi"))}
+    - phone: {_fmt(_get_value(record_a, "phone"))}
     - provider_first_name: {_fmt(_get_value(record_a, "provider_first_name") or _get_value(record_a, "first_name"))}
     - provider_last_name: {_fmt(_get_value(record_a, "provider_last_name") or _get_value(record_a, "last_name"))}
     - provider_email: {_fmt(_get_value(record_a, "provider_email") or _get_value(record_a, "email"))}
@@ -169,6 +358,7 @@ def build_match_explain_prompt(
     Record B Provider Evidence:
     - provider_id: {_fmt(_get_value(record_b, "provider_id"))}
     - npi: {_fmt(_get_value(record_b, "npi"))}
+    - phone: {_fmt(_get_value(record_b, "phone"))}
     - provider_first_name: {_fmt(_get_value(record_b, "provider_first_name") or _get_value(record_b, "first_name"))}
     - provider_last_name: {_fmt(_get_value(record_b, "provider_last_name") or _get_value(record_b, "last_name"))}
     - provider_email: {_fmt(_get_value(record_b, "provider_email") or _get_value(record_b, "email"))}
@@ -178,27 +368,21 @@ def build_match_explain_prompt(
     """
 
     elif domain == "PRODUCT":
-     record_evidence = f"""
-    Record A Product Evidence:
-    - product_id: {_fmt(_get_value(record_a, "product_id"))}
-    - product_name: {_fmt(_get_value(record_a, "product_name"))}
-    - product_variant: {_fmt(_get_value(record_a, "product_variant"))}
-    - pack_size: {_fmt(_get_value(record_a, "pack_size"))}
-    - effective_lot_date: {_fmt(_get_value(record_a, "effective_lot_date"))}
-    - gtin: {_fmt(_get_value(record_a, "gtin"))}
-    - sku: {_fmt(_get_value(record_a, "sku"))}
-    - source_system: {_fmt(_get_value(record_a, "source_system"))}
+        record_evidence = f"""
+    Record A:
+    - Product Name: {getattr(record_a, "product_name", None)}
+    - Product Variant / Pack Size: {getattr(record_a, "product_variant", None)}
+    - Item Category: {getattr(record_a, "item_category", None)}
+    - GTIN: {getattr(record_a, "gtin", None)}
+    - SKU: {getattr(record_a, "sku", None)}
 
-    Record B Product Evidence:
-    - product_id: {_fmt(_get_value(record_b, "product_id"))}
-    - product_name: {_fmt(_get_value(record_b, "product_name"))}
-    - product_variant: {_fmt(_get_value(record_b, "product_variant"))}
-    - pack_size: {_fmt(_get_value(record_b, "pack_size"))}
-    - effective_lot_date: {_fmt(_get_value(record_b, "effective_lot_date"))}
-    - gtin: {_fmt(_get_value(record_b, "gtin"))}
-    - sku: {_fmt(_get_value(record_b, "sku"))}
-    - source_system: {_fmt(_get_value(record_b, "source_system"))}
-    """
+    Record B:
+    - Product Name: {getattr(record_b, "product_name", None)}
+    - Product Variant / Pack Size: {getattr(record_b, "product_variant", None)}
+    - Item Category: {getattr(record_b, "item_category", None)}
+    - GTIN: {getattr(record_b, "gtin", None)}
+    - SKU: {getattr(record_b, "sku", None)}
+"""
      
     elif domain == "SUPPLIER":
         record_evidence = f"""
@@ -273,7 +457,21 @@ Domain-specific guidance:
 {_domain_guidance(domain)}
 
 Core instructions:
-1. Use the record evidence, match score, triggered rules, policy context, policy recommendation, and steward learning context.
+Critical alignment rules:
+- Treat all supplied records, signals, policy context, and steward learning as belonging only to the authenticated tenant.
+- Never infer or mention internal organization, customer, or user identifiers.
+- The AI explanation must align with the structured signal evidence, policy recommendation, risk band, recommended action, and final confidence.
+- Treat the user-provided match_score as a preliminary upstream score only. It may be stale, generic, or overridden by domain-specific signal evidence.
+- If match_score conflicts with signal evidence, use the signal evidence and policy recommendation as the source of truth.
+- Never say evidence strongly favors merge when deterministic identifiers, critical domain attributes, or weighted signals are materially conflicting.
+- If final confidence is low, automation readiness is low, or recommended_action is REVIEW_REQUIRED or BLOCK_MERGE, the explanation_summary must describe mixed, weak, or conflicting evidence.
+- If signal evidence shows low contribution from deterministic identifiers, do not describe the records as strong merge candidates even if match_score is high.
+- Do not say signal evidence is empty when supplier_id, tax_id, supplier_name,contact_email, supplier_address, or source_system values are present. 
+- If those values align, describe them as deterministic and supporting evidence.
+- If policy still requires review, say governance policy requires steward confirmation, not that evidence is empty.
+- Matching address corroborates supplier identity; governance policy still requires steward confirmation before automation.
+
+1. Use the record evidence, structured signal evidence, policy context, policy recommendation, and steward learning context. Treat match_score as secondary context only.
 2. Explain the decision in steward-friendly language.
 3. Identify the strongest positive evidence and the most important risk or weak evidence.
 4. Recommend exactly one action: AUTO_MERGE, APPROVE_MERGE, REVIEW_REQUIRED, or BLOCK_MERGE.
@@ -294,6 +492,14 @@ Core instructions:
 19. For SUPPLIER, use supplier_id, tax_id, supplier_name, contact_email, supplier_address, and source_system as evidence.
 20. For SUPPLIER, do not say email, name, or address are missing when contact_email, supplier_name, or supplier_address are present.
 21. For SUPPLIER, treat same-domain contact emails as supporting but non-deterministic evidence unless the full email matches exactly.
+22. For PROVIDER, conflicting NPI values are high-risk deterministic evidence and must not be minimized.
+23. For PROVIDER, conflicting provider_id values reduce merge confidence unless there is a clear same-root identifier pattern supported by other strong evidence.
+24. For PROVIDER, conflicting specialty or practice address should be described as cautionary evidence.
+25. For PROVIDER, same email domain or same last name alone is not enough to call the records strong merge candidates.
+26. For PROVIDER, if provider_id and npi are both missing, treat the records as weak evidence for merge even if other attributes align.
+27. For PROVIDER, treat an exact normalized phone-number match as supporting evidence, not a primary deterministic identifier.
+28. For PROVIDER, a missing phone number is unavailable evidence, not a conflict.
+29. For PROVIDER, a phone-number mismatch should reduce confidence modestly but must not outweigh matching NPI or Provider ID by itself.
 
 Decision calibration:
 - AUTO_MERGE: deterministic identifiers or highly aligned evidence with low risk and no conflicting identity attributes.
@@ -313,11 +519,8 @@ Avoid redundant rule_analysis items. Each reason should explain why the rule mat
 Domain:
 {_fmt(domain)}
 
-Domain:
-{_fmt(domain)}
-
 {record_evidence}
-Match score:
+Preliminary upstream match score secondary context only:
 {req.match_score}
 
 Triggered rules:
@@ -331,7 +534,7 @@ Policy recommendation:
 - recommended_actions_seen: {recommended_actions_seen}
 
 Signal evidence:
-{json.dumps(signal_packets, indent=2)}
+{json.dumps(prompt_signal_packets, indent=2)}
 """.strip()
 
     if policy_context:

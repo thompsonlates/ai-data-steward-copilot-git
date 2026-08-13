@@ -1,16 +1,130 @@
 from datetime import datetime, timezone
+
+from http import client
 import traceback
 import uuid
 from difflib import SequenceMatcher
 from typing import Optional
 import logging
+import os
+
+from fastapi import APIRouter, Depends, Query, status
+from fastapi.responses import RedirectResponse
+
+from app.api.auth import AuthUser, get_current_user, get_current_tenant_user
+
+from app.api.schemas import (
+    ConnectionTestResponse,
+    EnterpriseConnectionCreate,
+    EnterpriseConnectionListResponse,
+    EnterpriseConnectionResponse,
+    GoogleOAuthStartRequest,
+    OnboardingStatusResponse,
+    OrganizationOnboardingRequest,
+    OrganizationOnboardingResponse,
+)
+
+from app.repositories.onboarding_repository import (
+    OnboardingRepository,
+)
+from app.services.google_oauth_service import (
+    GoogleOAuthService,
+)
+from app.services.onboarding_service import (
+    OnboardingService,
+)
+
+from app.api.entitlements_schemas import (
+    DomainEntitlementResponse,
+)
+
+
+from app.repositories.connection_repository import ( ConnectionRepository,)
+from app.services.connection_service import ConnectionService
+from app.services.secret_manager_service import SecretManagerService
+
+from app.repositories.entitlement_repository import (
+    EntitlementRepository,
+)
+from app.services.entitlement_service import (
+    EntitlementService,
+)
+
+from app.api.customer_user_schemas import (
+    CustomerUserInviteRequest,
+    CustomerUserResponse,
+)
+from app.repositories.customer_user_repository import (
+    CustomerUserRepository,
+)
+from app.services.customer_user_service import (
+    CustomerUserService,
+)
+
+
+entitlement_repository = EntitlementRepository()
+
+entitlement_service = EntitlementService(
+    repository=entitlement_repository,
+)
+
+customer_user_repository = CustomerUserRepository()
+
+customer_user_service = CustomerUserService(
+    repository=customer_user_repository,
+    entitlement_service=entitlement_service,
+)
+
+
+
+PROJECT_ID = os.getenv(
+    "GOOGLE_CLOUD_PROJECT",
+    "api-project-503305938314",
+)
+
+DATASET_ID = os.getenv(
+    "BIGQUERY_DATASET",
+    "ai_data_steward_mvp",
+)
+
+onboarding_repository = OnboardingRepository(
+    project_id=PROJECT_ID,
+    dataset_id=DATASET_ID,
+)
+
+onboarding_service = OnboardingService(
+    repository=onboarding_repository,
+)
+
+connection_repository = ConnectionRepository(
+    project_id=PROJECT_ID,
+    dataset_id=DATASET_ID,
+)
+
+secret_manager_service = SecretManagerService(
+    project_id=PROJECT_ID,
+)
+
+connection_service = ConnectionService(
+    repository=connection_repository,
+    secret_manager=secret_manager_service,
+)
+
+google_oauth_service = GoogleOAuthService(
+    repository=connection_repository,
+    secret_manager=secret_manager_service,
+
+)
 
 from app.services.record_search_service import RecordSearchService
 from app.api.schemas import RecordSearchResponse
 record_search_service = RecordSearchService()
 
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 router = APIRouter()
+
+router = APIRouter(prefix="/v1", tags=["Enterprise Connections"])
 
 logger = logging.getLogger(__name__)
 from fastapi import Request
@@ -26,7 +140,7 @@ from app.workflow.orchestration.workflow_orchestrator import (
     )
 
 
-from app.api.deps import get_current_user
+from app.api.auth import AuthUser, get_current_user
 from app.api.schemas import (
     MatchExplainRequest,
     MatchExplainResponse,
@@ -51,7 +165,30 @@ from app.services.bq_metrics import BigQueryMetrics
 from app.services.entity_resolution_engine import EntityResolutionEngine
 from app.services.llm_service import LLMService
 from app.services.policy_intelligence import PolicyIntelligenceEngine
+from app.services.risk_engine import evaluate_risk
 from app.services.prompt_builder import build_match_explain_prompt
+from app.services.governance_service_engine import (build_governance_ai_recommendation,)
+from app.services.quality_intelligence_service import (build_quality_rule_suggestions,)
+
+from app.api.schemas import (
+    MatchExplainRequest,
+    MatchExplainResponse,
+    MatchFeedbackRequest,
+    MatchFeedbackResponse,
+    MetricsOverviewResponse,
+    DqDashboardResponse,
+    DqRuleSuggestionsResponse,
+    PolicyConfigResponse,
+    PolicyDraftRequest,
+    PolicyDraftResponse,
+    PolicyPublishRequest,
+    PolicyPublishResponse,
+    GovernanceOverviewResponse,
+    GovernanceKPI,
+    GovernanceDatasetStatus,
+    GovernanceBlocker,
+    GovernancePolicyActivity,
+)
 
 router = APIRouter()
 
@@ -81,6 +218,29 @@ def utc_now_iso() -> str:
 
 def ensure_request_id(request_id: Optional[str]) -> str:
     return request_id or f"req_{uuid.uuid4().hex[:16]}"
+
+
+def require_current_organization_id(current_user: AuthUser) -> str:
+    """Return the authenticated tenant ID or fail closed.
+
+    Never coerce a missing organization_id with str(), because str(None)
+    becomes "None" and can leak invalid tenant context downstream.
+    """
+    organization_id = (current_user.organization_id or "").strip()
+
+    if not organization_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authenticated organization context is required.",
+        )
+
+    if not organization_id.startswith("org_"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authenticated organization context is invalid.",
+        )
+
+    return organization_id
 
 
 def compute_address_similarity(a: Optional[str], b: Optional[str]) -> float:
@@ -594,22 +754,59 @@ def is_valid_date(value: str) -> bool:
         )
     )
 
+@router.post(
+    "/organization/users/invite",
+    response_model=CustomerUserResponse,
+)
+def invite_customer_user(
+    payload: CustomerUserInviteRequest,
+    current_user: AuthUser = Depends(
+        get_current_tenant_user
+    ),
+) -> CustomerUserResponse:
+    organization_id = (
+        require_current_organization_id(
+            current_user
+        )
+    )
 
-@router.get("/metrics/governance-overview", response_model=GovernanceOverviewResponse)
-def get_governance_overview(days: int = Query(30, ge=1, le=365)):
+    result = customer_user_service.invite_user(
+        organization_id=organization_id,
+        email=str(payload.email),
+        display_name=payload.display_name,
+        organization_role=payload.organization_role,
+        billing_role=payload.billing_role,
+        invited_by=str(current_user.email),
+    )
+
+    return CustomerUserResponse(
+        **result
+    )
+
+@router.get(
+    "/metrics/governance-overview",
+    response_model=GovernanceOverviewResponse,
+)
+def get_governance_overview(
+    days: int = Query(30, ge=1, le=365),
+    current_user: AuthUser = Depends(get_current_user),
+):
     project_id = "api-project-503305938314"
     dataset_id = "ai_data_steward_mvp"
+    organization_id = require_current_organization_id(current_user)
 
-    client = bigquery.Client(project=project_id)
+    bq_client = bigquery.Client(project=project_id)
 
     kpi_sql = f"""
     SELECT *
     FROM `{project_id}.{dataset_id}.V_GOVERNANCE_INTELLIGENCE`
+    WHERE organization_id = @organization_id
     """
 
     dataset_sql = f"""
     SELECT *
     FROM `{project_id}.{dataset_id}.V_GOVERNANCE_DATASET_DETAIL`
+    WHERE organization_id = @organization_id
     ORDER BY
       COALESCE(certification_readiness_score, 0) ASC,
       failed_checks DESC,
@@ -622,53 +819,142 @@ def get_governance_overview(days: int = Query(30, ge=1, le=365)):
       blocker_reason,
       blocker_count
     FROM `{project_id}.{dataset_id}.V_GOVERNANCE_TOP_BLOCKERS`
+    WHERE organization_id = @organization_id
     LIMIT 10
     """
 
     policy_sql = f"""
     SELECT *
     FROM `{project_id}.{dataset_id}.V_GOVERNANCE_POLICY_ACTIVITY`
-    WHERE DATE(changed_at) >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
-       OR changed_at IS NULL
+    WHERE organization_id = @organization_id
+      AND (
+        DATE(changed_at) >= DATE_SUB(CURRENT_DATE(), INTERVAL @days DAY)
+        OR changed_at IS NULL
+      )
     ORDER BY changed_at DESC
     LIMIT 20
     """
 
-    try:
-        kpi_rows = [dict(row) for row in client.query(kpi_sql).result()]
-        dataset_rows = [dict(row) for row in client.query(dataset_sql).result()]
-        blocker_rows = [dict(row) for row in client.query(blockers_sql).result()]
-        policy_rows = [dict(row) for row in client.query(policy_sql).result()]
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter(
+                "organization_id",
+                "STRING",
+                organization_id,
+            ),
+            bigquery.ScalarQueryParameter(
+                "days",
+                "INT64",
+                days,
+            ),
+        ]
+    )
 
+    try:
+        kpi_rows = [
+            dict(row)
+            for row in bq_client.query(
+                kpi_sql,
+                job_config=job_config,
+            ).result()
+        ]
+        dataset_rows = [
+            dict(row)
+            for row in bq_client.query(
+                dataset_sql,
+                job_config=job_config,
+            ).result()
+        ]
+        blocker_rows = [
+            dict(row)
+            for row in bq_client.query(
+                blockers_sql,
+                job_config=job_config,
+            ).result()
+        ]
+        policy_rows = [
+            dict(row)
+            for row in bq_client.query(
+                policy_sql,
+                job_config=job_config,
+            ).result()
+        ]
+        enriched_dataset_rows = []
+        import pprint
+
+        import pprint
+
+                   
         if not kpi_rows:
-            raise HTTPException(status_code=404, detail="No governance KPI data found")
+            raise HTTPException(
+                status_code=404,
+                detail="No governance KPI data found",
+            )
 
         kpi_row = kpi_rows[0]
 
+        enriched_dataset_rows = []
+
+        for dataset_row in dataset_rows:
+            enriched_row = dict(dataset_row)
+
+            enriched_row["ai_recommendation"] = (
+                build_governance_ai_recommendation(
+                    enriched_row,
+                    organization_id=organization_id,
+                )
+            )
+
+            enriched_dataset_rows.append(
+                enriched_row
+            )
+
+
         kpis = GovernanceKPI(
-            total_datasets=int(kpi_row.get("total_datasets") or 0),
-            certified_datasets=int(kpi_row.get("certified_datasets") or 0),
-            ready_for_certification=int(kpi_row.get("ready_for_certification") or 0),
+            total_datasets=int(
+                kpi_row.get("total_datasets") or 0
+            ),
+            certified_datasets=int(
+                kpi_row.get("certified_datasets") or 0
+            ),
+            ready_for_certification=int(
+                kpi_row.get("ready_for_certification") or 0
+            ),
             in_progress_certifications=int(
                 kpi_row.get("in_progress_certifications") or 0
             ),
-            avg_fair_score=float(kpi_row.get("avg_fair_score") or 0),
-            open_governance_issues=int(kpi_row.get("open_governance_issues") or 0),
-            total_checks=int(kpi_row.get("total_checks") or 0),
-            passed_checks=int(kpi_row.get("passed_checks") or 0),
-            failed_checks=int(kpi_row.get("failed_checks") or 0),
-            check_pass_rate=float(kpi_row.get("check_pass_rate") or 0),
-            active_policies=int(kpi_row.get("active_policies") or 0),
+            avg_fair_score=float(
+                kpi_row.get("avg_fair_score") or 0
+            ),
+            open_governance_issues=int(
+                kpi_row.get("open_governance_issues") or 0
+            ),
+            total_checks=int(
+                kpi_row.get("total_checks") or 0
+            ),
+            passed_checks=int(
+                kpi_row.get("passed_checks") or 0
+            ),
+            failed_checks=int(
+                kpi_row.get("failed_checks") or 0
+            ),
+            check_pass_rate=float(
+                kpi_row.get("check_pass_rate") or 0
+            ),
+            active_policies=int(
+                kpi_row.get("active_policies") or 0
+            ),
             recent_policy_changes_30d=int(
                 kpi_row.get("recent_policy_changes_30d") or 0
             ),
         )
 
-        dataset_statuses = [GovernanceDatasetStatus(**row) for row in dataset_rows]
+        dataset_statuses = [GovernanceDatasetStatus(**row) for row in enriched_dataset_rows]
         top_blockers = [GovernanceBlocker(**row) for row in blocker_rows]
         policy_activity = [GovernancePolicyActivity(**row) for row in policy_rows]
 
         return GovernanceOverviewResponse(
+            organization_id=organization_id,
             kpis=kpis,
             dataset_statuses=dataset_statuses,
             top_blockers=top_blockers,
@@ -684,19 +970,236 @@ def get_governance_overview(days: int = Query(30, ge=1, le=365)):
         )
 
 
-@router.get("/metrics/dq-overview", response_model=DqDashboardResponse)
+@router.get(
+    "/metrics/dq-overview",
+    response_model=DqDashboardResponse,
+)
 def get_dq_metrics_overview(
     days: int = Query(30, ge=1, le=365),
     domain: Optional[str] = Query(None),
+    current_user: AuthUser = Depends(get_current_user),
 ):
+    organization_id = require_current_organization_id(
+        current_user
+    )
+
     try:
-        result = metrics.get_dq_dashboard_overview(days=days, domain=domain)
-        return result
-    except Exception as e:
+        result = metrics.get_dq_dashboard_overview(
+            days=days,
+            domain=domain,
+            organization_id=organization_id,
+        )
+
+        return {
+            "organization_id": organization_id,
+            **result,
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        logger.exception(
+            "Failed to load DQ dashboard overview "
+            "for organization_id=%s",
+            organization_id,
+        )
+
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to load DQ overview: {str(e)}",
+            detail=str(exc),
+        ) from exc
+
+@router.get(
+    "/onboarding/status",
+    response_model=OnboardingStatusResponse,
+)
+def get_onboarding_status(
+    current_user: AuthUser = Depends(get_current_user),
+) -> OnboardingStatusResponse:
+    result = onboarding_service.get_onboarding_status(
+        current_user=current_user,
+    )
+
+    return OnboardingStatusResponse.model_validate(result)
+
+@router.post(
+    "/onboarding/organization",
+    response_model=OrganizationOnboardingResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_onboarding_organization(
+    request: OrganizationOnboardingRequest,
+    current_user: AuthUser = Depends(get_current_user),
+) -> OrganizationOnboardingResponse:
+    result = onboarding_service.create_organization_and_owner(
+        current_user=current_user,
+        request=request,
+    )
+
+    return OrganizationOnboardingResponse.model_validate(result)
+
+@router.post("/oauth/google/start")
+def start_google_oauth(
+    request: GoogleOAuthStartRequest,
+    current_user: AuthUser = Depends(get_current_user),
+):
+    result = google_oauth_service.start_authorization(
+        connection_id=request.connection_id,
+        organization_id=require_current_organization_id(current_user),
+        current_user_email=current_user.email,
+        project_id=request.project_id,
+        return_url=request.return_url,
+    )
+
+    return {
+        "authorization_url": result.authorization_url,
+        "connection_id": result.connection_id,
+    }
+
+@router.get("/oauth/google/callback")
+def google_oauth_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    error_description: str | None = None,
+):
+    try:
+        logger.info(
+            "Google OAuth callback received. "
+            "code_present=%s state_present=%s error=%s",
+            bool(code),
+            bool(state),
+            error,
         )
+
+        result = google_oauth_service.complete_authorization(
+            code=code,
+            state_token=state,
+            oauth_error=error,
+            oauth_error_description=error_description,
+        )
+
+        logger.info(
+            "Google OAuth completed successfully. connection_id=%s",
+            result.connection_id,
+        )
+
+        return RedirectResponse(
+            url=result.return_url,
+            status_code=status.HTTP_302_FOUND,
+        )
+
+    except HTTPException as exc:
+        logger.warning(
+            "Google OAuth callback failed with HTTP error: %s",
+            exc.detail,
+        )
+
+        failure_url = google_oauth_service.build_failure_return_url(
+            state_token=state,
+            message=str(exc.detail),
+        )
+
+        return RedirectResponse(
+            url=failure_url,
+            status_code=status.HTTP_302_FOUND,
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "Unexpected Google OAuth callback failure."
+        )
+
+        failure_url = google_oauth_service.build_failure_return_url(
+            state_token=state,
+            message=(
+                "Google authorization completed, but the connection "
+                "could not be activated."
+            ),
+        )
+
+        return RedirectResponse(
+            url=failure_url,
+            status_code=status.HTTP_302_FOUND,
+        )
+
+
+@router.post(
+    "/connections",
+    response_model=EnterpriseConnectionResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_enterprise_connection(
+    request: EnterpriseConnectionCreate,current_user: AuthUser = Depends(get_current_tenant_user
+),
+) -> EnterpriseConnectionResponse:
+    return connection_service.create_connection(
+        request=request,
+        organization_id=require_current_organization_id(current_user),
+        created_by=str(current_user.email),
+    )
+
+@router.get(
+    "/connections",
+    response_model=EnterpriseConnectionListResponse,
+    status_code=status.HTTP_200_OK,
+)
+def list_enterprise_connections(
+    page: int = Query(
+        default=1,
+        ge=1,
+        description="Page number beginning at 1",
+    ),
+    page_size: int = Query(
+        default=25,
+        ge=1,
+        le=100,
+        description="Number of connections returned per page",
+    ),
+    current_user: AuthUser = Depends(get_current_tenant_user),
+    
+) -> EnterpriseConnectionListResponse:
+
+    print(
+            "CURRENT USER TENANT:",
+            repr(current_user.organization_id),
+            flush=True,
+        )
+    return connection_service.list_connections(
+        page=page,
+        page_size=page_size,
+        organization_id=require_current_organization_id(current_user),
+        
+    )
+@router.get(
+    "/connections/{connection_id}",
+    response_model=EnterpriseConnectionResponse,
+    status_code=status.HTTP_200_OK,
+)
+def get_enterprise_connection(
+    connection_id: str,
+    current_user: AuthUser = Depends(get_current_tenant_user),
+) -> EnterpriseConnectionResponse:
+    return connection_service.get_connection(
+        connection_id=connection_id,
+        organization_id=require_current_organization_id(current_user),
+    )
+
+@router.post(
+    "/connections/{connection_id}/test",
+    response_model=ConnectionTestResponse,
+    status_code=status.HTTP_200_OK,
+)
+def test_enterprise_connection(
+    connection_id: str,
+    current_user: AuthUser = Depends(get_current_tenant_user),
+) -> ConnectionTestResponse:
+    return connection_service.test_connection(
+        connection_id=connection_id,
+        organization_id=require_current_organization_id(current_user),
+        tested_by=str(current_user.email),
+    )
 
 @router.get("/records/search",
     response_model=RecordSearchResponse,
@@ -704,11 +1207,13 @@ def get_dq_metrics_overview(
 async def search_records(
     domain: str,
     q: str,
+    current_user: AuthUser = Depends(get_current_tenant_user),
 ):
 
     rows = record_search_service.search_records(
         domain=domain,
         search_text=q,
+        organization_id=require_current_organization_id(current_user),
     )
 
     return {
@@ -720,18 +1225,29 @@ async def search_records(
                 "display_name": row["display_name"],
                 "source_system": row["source_system"],
                 "golden_record_flag": row["golden_record_flag"],
+                "human_id": row.get("human_id"),
+                "phone_number": row.get("phone_number"),
                 "record": {
                     "member_id": row.get("member_id"),
                     "patient_id": row.get("patient_id"),
                     "provider_id": row.get("provider_id"),
                     "supplier_id": row.get("supplier_id"),
                     "product_id": row.get("product_id"),
+
+                    # Supplier fields
+                    "supplier_name": row.get("supplier_name"),
+                    "supplier_name_line_1": row.get("supplier_name_line_1") or row.get("supplier_name"),
+                    "supplier_name_line_2": row.get("supplier_name_line_2"),
+                    "contact_email": row.get("contact_email") or row.get("email"),
+                    "supplier_address": row.get("supplier_address") or row.get("address"),
+
                     "first_name": row.get("first_name"),
                     "last_name": row.get("last_name"),
                     "email": row.get("email"),
                     "address": row.get("address"),
                     "dob": row.get("dob"),
                     "npi": row.get("npi"),
+                    "phone_number": row.get("phone_number"),
                     "specialty": row.get("specialty"),
                     "tax_id": row.get("tax_id"),
                     "gtin": row.get("gtin"),
@@ -739,24 +1255,166 @@ async def search_records(
                     "product_name": row.get("product_name"),
                     "product_variant": row.get("product_variant"),
                     "effective_lot_date": row.get("effective_lot_date"),
+                    "item_category": row.get("item_category"),
                     "source_system": row.get("source_system"),
-    },
+},
 
             }
             for row in rows
         ]
     }
 
+@router.get(
+    "/metrics/dq-rule-suggestions",
+    response_model=DqRuleSuggestionsResponse,
+)
+def get_dq_rule_suggestions(
+    days: int = Query(30, ge=1, le=365),
+    domain: Optional[str] = Query(None),
+    provider: Optional[str] = Query(
+        None,
+        description="Optional LLM provider override",
+    ),
+    use_llm: bool = Query(
+        True,
+        description=(
+            "When false, returns deterministic rule suggestions "
+            "without calling the LLM"
+        ),
+    ),
+    current_user: AuthUser = Depends(get_current_tenant_user),
+    
+):
+    """
+    Generate implementation-ready AI data quality rule suggestions from
+    the most recent Data Quality Intelligence metrics.
+    """
+    try:
+        dq_result = metrics.get_dq_dashboard_overview(
+            days=days,
+            domain=domain,
+            organization_id=require_current_organization_id(current_user),
+        )
+
+        if not isinstance(dq_result, dict):
+            raise HTTPException(
+                status_code=500,
+                detail="DQ overview returned an unexpected response format.",
+            )
+
+        latest_dq_row = dq_result.get("latest")
+
+        # Defensive fallback if the metrics service returns rows but does
+        # not explicitly populate latest.
+        if not latest_dq_row:
+            rows = dq_result.get("rows") or []
+
+            if rows:
+                latest_dq_row = rows[-1]
+
+        if not latest_dq_row:
+            return DqRuleSuggestionsResponse(
+                organization_id=require_current_organization_id(
+                    current_user
+                ),
+                days=days,
+                domain=domain,
+                dataset_id=None,
+                dataset_name=None,
+                metric_date=None,
+                model_provider=(
+                    provider
+                    or os.getenv("QUALITY_INTELLIGENCE_LLM_PROVIDER")
+                    or os.getenv("GOVERNANCE_LLM_PROVIDER")
+                    or "claude"
+                ),
+                used_llm=False,
+                ai_rule_suggestions={
+                    "headline": "No DQ recommendations available yet",
+                    "summary": (
+                        "No Data Quality Intelligence metrics are available "
+                        "for this organization in the selected lookback window."
+                    ),
+                    "priority": "LOW",
+                    "rule_strategy": "MIXED",
+                    "suggested_rules": [],
+                    "recommended_sequence": [],
+                    "supporting_evidence": [],
+                    "confidence": 0.0,
+                },
+                generated_at=datetime.now(timezone.utc),
+            )
+
+        if hasattr(latest_dq_row, "model_dump"):
+            latest_dq_row = latest_dq_row.model_dump()
+        elif not isinstance(latest_dq_row, dict):
+            latest_dq_row = dict(latest_dq_row)
+
+        suggestions = build_quality_rule_suggestions(
+            latest_dq_row,
+            organization_id=str(current_user.organization_id),
+            provider=provider,
+            use_llm=use_llm,
+)
+
+        generated_at = datetime.now(timezone.utc)
+
+        return DqRuleSuggestionsResponse(
+            days=days,
+            domain=domain or latest_dq_row.get("domain"),
+            dataset_id=latest_dq_row.get("dataset_id"),
+            dataset_name=(
+                latest_dq_row.get("dataset_name")
+                or latest_dq_row.get("table_name")
+                or latest_dq_row.get("asset_name")
+            ),
+            metric_date=(
+                str(latest_dq_row.get("metric_date"))
+                if latest_dq_row.get("metric_date") is not None
+                else None
+            ),
+            model_provider=(
+                provider
+                or os.getenv("QUALITY_INTELLIGENCE_LLM_PROVIDER")
+                or os.getenv("GOVERNANCE_LLM_PROVIDER")
+                or "claude"
+            ),
+            used_llm=use_llm,
+            ai_rule_suggestions=suggestions,
+            generated_at=generated_at,
+            organization_id=require_current_organization_id(
+                                current_user
+            ),
+        )
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        logger.exception(
+            "Failed to generate DQ rule suggestions."
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Failed to generate DQ rule suggestions: "
+                f"{str(exc)}"
+            ),
+        ) from exc
+
 
 @router.get("/policy/config", response_model=PolicyConfigResponse)
 def get_policy_config(
     domain: str = Query(...),
     policy_version: Optional[str] = Query(None),
+    current_user: AuthUser = Depends(get_current_tenant_user),
 ):
     try:
         result = policy_engine.get_policy_config_bundle(
             domain=domain,
             policy_version=policy_version,
+            organization_id=require_current_organization_id(current_user),
         )
         return PolicyConfigResponse(**result)
     except Exception as e:
@@ -766,25 +1424,53 @@ def get_policy_config(
         )
 
 
-@router.post("/policy/config/draft", response_model=PolicyDraftResponse)
-def save_policy_config_draft(payload: PolicyDraftRequest):
+@router.post(
+    "/policy/config/draft",
+    response_model=PolicyDraftResponse,
+)
+def save_policy_config_draft(
+    payload: PolicyDraftRequest,
+    current_user: AuthUser = Depends(
+    get_current_tenant_user
+),
+):
     try:
-        result = policy_engine.save_policy_draft(payload.model_dump())
-        return PolicyDraftResponse(**result)
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to save policy draft: {str(e)}",
+        policy_payload = payload.model_dump()
+
+        policy_payload["created_by"] = current_user.email
+        policy_payload["updated_by"] = current_user.email
+
+        result = policy_engine.save_policy_draft(
+            policy_payload,
+            organization_id=require_current_organization_id(current_user),
         )
 
+        return PolicyDraftResponse(**result)
 
-@router.post("/policy/config/publish", response_model=PolicyPublishResponse)
-def publish_policy_config(payload: PolicyPublishRequest):
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Failed to save policy draft: "
+                f"{str(exc)}"
+            ),
+        ) from exc
+
+
+@router.post(
+    "/policy/config/publish",
+    response_model=PolicyPublishResponse,
+)
+def publish_policy_config(
+    payload: PolicyPublishRequest,
+    current_user: AuthUser = Depends(get_current_tenant_user),
+):
     try:
         result = policy_engine.publish_policy_version(
             domain=payload.domain,
             policy_version=payload.policy_version,
-            published_by=payload.published_by or "system",
+            organization_id=require_current_organization_id(current_user),
+            published_by=str(current_user.email),
         )
         return PolicyPublishResponse(**result)
     except ValueError as e:
@@ -868,6 +1554,7 @@ def generate_text_insight(llm: LLMService, prompt: str) -> str | None:
 async def match_explain(
     request: Request,
     req: MatchExplainRequest,
+    current_user: AuthUser = Depends(get_current_tenant_user),
     provider: str = Query(DEFAULT_LLM_PROVIDER, pattern="^(gemini|claude)$"),
 ):
 
@@ -884,10 +1571,43 @@ async def match_explain(
         
         explanation_id = f"exp_{uuid.uuid4().hex[:12]}"
 
-        model_provider, model_version = get_model_metadata(provider)
-        llm = LLMService(provider=provider)
+        organization_id = require_current_organization_id(
+            current_user
+        )
 
-        decision_ctx = policy_engine.build_decision_context(req)
+    # ---------------------------------------------------
+    # Domain Entitlement Enforcement
+    # ---------------------------------------------------
+        requested_domain = str(
+            req.domain or ""
+        ).strip().upper()
+
+        if not requested_domain:
+            raise HTTPException(
+                status_code=400,
+                detail="domain is required",
+            )
+
+        entitlement_service.require_domain_entitlement(
+            organization_id=organization_id,
+            domain=requested_domain,
+        )
+
+        # Normalize the request once entitlement has been verified.
+        req.domain = requested_domain
+
+        model_provider, model_version = get_model_metadata(
+            provider
+        )
+
+        llm = LLMService(
+            provider=provider
+        )
+
+        decision_ctx = policy_engine.build_decision_context(
+            req,
+            organization_id=organization_id,
+        )
 
         policy_rec = decision_ctx.get("policy_recommendation", {}) or {}
         policy_cfg = decision_ctx.get("policy_config", {}) or {}
@@ -988,6 +1708,9 @@ async def match_explain(
         entity_engine = EntityResolutionEngine()
         entity_resolution = entity_engine.score(
             req=req,
+            organization_id=require_current_organization_id(
+                current_user
+            ),
             address_similarity_score=address_similarity_score,
             override_rate_estimate=policy_rec.get("override_rate_estimate"),
             composite_risk_score=policy_rec.get("composite_risk_score"),
@@ -1006,24 +1729,96 @@ async def match_explain(
             primary_risk_driver=policy_rec.get("primary_risk_driver"),
             policy_config=entity_policy_config,
         )
+                # ---------------------------------------------------
+        # Attribute Conflict Risk Evaluation
+        # ---------------------------------------------------
+        attribute_risk = evaluate_risk(
+            domain=domain,
+            record_a=req.record_a,
+            record_b=req.record_b,
+            signal_packets=entity_resolution.get("signals"),
+            recommended_action=(
+                entity_resolution.get("final_recommended_action")
+                or final_recommended_action
+            ),
+        )
+
+        risk_drivers = attribute_risk.get(
+            "risk_drivers",
+            [],
+)
+
+        attribute_risk_flag = attribute_risk.get("risk_flag", "LOW")
+        attribute_risk_score = attribute_risk.get("risk_score", 0)
+        attribute_primary_risk_driver = attribute_risk.get(
+            "primary_risk_driver",
+            "NO_MAJOR_CONFLICT",
+        )
+
+
+        policy_risk_flag = str(
+            policy_rec.get("highest_risk_level") or ""
+        ).strip().upper()
+
+        if policy_risk_flag not in VALID_RISK_FLAGS:
+            policy_risk_flag = "LOW"
+
+        risk_rank = {
+            "LOW": 1,
+            "MEDIUM": 2,
+            "HIGH": 3,
+            "CRITICAL": 4,
+            "SEVERE": 4,
+        }
+
+        response_risk_flag = (
+            attribute_risk_flag
+            if risk_rank.get(attribute_risk_flag, 1)
+            >= risk_rank.get(policy_risk_flag, 1)
+            else policy_risk_flag
+        )
+
+        primary_risk_driver = (
+            attribute_primary_risk_driver
+            if attribute_primary_risk_driver != "NO_MAJOR_CONFLICT"
+            else policy_rec.get("primary_risk_driver")
+        )
+
+        composite_risk_score = max(
+            int(policy_rec.get("composite_risk_score") or 0),
+            int(attribute_risk_score or 0),
+        )
+
 
         prompt = build_match_explain_prompt(
             req=req,
+            organization_id=organization_id,
             learning_context=decision_ctx.get("learning_context"),
             policy_context=decision_ctx.get("policy_context"),
-            policy_recommendation=decision_ctx.get("policy_recommendation"),
+            policy_recommendation=decision_ctx.get(
+                "policy_recommendation"
+            ),
             signal_packets=decision_ctx.get("signal_packets"),
-        )
+)
         try:
-            ai_payload = llm.generate_explanation(prompt)
+           ai_payload = llm.generate_explanation(
+            prompt,
+            organization_id=require_current_organization_id(
+                current_user
+            ),
+        )
         except Exception as e:
             print("LLM PARSE FAILURE:")
             print(str(e))
 
             retry_prompt = build_retry_prompt(prompt)
-            ai_payload = llm.generate_explanation(retry_prompt)
+            ai_payload = llm.generate_explanation(
+                retry_prompt,
+                organization_id=organization_id
+                ),
+            
 
-        ai_payload = normalize_ai_payload(ai_payload)
+            ai_payload = normalize_ai_payload(ai_payload)
 
             # ---------------------------------------------------
             # Governance Workflow Orchestration
@@ -1039,13 +1834,15 @@ async def match_explain(
                 **ai_payload,
                 "explanation_id": explanation_id,
                 "request_id": request_id,
+                "organization_id": require_current_organization_id(current_user),
                 "domain": domain,
                 "policy_version": policy_version,
                 "record_a": req.record_a.model_dump(),
                 "record_b": req.record_b.model_dump(),
-                "primary_risk_driver": policy_rec.get("primary_risk_driver"),
-                "composite_risk_score": policy_rec.get("composite_risk_score"),
+                "primary_risk_driver": primary_risk_driver,
+                "composite_risk_score": composite_risk_score,
                 "composite_risk_band": policy_rec.get("composite_risk_band"),
+                "risk_flag": response_risk_flag,
             }
 
             workflow_result = orchestrator.evaluate_match_explanation(
@@ -1098,39 +1895,30 @@ async def match_explain(
                         },
                     )
         
-        policy_recommended_action = str(
-            policy_rec.get("recommendation") or ""
-        ).strip().upper()
-        final_recommended_action = (
-            policy_recommended_action
-            if policy_recommended_action in VALID_DECISIONS
-            else ai_payload["recommended_action"]
-        )
+                policy_recommended_action = str(
+                    policy_rec.get("recommendation") or ""
+                ).strip().upper()
+                final_recommended_action = (
+                    policy_recommended_action
+                    if policy_recommended_action in VALID_DECISIONS
+                    else ai_payload["recommended_action"]
+                )
 
-        policy_risk_flag = str(
-            policy_rec.get("highest_risk_level") or ""
-        ).strip().upper()
-        response_risk_flag = (
-            policy_risk_flag
-            if policy_risk_flag in VALID_RISK_FLAGS
-            else ai_payload["risk_flag"]
-        )
-
-
-        insight_prompt = build_ai_insight_prompt(
-            domain=domain,
-            ai_decision=ai_payload["ai_decision"],
-            recommended_action=final_recommended_action,
-            confidence=ai_payload["confidence"],
-            risk_flag=response_risk_flag,
-            triggered_rules=req.triggered_rules or [],
-            primary_signal=entity_resolution.get("primary_signal"),
-            composite_risk_score=(
-                entity_resolution.get("composite_risk_score")
-                or policy_rec.get("composite_risk_score")
-            ),
-            signal_contributions=entity_resolution.get("signal_contributions"),
-        )
+      
+                insight_prompt = build_ai_insight_prompt(
+                    domain=domain,
+                    ai_decision=ai_payload["ai_decision"],
+                    recommended_action=final_recommended_action,
+                    confidence=ai_payload["confidence"],
+                    risk_flag=response_risk_flag,
+                    triggered_rules=req.triggered_rules or [],
+                    primary_signal=entity_resolution.get("primary_signal"),
+                    composite_risk_score=(
+                        entity_resolution.get("composite_risk_score")
+                        or policy_rec.get("composite_risk_score")
+                    ),
+                    signal_contributions=entity_resolution.get("signal_contributions"),
+                )
         ai_insight = generate_text_insight(llm, insight_prompt)
 
 
@@ -1149,11 +1937,16 @@ async def match_explain(
             entity_resolution.get("automation_policy_status"),
         )
         print("=============================")
+        print(req.record_a.item_category)
+        print(req.record_b.item_category)
+
         response_obj = MatchExplainResponse(
             explanation_id=explanation_id,
+            organization_id=require_current_organization_id(current_user),
             ai_decision=ai_payload["ai_decision"],
             confidence=ai_payload["confidence"],
             risk_flag=response_risk_flag,
+            risk_drivers=risk_drivers,
             match_score=entity_resolution.get("match_score"),
             explanation_summary=ai_payload["explanation_summary"],
             rule_analysis=ai_payload["rule_analysis"],
@@ -1169,9 +1962,9 @@ async def match_explain(
             request_id=request_id,
             trace_id=request_id,
             audit_packet_id=audit_packet_id,
-            composite_risk_score=policy_rec.get("composite_risk_score"),
+            composite_risk_score=composite_risk_score,
             composite_risk_band=policy_rec.get("composite_risk_band"),
-            primary_risk_driver=policy_rec.get("primary_risk_driver"),
+            primary_risk_driver=primary_risk_driver,
             record_a_address_intelligence=record_a_address_intelligence,
             record_b_address_intelligence=record_b_address_intelligence,
             address_match_insight=address_match_insight,
@@ -1228,6 +2021,7 @@ async def match_explain(
 
         log_row = {
             "explanation_id": explanation_id,
+            "organization_id": require_current_organization_id(current_user),
             "request_id": request_id,
             "audit_packet_id": audit_packet_id,
             "domain": domain,
@@ -1239,7 +2033,7 @@ async def match_explain(
             "record_b_source_system": record_b_source_system,
             "match_score": entity_resolution.get("match_score"),
             "triggered_rules": req.triggered_rules,
-            "requested_by": req.requested_by,
+            "requested_by": current_user.email,
             "context_id": req.context_id,
             "ai_decision": response_obj.ai_decision,
             "ai_confidence": response_obj.confidence,
@@ -1268,7 +2062,15 @@ async def match_explain(
             "created_at": utc_now_iso(),
         }
 
-        bq.log_explanation(log_row)
+        logger.info(
+            "Logging explanation for authenticated user: %s",
+            current_user.email,
+        )
+
+        bq.log_explanation(
+            log_row,
+            organization_id=require_current_organization_id(current_user),
+        )
 
         return JSONResponse(content=jsonable_encoder(response_obj))
 
@@ -1284,8 +2086,36 @@ async def match_explain(
                 detail=str(e)
     )
 
-@router.post("/match/feedback", dependencies=[Depends(get_current_user)])
-def match_feedback(req: MatchFeedbackRequest):
+@router.post(
+    "/entitlements/domains/{domain}",
+    response_model=DomainEntitlementResponse,
+)
+def grant_domain_entitlement(
+    domain: str,
+    current_user: AuthUser = Depends(
+        get_current_tenant_user
+    ),
+) -> DomainEntitlementResponse:
+    organization_id = (
+        require_current_organization_id(
+            current_user
+        )
+    )
+
+    result = (
+        entitlement_service.grant_domain_entitlement(
+            organization_id=organization_id,
+            domain=domain,
+            granted_by=str(current_user.email),
+        )
+    )
+
+    return DomainEntitlementResponse(
+        **result
+    )
+
+@router.post("/match/feedback", dependencies=[Depends(get_current_tenant_user)])
+def match_feedback(req: MatchFeedbackRequest, current_user: AuthUser = Depends(get_current_tenant_user)):
     try:
         if not req.domain:
             raise HTTPException(status_code=400, detail="domain is required")
@@ -1297,7 +2127,10 @@ def match_feedback(req: MatchFeedbackRequest):
         decision_id = f"dec_{uuid.uuid4().hex[:12]}"
         submitted_at = utc_now_iso()
 
-        recommended_action = metrics.get_recommended_action(req.explanation_id)
+        recommended_action = metrics.get_recommended_action(
+            req.explanation_id,
+            organization_id=require_current_organization_id(current_user),
+        )
 
         if recommended_action is None:
             raise HTTPException(status_code=404, detail="explanation_id not found")
@@ -1307,8 +2140,9 @@ def match_feedback(req: MatchFeedbackRequest):
         row = bq.log_feedback_event(
             explanation_id=req.explanation_id,
             steward_decision=req.steward_decision,
-            steward_user=req.steward_user,
+            steward_user=current_user.email,
             steward_override_flag=override_flag,
+            organization_id=require_current_organization_id(current_user),
             request_id=request_id,
             decision_id=decision_id,
             domain=req.domain,
@@ -1339,10 +2173,19 @@ def match_feedback(req: MatchFeedbackRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/metrics/overview", response_model=MetricsOverviewResponse)
-def metrics_overview(days: int = Query(7, ge=1, le=365)):
+@router.get(
+    "/metrics/overview",
+    response_model=MetricsOverviewResponse,
+)
+def metrics_overview(
+    days: int = Query(7, ge=1, le=365),
+    current_user: AuthUser = Depends(get_current_tenant_user),
+):
     try:
-        data = metrics.overview(days)
+        data = metrics.overview(
+            days,
+            organization_id=require_current_organization_id(current_user),
+        )
 
         payload = {
             "days": days,

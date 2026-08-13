@@ -1,5 +1,3 @@
-# app/services/name_intelligence_service.py
-
 from __future__ import annotations
 
 import re
@@ -8,7 +6,12 @@ from difflib import SequenceMatcher
 from typing import Dict, List, Literal, Optional
 
 
-NameMatchLevel = Literal["EXACT", "SIMILAR", "DIFFERENT", "UNKNOWN"]
+NameMatchLevel = Literal[
+    "EXACT",
+    "SIMILAR",
+    "DIFFERENT",
+    "UNKNOWN",
+]
 
 
 COMMON_NICKNAMES: Dict[str, List[str]] = {
@@ -52,7 +55,7 @@ COMMON_NICKNAMES: Dict[str, List[str]] = {
 }
 
 
-@dataclass
+@dataclass(frozen=True)
 class NameIntelligenceResult:
     raw_a: Optional[str]
     raw_b: Optional[str]
@@ -68,7 +71,20 @@ class NameIntelligenceResult:
 
 
 class NameIntelligenceService:
-    def compare(self, a: Optional[str], b: Optional[str]) -> NameIntelligenceResult:
+    """
+    Stateless name-comparison utility.
+
+    This service does not read, write, fetch, or persist tenant data, so it
+    should not accept organization_id or perform tenant filtering itself.
+    Tenant isolation must happen before tenant-owned records or names are
+    passed into compare().
+    """
+
+    def compare(
+        self,
+        a: Optional[str],
+        b: Optional[str],
+    ) -> NameIntelligenceResult:
         norm_a = self._normalize(a)
         norm_b = self._normalize(b)
 
@@ -80,50 +96,103 @@ class NameIntelligenceService:
                 normalized_b=norm_b,
                 similarity_score=0.0,
                 match_level="UNKNOWN",
-                phonetic_key_a=self._phonetic_key(norm_a) if norm_a else None,
-                phonetic_key_b=self._phonetic_key(norm_b) if norm_b else None,
+                phonetic_key_a=(
+                    self._phonetic_key(norm_a)
+                    if norm_a
+                    else None
+                ),
+                phonetic_key_b=(
+                    self._phonetic_key(norm_b)
+                    if norm_b
+                    else None
+                ),
                 nickname_match=False,
-                findings=["One or both names are missing."],
+                findings=[
+                    "One or both names are missing."
+                ],
                 insight="Name comparison unavailable.",
             )
 
         findings: List[str] = []
-        nickname_match = self._is_nickname_match(norm_a, norm_b)
+
+        nickname_match = self._is_nickname_match(
+            norm_a,
+            norm_b,
+        )
+
         phonetic_a = self._phonetic_key(norm_a)
         phonetic_b = self._phonetic_key(norm_b)
 
         if norm_a == norm_b:
-            findings.append("Names match exactly after normalization.")
+            findings.append(
+                "Names match exactly after normalization."
+            )
+
             score = 1.0
             match_level: NameMatchLevel = "EXACT"
             insight = "Names match exactly."
+
         else:
-            seq_score = SequenceMatcher(None, norm_a, norm_b).ratio()
+            seq_score = SequenceMatcher(
+                None,
+                norm_a,
+                norm_b,
+            ).ratio()
+
             score = seq_score
 
             if nickname_match:
                 score = max(score, 0.92)
-                findings.append("Known nickname or common name variant detected.")
+                findings.append(
+                    "Known nickname or common name variant detected."
+                )
 
-            if phonetic_a and phonetic_b and phonetic_a == phonetic_b:
+            if (
+                phonetic_a
+                and phonetic_b
+                and phonetic_a == phonetic_b
+            ):
                 score = max(score, 0.88)
-                findings.append("Names are phonetically similar.")
+                findings.append(
+                    "Names are phonetically similar."
+                )
 
-            if self._one_char_off(norm_a, norm_b):
+            if self._one_char_off(
+                norm_a,
+                norm_b,
+            ):
                 score = max(score, 0.90)
-                findings.append("Names differ by a minor spelling variation.")
+                findings.append(
+                    "Names differ by a minor spelling variation."
+                )
 
-            score = round(min(score, 1.0), 4)
+            score = round(
+                min(
+                    max(score, 0.0),
+                    1.0,
+                ),
+                4,
+            )
 
             if score >= 0.97:
                 match_level = "EXACT"
-                insight = "Names are effectively identical after normalization."
+                insight = (
+                    "Names are effectively identical "
+                    "after normalization."
+                )
+
             elif score >= 0.82:
                 match_level = "SIMILAR"
-                insight = "Names appear to be a likely spelling or nickname variation."
+                insight = (
+                    "Names appear to be a likely spelling "
+                    "or nickname variation."
+                )
+
             else:
                 match_level = "DIFFERENT"
-                insight = "Names do not strongly support a match."
+                insight = (
+                    "Names do not strongly support a match."
+                )
 
         return NameIntelligenceResult(
             raw_a=a,
@@ -139,29 +208,73 @@ class NameIntelligenceService:
             insight=insight,
         )
 
-    def _normalize(self, value: Optional[str]) -> Optional[str]:
+    @staticmethod
+    def _normalize(
+        value: Optional[str],
+    ) -> Optional[str]:
         if value is None:
             return None
-        v = value.strip().lower()
-        v = re.sub(r"[^a-z\s\-']", "", v)
-        v = re.sub(r"\s+", " ", v).strip()
-        return v or None
 
-    def _is_nickname_match(self, a: str, b: str) -> bool:
-        return b in COMMON_NICKNAMES.get(a, []) or a in COMMON_NICKNAMES.get(b, [])
+        normalized = value.strip().lower()
 
-    def _one_char_off(self, a: str, b: str) -> bool:
+        if not normalized:
+            return None
+
+        normalized = re.sub(
+            r"[^a-z\s\-']",
+            "",
+            normalized,
+        )
+        normalized = re.sub(
+            r"\s+",
+            " ",
+            normalized,
+        ).strip()
+
+        return normalized or None
+
+    @staticmethod
+    def _is_nickname_match(
+        a: str,
+        b: str,
+    ) -> bool:
+        return (
+            b in COMMON_NICKNAMES.get(a, [])
+            or a in COMMON_NICKNAMES.get(b, [])
+        )
+
+    @staticmethod
+    def _one_char_off(
+        a: str,
+        b: str,
+    ) -> bool:
         if abs(len(a) - len(b)) > 1:
             return False
-        return SequenceMatcher(None, a, b).ratio() >= 0.85
 
-    def _phonetic_key(self, value: Optional[str]) -> Optional[str]:
+        return (
+            SequenceMatcher(
+                None,
+                a,
+                b,
+            ).ratio()
+            >= 0.85
+        )
+
+    @staticmethod
+    def _phonetic_key(
+        value: Optional[str],
+    ) -> Optional[str]:
         if not value:
             return None
 
-        v = value.lower()
-        v = re.sub(r"[^a-z]", "", v)
-        if not v:
+        normalized = value.lower()
+        normalized = re.sub(
+            r"[^a-z]",
+            "",
+            normalized,
+        )
+
+        if not normalized:
             return None
 
         replacements = [
@@ -180,13 +293,25 @@ class NameIntelligenceService:
             ("v", "f"),
         ]
 
-        for src, tgt in replacements:
-            v = v.replace(src, tgt)
+        for source, target in replacements:
+            normalized = normalized.replace(
+                source,
+                target,
+            )
 
-        if len(v) > 1:
-            first = v[0]
-            tail = re.sub(r"[aeiouy]", "", v[1:])
-            v = first + tail
+        if len(normalized) > 1:
+            first = normalized[0]
+            tail = re.sub(
+                r"[aeiouy]",
+                "",
+                normalized[1:],
+            )
+            normalized = first + tail
 
-        v = re.sub(r"(.)\1+", r"\1", v)
-        return v[:6]
+        normalized = re.sub(
+            r"(.)\1+",
+            r"\1",
+            normalized,
+        )
+
+        return normalized[:6]

@@ -1,8 +1,27 @@
+from __future__ import annotations
+
 from datetime import date, datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
+
+
+AuthenticationType = Literal[
+    "PAT",
+    "API_KEY",
+    "BASIC_AUTH",
+    "GOOGLE_SERVICE_ACCOUNT",
+    "USERNAME_PASSWORD",
+    "SERVICE_ACCOUNT",
+    "OAUTH_CLIENT",
+    "OAUTH_CLIENT_CREDENTIALS",
+    "OAUTH2_CLIENT_CREDENTIALS",
+    "KEY_PAIR",
+    "KEY_PAIR_JWT",
+    "ACCESS_TOKEN",
+    "GOOGLE_OAUTH",
+]
 
 # -------------------------------------------------------------------
 # Flexible primitive aliases
@@ -20,22 +39,53 @@ AddressValidationStatus = str
 PostalMatchLevel = str
 OverrideReasonCode = str
 
+
+class TenantScopedResponseModel(BaseModel):
+    model_config = ConfigDict(
+        extra="ignore",
+        str_strip_whitespace=True,
+    )
+
+    organization_id: str
+
+    @field_validator("organization_id")
+    @classmethod
+    def validate_organization_id(
+        cls,
+        value: str,
+    ) -> str:
+        normalized = value.strip()
+
+        if not normalized:
+            raise ValueError(
+                "organization_id is required."
+            )
+
+        if not normalized.startswith("org_"):
+            raise ValueError(
+                "organization_id must use the org_ identifier standard."
+            )
+
+        return normalized
+
+
 #-----------------------------------
 # Search result models
 # These models represent the structure of search results returned by the API.
 # They include fields for record identifiers, domain, display name, source system, and golden record flag.
 #-------------------------------------
 
-class RecordSearchResult(BaseModel):
+class RecordSearchResult(TenantScopedResponseModel):
     record_id: str
     mdm_id: str | None = None
     domain: str
     display_name: str | None = None
     source_system: str | None = None
     golden_record_flag: bool | None = None
+    phone_number: str | None = None
     record: dict | None = None  # Optional full record data for advanced use cases
 
-class RecordSearchResponse(BaseModel):
+class RecordSearchResponse(TenantScopedResponseModel):
     results: list[RecordSearchResult]
 
 # -------------------------------------------------------------------
@@ -44,6 +94,270 @@ class RecordSearchResponse(BaseModel):
 
 class FlexibleBaseModel(BaseModel):
     model_config = ConfigDict(extra="allow")
+
+
+class TenantScopedResponseModel(BaseModel):
+    """
+    Base model for API responses that expose organization-scoped data.
+
+    Tenant filtering is enforced in route/service/repository layers.
+    This model validates that tenant context survives through the response.
+    """
+
+    model_config = ConfigDict(
+        extra="ignore",
+        str_strip_whitespace=True,
+    )
+
+    organization_id: str
+
+    @field_validator("organization_id")
+    @classmethod
+    def _validate_organization_id(
+        cls,
+        value: str,
+    ) -> str:
+        normalized = value.strip()
+
+        if not normalized:
+            raise ValueError("organization_id is required.")
+
+        if not normalized.startswith("org_"):
+            raise ValueError(
+                "organization_id must use the org_ identifier standard."
+            )
+
+        return normalized
+
+class OnboardingStatusResponse(BaseModel):
+    user_exists: bool
+    organization_exists: bool
+    subscription_exists: bool
+    onboarding_complete: bool
+    current_step: str
+
+    organization_id: str | None = None
+    organization_name: str | None = None
+    user_role: str | None = None
+
+    @field_validator("organization_id")
+    @classmethod
+    def _validate_optional_organization_id(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        if value is None:
+            return None
+
+        normalized = value.strip()
+
+        if not normalized:
+            return None
+
+        if not normalized.startswith("org_"):
+            raise ValueError(
+                "organization_id must use the org_ identifier standard."
+            )
+
+        return normalized
+
+    subscription_plan: str | None = None
+    subscription_status: str | None = None
+    trial_end_date: str | None = None
+
+class GoogleOAuthStartRequest(BaseModel):
+    connection_id: str
+    project_id: str
+    return_url: str
+
+
+class OrganizationOnboardingRequest(BaseModel):
+    organization_name: str = Field(min_length=2, max_length=200)
+    company_domain: str | None = None
+    industry: str | None = None
+    country: str | None = None
+    timezone: str = "America/New_York"
+    company_size: str | None = None
+
+
+class OrganizationOnboardingResponse(TenantScopedResponseModel):
+    organization_name: str
+
+    user_id: str
+    email: EmailStr
+    role: str
+
+    subscription_id: str
+    subscription_plan: str
+    subscription_status: str
+
+    trial_start_date: str
+    trial_end_date: str | None = None
+
+    max_users: int | None = None
+    max_connections: int | None = None
+    max_monthly_explanations: int | None = None
+
+    onboarding_complete: bool
+    current_step: str
+
+
+class EnterpriseConnectionListResponse(TenantScopedResponseModel):
+    items: list[EnterpriseConnectionResponse]
+    page: int = Field(ge=1)
+    page_size: int = Field(ge=1)
+    total: int = Field(ge=0)
+    total_pages: int = Field(ge=0)
+
+class ConnectionDetailsInput(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    account: str | None = None
+    organization: str | None = None
+    region: str | None = None
+
+    database: str | None = None
+    schema_name: str | None = Field(
+        default=None,
+        alias="schema",
+        serialization_alias="schema",
+    )
+    warehouse: str | None = None
+    role: str | None = None
+
+    catalog: str | None = None
+    host: str | None = None
+    port: int | None = Field(default=None, ge=1, le=65535)
+
+
+class NetworkConfigInput(BaseModel):
+    timeout_seconds: int = Field(default=60, ge=1, le=300)
+    retry_attempts: int = Field(default=3, ge=0, le=10)
+    verify_ssl: bool = True
+
+
+class HealthCheckConfigInput(BaseModel):
+    enabled: bool = True
+    query: str | None = None
+    endpoint: str | None = None
+    method: Literal["GET", "POST", "HEAD"] = "GET"
+
+
+    
+class ConnectionCredentialInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    authentication_type: AuthenticationType
+
+    token: str | None = Field(default=None, min_length=1)
+    access_token: str | None = Field(default=None, min_length=1)
+
+    username: str | None = None
+    password: str | None = None
+    api_key: str | None = None
+
+    client_id: str | None = None
+    client_secret: str | None = None
+    token_url: str | None = None
+    scope: str | None = None
+    scopes: list[str] = Field(default_factory=list)
+
+    service_account_json: dict[str, Any] | None = None
+
+    private_key: str | None = None
+    private_key_passphrase: str | None = None
+
+    additional_properties: dict[str, Any] = Field(
+        default_factory=dict
+    )
+
+
+class EnterpriseConnectionCreate(BaseModel):
+    # organization_id is intentionally omitted; derive it from AuthUser.
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+    )
+
+    connection_name: str = Field(min_length=1, max_length=200)
+    vendor: str = Field(min_length=1, max_length=100)
+    product: str = Field(
+        default="AI Data Steward Copilot",
+        max_length=200,
+    )
+
+    connection_type: str = Field(min_length=1, max_length=100)
+    environment: str = Field(min_length=1, max_length=50)
+
+    description: str | None = Field(
+        default=None,
+        max_length=2000,
+    )
+
+    api_endpoint: str | None = None
+    workspace_name: str | None = None
+
+    connection_capabilities: list[str] = Field(
+        default_factory=list
+    )
+
+    credentials: ConnectionCredentialInput
+
+    connection_details: ConnectionDetailsInput = Field(
+        default_factory=ConnectionDetailsInput
+    )
+
+    network_config: NetworkConfigInput = Field(
+        default_factory=NetworkConfigInput
+    )
+
+    health_check_config: HealthCheckConfigInput = Field(
+        default_factory=HealthCheckConfigInput
+    )
+
+    tags: list[str] = Field(default_factory=list)
+
+
+class EnterpriseConnectionUpdate(BaseModel):
+    connection_name: str | None = None
+    environment: str | None = None
+    api_endpoint: str | None = None
+    workspace_name: str | None = None
+    connection_capabilities: list[str] | None = None
+    is_active: bool | None = None
+
+    credentials: ConnectionCredentialInput | None = None
+
+
+class EnterpriseConnectionResponse(TenantScopedResponseModel):
+    connection_id: str
+    connection_name: str
+    vendor: str
+    connection_type: str
+    environment: str
+
+    api_endpoint: str | None = None
+    workspace_name: str | None = None
+    authentication_type: AuthenticationType
+    connection_capabilities: list[str] = Field(
+        default_factory=list
+    )
+
+    health_status: str
+    is_active: bool
+    created_by: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class ConnectionTestResponse(TenantScopedResponseModel):
+    connection_id: str
+    vendor: str
+    health_status: str
+    success: bool
+    message: str
+    tested_at: str
+    response_time_ms: int | None = None
 
 
 class MemberRecord(FlexibleBaseModel):
@@ -69,6 +383,8 @@ class MemberRecord(FlexibleBaseModel):
     provider_last_name: Optional[str] = None
     provider_email: Optional[str] = None
     provider_address: Optional[str] = None
+    human_id: Optional[str] = None
+    phone_number: str | None = None
 
     # Supplier fields
     supplier_id: Optional[str] = None
@@ -81,7 +397,7 @@ class MemberRecord(FlexibleBaseModel):
     product_id: Optional[str] = None
     product_name: Optional[str] = None
     product_variant: Optional[str] = None
-    effective_lot_date: Optional[str] = None
+    item_category: Optional[str] = None
     gtin: Optional[str] = None
     sku: Optional[str] = None
     upc: Optional[str] = None
@@ -188,7 +504,7 @@ class TimelineEvent(BaseModel):
     event_type: Optional[str] = None
     impact: Optional[str] = None
 
-class LearningTimelineItem(BaseModel):
+class LearningTimelineItem(TenantScopedResponseModel):
     explanation_id: str
     ai_decision: str
     recommended_action: str
@@ -269,6 +585,7 @@ class AddressIntelligenceResult(BaseModel):
 # -------------------------------------------------------------------
 
 class MatchExplainRequest(BaseModel):
+    # organization_id is intentionally omitted; derive it from AuthUser.
     # Keep current routes compatible
     record_a: MemberRecord = Field(..., description="First record")
     record_b: MemberRecord = Field(..., description="Second record")
@@ -301,11 +618,12 @@ class MatchExplainRequest(BaseModel):
     )
 
 
-class MatchExplainResponse(BaseModel):
+class MatchExplainResponse(TenantScopedResponseModel):
     explanation_id: str = Field(..., description="Unique ID for this explanation event")
     ai_decision: DecisionType = Field(..., description="AI decision")
     confidence: float = Field(..., ge=0, le=1, description="Model confidence from 0 to 1")
     risk_flag: RiskFlag = Field(..., description="Risk flag")
+    risk_drivers: list[str] = Field(default_factory=list)
     explanation_summary: str = Field(..., description="Short steward-friendly summary")
     rule_analysis: List[RuleAnalysis] = Field(..., description="Per-rule reasoning")
     recommended_action: DecisionType = Field(
@@ -475,7 +793,7 @@ class MatchExplainResponse(BaseModel):
 # Policy config models
 # -------------------------------------------------------------------
 
-class PolicyConfigModel(BaseModel):
+class PolicyConfigModel(TenantScopedResponseModel):
     policy_id: Optional[str] = Field(
         None,
         description="Unique policy configuration ID",
@@ -507,7 +825,7 @@ class PolicyConfigModel(BaseModel):
     )
 
 
-class PolicyThresholdModel(BaseModel):
+class PolicyThresholdModel(TenantScopedResponseModel):
     threshold_id: Optional[str] = Field(
         None,
         description="Unique threshold configuration ID",
@@ -583,7 +901,7 @@ class PolicyThresholdModel(BaseModel):
     )
 
 
-class PolicyRiskRuleModel(BaseModel):
+class PolicyRiskRuleModel(TenantScopedResponseModel):
     risk_rule_id: Optional[str] = Field(None, description="Unique risk rule ID")
     policy_id: Optional[str] = Field(None, description="Parent policy ID")
     domain: DomainType = Field(..., description="Business domain")
@@ -627,7 +945,7 @@ class PolicyRiskRuleModel(BaseModel):
     notes: Optional[str] = Field(None, description="Additional rule notes")
 
 
-class PolicyConfigResponse(BaseModel):
+class PolicyConfigResponse(TenantScopedResponseModel):
     domain: DomainType = Field(..., description="Business domain")
     policy_version: str = Field(..., description="Resolved policy version")
     config: Optional[PolicyConfigModel] = Field(
@@ -649,6 +967,7 @@ class PolicyConfigResponse(BaseModel):
 
 
 class PolicyDraftRequest(BaseModel):
+    # organization_id is intentionally omitted; derive it from AuthUser.
     domain: DomainType = Field(..., description="Business domain")
     policy_version: str = Field(..., description="Draft policy version identifier")
 
@@ -740,7 +1059,7 @@ class PolicyDraftRequest(BaseModel):
     updated_by: Optional[str] = Field(None, description="User saving the draft")
 
 
-class PolicyDraftResponse(BaseModel):
+class PolicyDraftResponse(TenantScopedResponseModel):
     status: str = Field(..., description="Draft save status")
     domain: DomainType = Field(..., description="Business domain")
     policy_version: str = Field(..., description="Draft policy version")
@@ -754,12 +1073,13 @@ class PolicyDraftResponse(BaseModel):
 
 
 class PolicyPublishRequest(BaseModel):
+    # organization_id is intentionally omitted; derive it from AuthUser.
     domain: DomainType = Field(..., description="Business domain")
     policy_version: str = Field(..., description="Policy version to publish")
     published_by: Optional[str] = Field(None, description="User publishing the policy")
 
 
-class PolicyPublishResponse(BaseModel):
+class PolicyPublishResponse(TenantScopedResponseModel):
     status: str = Field(..., description="Publish status")
     domain: DomainType = Field(..., description="Business domain")
     policy_version: str = Field(..., description="Published policy version")
@@ -801,7 +1121,7 @@ class GovernanceKPI(BaseModel):
     recent_policy_changes_30d: int
 
 
-class GovernanceDatasetStatus(BaseModel):
+class GovernanceDatasetStatus(TenantScopedResponseModel):
     dataset_id: str
     dataset_name: str
     domain: Optional[str] = None
@@ -840,6 +1160,7 @@ class GovernanceDatasetStatus(BaseModel):
     certification_effective_at: Optional[datetime] = None
     certification_expires_at: Optional[datetime] = None
     recertification_due_at: Optional[datetime] = None
+    ai_recommendation: Optional[Dict[str, Any]] = None
 
 
 class GovernanceBlocker(BaseModel):
@@ -847,7 +1168,7 @@ class GovernanceBlocker(BaseModel):
     blocker_count: int
 
 
-class GovernancePolicyActivity(BaseModel):
+class GovernancePolicyActivity(TenantScopedResponseModel):
     change_id: Optional[str] = None
     domain: Optional[str] = None
     policy_version: Optional[str] = None
@@ -859,7 +1180,7 @@ class GovernancePolicyActivity(BaseModel):
     publish_status: Optional[str] = None
 
 
-class GovernanceOverviewResponse(BaseModel):
+class GovernanceOverviewResponse(TenantScopedResponseModel):
     kpis: GovernanceKPI
     dataset_statuses: List[GovernanceDatasetStatus]
     top_blockers: List[GovernanceBlocker]
@@ -871,6 +1192,7 @@ class GovernanceOverviewResponse(BaseModel):
 # -------------------------------------------------------------------
 
 class MatchFeedbackRequest(BaseModel):
+    # organization_id is intentionally omitted; derive it from AuthUser.
     explanation_id: str = Field(
         ...,
         description="Explanation ID returned by /match/explain",
@@ -898,7 +1220,7 @@ class MatchFeedbackRequest(BaseModel):
     )
 
 
-class MatchFeedbackResponse(BaseModel):
+class MatchFeedbackResponse(TenantScopedResponseModel):
     decision_id: str = Field(..., description="Unique ID for steward decision event")
     explanation_id: str = Field(..., description="Explanation being responded to")
     status: str = Field(..., description="Decision processing status")
@@ -937,7 +1259,7 @@ class ScoreBucketBreakdown(BaseModel):
     fn_rate: Optional[float] = None
 
 
-class MetricsOverviewResponse(BaseModel):
+class MetricsOverviewResponse(TenantScopedResponseModel):
     days: int = Field(..., description="Lookback window in days")
     total_explanations: int
 
@@ -976,7 +1298,7 @@ class MetricsOverviewResponse(BaseModel):
     learning_timeline: List[LearningTimelineItem] = Field(default_factory=list)
 
 
-class DqDashboardRow(BaseModel):
+class DqDashboardRow(TenantScopedResponseModel):
     metric_date: date
     domain: str
 
@@ -1069,9 +1391,100 @@ class DqDashboardRow(BaseModel):
     summary_created_at: Optional[str] = None
 
 
-class DqDashboardResponse(BaseModel):
+class DqDashboardResponse(TenantScopedResponseModel):
     days: int
     domain: Optional[str] = None
     rows: List[DqDashboardRow]
     latest: Optional[DqDashboardRow] = None
     generated_at: Optional[str] = None
+
+
+class DqSuggestedRule(BaseModel):
+    rule_id: str = Field(
+        ...,
+        description="Stable identifier for the suggested DQ rule",
+    )
+    rule_name: str
+    dimension: Literal[
+        "COMPLETENESS",
+        "VALIDITY",
+        "UNIQUENESS",
+        "CONSISTENCY",
+        "STANDARDIZATION",
+        "TIMELINESS",
+        "INTEGRITY",
+        "ACCURACY",
+    ]
+    severity: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+
+    rule_type: str = Field(
+        ...,
+        description=(
+            "Rule implementation style, such as SQL, REGEX, "
+            "THRESHOLD, UNIQUENESS, or CROSS_FIELD"
+        ),
+    )
+
+    description: str
+    rationale: str
+    business_risk: str
+    rule_logic: str
+
+    sql_example: Optional[str] = None
+    implementation_target: str = "GENERIC"
+
+    expected_impact: str
+    estimated_automation_gain_points: int = Field(
+        default=0,
+        ge=0,
+        le=25,
+    )
+
+    supporting_evidence: List[str] = Field(default_factory=list)
+
+    confidence: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+    )
+
+
+class DqRuleSuggestions(BaseModel):
+    headline: str
+    summary: str
+
+    priority: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+
+    rule_strategy: Literal[
+        "PREVENTIVE",
+        "REMEDIATION",
+        "MIXED",
+    ]
+
+    suggested_rules: List[DqSuggestedRule] = Field(default_factory=list)
+    recommended_sequence: List[str] = Field(default_factory=list)
+    supporting_evidence: List[str] = Field(default_factory=list)
+
+    confidence: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+    )
+
+
+class DqRuleSuggestionsResponse(TenantScopedResponseModel):
+    days: int
+    domain: Optional[str] = None
+
+    dataset_id: Optional[str] = None
+    dataset_name: Optional[str] = None
+    metric_date: Optional[str] = None
+
+    source: str = "AI_DATA_QUALITY_RULE_ENGINEERING_ASSISTANT"
+    model_provider: Optional[str] = None
+    used_llm: bool = True
+
+    ai_rule_suggestions: DqRuleSuggestions
+
+    generated_at: datetime
+    
