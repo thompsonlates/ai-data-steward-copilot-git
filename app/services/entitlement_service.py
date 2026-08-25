@@ -82,10 +82,12 @@ class EntitlementService:
                 or ""
             ).strip().upper()
 
+            # Existing active/accepted membership is idempotent.
+            # A pending invitation does NOT yet occupy a seat,
+            # so activation must still pass the seat-limit check.
             if (
                 is_active
-                or invitation_status
-                in {"PENDING", "INVITED"}
+                and invitation_status == "ACCEPTED"
             ):
                 return
 
@@ -254,3 +256,19 @@ class EntitlementService:
                 "organization's subscription."
             ),
         )
+    def list_enabled_domains(
+        self,
+        *,
+        organization_id: str,
+    ) -> list[str]:
+        rows = self.repository.list_enabled_domains(
+            organization_id=organization_id,
+        )
+
+        return [
+            str(row.get("domain") or "")
+            .strip()
+            .upper()
+            for row in rows
+            if str(row.get("domain") or "").strip()
+        ]

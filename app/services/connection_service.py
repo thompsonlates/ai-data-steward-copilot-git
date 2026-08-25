@@ -6,6 +6,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
+import re
 
 import requests
 import snowflake.connector
@@ -20,6 +21,8 @@ from app.api.schemas import (
 )
 from app.repositories.connection_repository import ConnectionRepository
 from app.services.secret_manager_service import SecretManagerService
+
+from google.auth.transport.requests import Request as GoogleAuthRequest
 
 
 logger = logging.getLogger(__name__)
@@ -60,23 +63,35 @@ class ConnectionService:
     def _require_connection_id(
         connection_id: str,
     ) -> str:
-        normalized = str(
+        value = str(
             connection_id or ""
         ).strip()
 
-        if not normalized:
+        if not value:
             raise ValueError(
                 "connection_id is required."
             )
 
-        if not normalized.startswith("conn_"):
+        is_conn_id = value.startswith("conn_")
+
+        is_uuid = bool(
+            re.fullmatch(
+                r"[0-9a-fA-F]{8}-"
+                r"[0-9a-fA-F]{4}-"
+                r"[0-9a-fA-F]{4}-"
+                r"[0-9a-fA-F]{4}-"
+                r"[0-9a-fA-F]{12}",
+                value,
+            )
+        )
+
+        if not is_conn_id and not is_uuid:
             raise ValueError(
-                "connection_id must use the "
-                "conn_ identifier standard."
+                "connection_id must use either the "
+                "conn_ identifier standard or a valid UUID."
             )
 
-        return normalized
-
+        return value
     @staticmethod
     def _require_actor(
         actor: str,
@@ -465,6 +480,7 @@ class ConnectionService:
                 )
 
             credentials_object = user_credentials.Credentials(
+                
                 token=access_token,
                 refresh_token=credentials.get(
                     "refresh_token"
@@ -480,7 +496,24 @@ class ConnectionService:
                 scopes=[
                     "https://www.googleapis.com/auth/bigquery",
                 ],
+
             )
+
+            if credentials_object.refresh_token:
+                try:
+                    credentials_object.refresh(
+                        GoogleAuthRequest()
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Google OAuth refresh failed: %s",
+                        type(exc).__name__,
+                    )
+                    return (
+                        False,
+                        "Google authorization expired. "
+                        "Please reconnect your Google account.",
+                    )
 
         else:
             return (
@@ -723,15 +756,15 @@ class ConnectionService:
         )
 
         return ConnectionTestResponse(
-            connection_id=effective_connection_id,
-            vendor=vendor,
-            health_status=health_status,
-            success=success,
-            message=message,
-            tested_at=tested_at.isoformat(),
-            response_time_ms=response_time_ms,
-        )
-
+                organization_id=effective_organization_id,
+                connection_id=effective_connection_id,
+                vendor=vendor,
+                health_status=health_status,
+                success=success,
+                message=message,
+                tested_at=tested_at.isoformat(),
+                response_time_ms=response_time_ms,
+)
     def create_connection(
         self,
         request: EnterpriseConnectionCreate,

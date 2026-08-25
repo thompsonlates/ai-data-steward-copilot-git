@@ -96,14 +96,15 @@ class EntityResolutionEngine:
 
     DOMAIN_SIGNAL_WEIGHTS = {
         "CUSTOMER": {
-           "member_id_match": 0.25,
+            "member_id_match": 0.15,
+            "phone_match": 0.15,
             "name_similarity": 0.10,
-            "dob_match": 0.25,
-            "email_match": 0.20,
+            "dob_match": 0.15,
+            "email_match": 0.25,
             "address_similarity": 0.10,
             "source_trust": 0.05,
             "steward_learning": 0.05,
-        },
+},
         "SUPPLIER": {
             "supplier_id_match": 0.45,
             "tax_id_match": 0.25,
@@ -137,13 +138,30 @@ class EntityResolutionEngine:
        "PATIENT": {
             "patient_id_match": 0.20,
             "human_id_match": 0.10,
+            "phone_match": 0.15,
             "dob_match": 0.20,
             "name_similarity": 0.20,
             "address_similarity": 0.15,
             "email_match": 0.05,
             "source_trust": 0.05,
             "steward_learning": 0.05,
-},
+        },
+
+        "BANKING": {
+            "account_id_match": 0.20,
+            "customer_id_match": 0.15,
+            "sap_business_partner_id_match": 0.15,
+            "routing_number_match": 0.10,
+            "account_number_last4_match": 0.05,
+            "institution_name_similarity": 0.08,
+            "account_type_match": 0.05,
+            "currency_match": 0.03,
+            "email_match": 0.07,
+            "phone_match": 0.05,
+            "source_trust": 0.04,
+            "steward_learning": 0.03,
+        },
+
     }
 
     def _gtin_detail(
@@ -216,6 +234,66 @@ class EntityResolutionEngine:
     def _patient_id_detail(self, a, b):
         return f"Compared Patient IDs '{a}' and '{b}'."
 
+    def _account_id_detail(self, a, b) -> str:
+        if not a or not b:
+            return "Banking account ID evidence is unavailable on one or both records."
+
+        if self._normalize_text(a) == self._normalize_text(b):
+            return "Banking account IDs match exactly."
+
+        return "Banking account IDs differ."
+
+
+    def _customer_id_detail(self, a, b) -> str:
+        if not a or not b:
+            return "Banking customer ID evidence is unavailable on one or both records."
+
+        if self._normalize_text(a) == self._normalize_text(b):
+            return "Banking customer IDs match exactly."
+
+        return "Banking customer IDs differ."
+
+
+    def _sap_business_partner_id_detail(self, a, b) -> str:
+        if not a or not b:
+            return (
+                "SAP Business Partner ID evidence is unavailable "
+                "on one or both records."
+            )
+
+        if self._normalize_text(a) == self._normalize_text(b):
+            return "SAP Business Partner IDs match exactly."
+
+        return "SAP Business Partner IDs differ."
+
+
+    def _routing_number_detail(self, a, b) -> str:
+        if not a or not b:
+            return "Routing number evidence is unavailable on one or both records."
+
+        if self._normalize_text(a) == self._normalize_text(b):
+            return "Routing numbers match exactly."
+
+        return "Routing numbers differ."
+
+
+    def _account_last4_detail(self, a, b) -> str:
+        if not a or not b:
+            return (
+                "Account-number last-four evidence is unavailable "
+                "on one or both records."
+            )
+
+        if self._normalize_text(a) == self._normalize_text(b):
+            return (
+                "Account-number last four digits match. "
+                "This is supporting evidence only."
+            )
+
+        return "Account-number last four digits differ."
+
+    
+
     def _human_id_detail(self, a, b):
 
         if not a and not b:
@@ -278,15 +356,15 @@ class EntityResolutionEngine:
         normalized_b = self._normalize_phone(phone_b)
 
         if not normalized_a and not normalized_b:
-            return "Provider phone evidence was unavailable for both records."
+            return "Phone evidence was unavailable for both records."
 
         if not normalized_a or not normalized_b:
-            return "Provider phone evidence was unavailable for one record."
+            return "Phone evidence was unavailable for one record."
 
         if normalized_a == normalized_b:
-            return "Provider phone numbers match after normalization."
+            return "Phone numbers match after normalization."
 
-        return "Provider phone numbers differ after normalization."
+        return "Phone numbers differ after normalization."
 
     
     def _is_valid_dob(self, value):
@@ -499,9 +577,10 @@ class EntityResolutionEngine:
         fields_by_domain = {
             "CUSTOMER": ["member_id"],
             "PATIENT":  ["patient_id", "member_id"],
-            "PROVIDER": ["human_id", "provider_id", "npi", "member_id", "phone_number  "],
+            "PROVIDER": ["human_id", "provider_id", "npi", "member_id", "phone_number"],
             "SUPPLIER": ["supplier_id", "vendor_id", "tax_id", "member_id"],
             "PRODUCT":  ["product_id", "gtin", "sku", "item_category", "member_id"],
+            "BANKING": ["account_id","sap_business_partner_id","banking_customer_id",],
         }
 
         for field in fields_by_domain.get(domain, ["member_id"]):
@@ -796,19 +875,28 @@ class EntityResolutionEngine:
         
         if normalized_domain == "CUSTOMER":
 
-            full_name_a = (
-            f"{getattr(record_a, 'first_name', '') or ''} "
-            f"{getattr(record_a, 'last_name', '') or ''}"
-            .strip()
-            .lower()
+            customer_full_name_a = (
+            getattr(record_a, "full_name", None)
+            or " ".join(
+                [
+                    getattr(record_a, "first_name", "") or "",
+                    getattr(record_a, "last_name", "") or "",
+                ]
+            ).strip()
         )
 
-            full_name_b = (
-            f"{getattr(record_b, 'first_name', '') or ''} "
-            f"{getattr(record_b, 'last_name', '') or ''}"
-            .strip()
-            .lower()
-        )
+            customer_full_name_b = (
+            getattr(record_b, "full_name", None)
+            or " ".join(
+                [
+                    getattr(record_b, "first_name", "") or "",
+                    getattr(record_b, "last_name", "") or "",
+                ]
+            ).strip()
+)
+
+            full_name_a = customer_full_name_a.strip().lower()
+            full_name_b = customer_full_name_b.strip().lower()
 
             name_similarity_score = SequenceMatcher(
             None,
@@ -816,13 +904,79 @@ class EntityResolutionEngine:
             full_name_b,
         )   .ratio()
 
+            customer_phone_a = getattr(
+            record_a,
+            "phone_number",
+            None,
+        )
+
+            customer_phone_b = getattr(
+                record_b,
+                "phone_number",
+                None,
+            )
+
+            phone_score = SimilarityEngine.phone_similarity(
+                customer_phone_a,
+                customer_phone_b,
+            )
+
+            phone_weight = (
+                domain_weights.get(
+                    "phone_match",
+                    0.0,
+                )
+                if phone_score is not None
+                else 0.0
+            )
+
+            phone_score_value = (
+                phone_score
+                if phone_score is not None
+                else 0.0
+            )
+
             match_score = (
-            name_similarity_score * 0.25 +
-            email_score * 0.15 +
-            address_score * 0.20 +
-            dob_score * 0.25 +
-            member_id_score * 0.10 +
-            source_score * 0.05
+            member_id_score
+            * domain_weights.get(
+                "member_id_match",
+                0.0,
+            )
+            + phone_score_value
+            * domain_weights.get(
+                "phone_match",
+                0.0,
+            )
+            + name_similarity_score
+            * domain_weights.get(
+                "name_similarity",
+                0.0,
+            )
+            + dob_score
+            * domain_weights.get(
+                "dob_match",
+                0.0,
+            )
+            + email_score
+            * domain_weights.get(
+                "email_match",
+                0.0,
+            )
+            + address_score
+            * domain_weights.get(
+                "address_similarity",
+                0.0,
+            )
+            + source_score
+            * domain_weights.get(
+                "source_trust",
+                0.0,
+            )
+            + learning_score
+            * domain_weights.get(
+                "steward_learning",
+                0.0,
+            )
         )
             if (
             dob_score == 1.0
@@ -861,6 +1015,23 @@ class EntityResolutionEngine:
                     ),
                 )
         )
+
+            signals.append(
+                self._build_signal(
+                    "phone_match",
+                    (
+                        phone_score
+                        if phone_score is not None
+                        else 0.5
+                    ),
+                    phone_weight,
+                    self._phone_detail(
+                        customer_phone_a,
+                        customer_phone_b,
+                    ),
+                    signal_type="deterministic",
+                )
+            )
 
             signals.append(
                 self._build_signal(
@@ -1491,17 +1662,17 @@ class EntityResolutionEngine:
             signals.append(
                     self._build_signal(
                             "phone_match",
-                                (
-                                phone_score
-                                if phone_score is not None
-                                else 0.5
+                            (
+                            phone_score
+                            if phone_score is not None
+                            else 0.5
+                            ),
+                            phone_weight,
+                            self._phone_detail(
+                                provider_phone_a,
+                                provider_phone_b,
                                 ),
-                                phone_weight,
-                                self._phone_detail(
-                                    provider_phone_a,
-                                    provider_phone_b,
-                                ),
-                                signal_type="probabilistic",
+                            signal_type="probabilistic",
                         )
                     )
                 
@@ -1666,6 +1837,22 @@ class EntityResolutionEngine:
                 getattr(record_b, "patient_address", None)
                 or getattr(record_b, "address", None)
             )
+            patient_phone_a = getattr(
+            record_a,
+            "phone_number",
+            None,
+            )
+
+            patient_phone_b = getattr(
+                record_b,
+                "phone_number",
+                None,
+            )
+
+            phone_score = SimilarityEngine.phone_similarity(
+                patient_phone_a,
+                patient_phone_b,
+            )
 
             name_score = self._name_similarity(
                 patient_first_name_a,
@@ -1782,11 +1969,7 @@ class EntityResolutionEngine:
                 and dob_score == 1.0
                 and name_score >= 0.85
             ):
-                 
-                phone_a = getattr(record_a, "phone", None)
-                phone_b = getattr(record_b, "phone", None)
-
-               
+                                
                 match_score = min(max(match_score, 0.86), 0.90)
 
             match_score = min(match_score, 0.92)
@@ -1825,8 +2008,8 @@ class EntityResolutionEngine:
                     signal_score,
                     signal_weight,
                     self._phone_detail(
-                        provider_phone_a,
-                        provider_phone_b,
+                        patient_phone_a,
+                        patient_phone_b,
                     ),
                     signal_type="deterministic",
                 )
@@ -1899,6 +2082,614 @@ class EntityResolutionEngine:
             )
 
             raw_entity_score = round(match_score * risk_multiplier, 4)
+        elif normalized_domain == "BANKING":
+
+            signals = []
+
+            account_id_a = getattr(
+                record_a,
+                "account_id",
+                None,
+            )
+            account_id_b = getattr(
+                record_b,
+                "account_id",
+                None,
+            )
+
+            banking_customer_id_a = getattr(
+                record_a,
+                "banking_customer_id",
+                None,
+            )
+            banking_customer_id_b = getattr(
+                record_b,
+                "banking_customer_id",
+                None,
+            )
+
+            sap_bp_id_a = getattr(
+                record_a,
+                "sap_business_partner_id",
+                None,
+            )
+            sap_bp_id_b = getattr(
+                record_b,
+                "sap_business_partner_id",
+                None,
+            )
+
+            routing_number_a = getattr(
+                record_a,
+                "routing_number",
+                None,
+            )
+            routing_number_b = getattr(
+                record_b,
+                "routing_number",
+                None,
+            )
+
+            account_last4_a = getattr(
+                record_a,
+                "account_number_last4",
+                None,
+            )
+            account_last4_b = getattr(
+                record_b,
+                "account_number_last4",
+                None,
+            )
+
+            institution_name_a = getattr(
+                record_a,
+                "institution_name",
+                None,
+            )
+            institution_name_b = getattr(
+                record_b,
+                "institution_name",
+                None,
+            )
+
+            account_type_a = getattr(
+                record_a,
+                "account_type",
+                None,
+            )
+            account_type_b = getattr(
+                record_b,
+                "account_type",
+                None,
+            )
+
+            currency_a = getattr(
+                record_a,
+                "currency",
+                None,
+            )
+            currency_b = getattr(
+                record_b,
+                "currency",
+                None,
+            )
+
+            banking_email_a = (
+                getattr(
+                    record_a,
+                    "email",
+                    None,
+                )
+                or ""
+            ).strip().lower()
+
+            banking_email_b = (
+                getattr(
+                    record_b,
+                    "email",
+                    None,
+                )
+                or ""
+            ).strip().lower()
+
+            banking_phone_a = getattr(
+                record_a,
+                "phone_number",
+                None,
+            )
+
+            banking_phone_b = getattr(
+                record_b,
+                "phone_number",
+                None,
+            )
+
+            # -------------------------------------------------
+            # Deterministic banking identifiers
+            # -------------------------------------------------
+
+            account_id_score = (
+                1.0
+                if self._normalize_text(
+                    account_id_a
+                )
+                and self._normalize_text(
+                    account_id_a
+                )
+                == self._normalize_text(
+                    account_id_b
+                )
+                else 0.0
+            )
+
+            customer_id_score = (
+                1.0
+                if self._normalize_text(
+                    banking_customer_id_a
+                )
+                and self._normalize_text(
+                    banking_customer_id_a
+                )
+                == self._normalize_text(
+                    banking_customer_id_b
+                )
+                else 0.0
+            )
+
+            sap_business_partner_id_score = (
+                1.0
+                if self._normalize_text(
+                    sap_bp_id_a
+                )
+                and self._normalize_text(
+                    sap_bp_id_a
+                )
+                == self._normalize_text(
+                    sap_bp_id_b
+                )
+                else 0.0
+            )
+
+            routing_number_score = (
+                1.0
+                if self._normalize_text(
+                    routing_number_a
+                )
+                and self._normalize_text(
+                    routing_number_a
+                )
+                == self._normalize_text(
+                    routing_number_b
+                )
+                else 0.0
+            )
+
+            account_number_last4_score = (
+                1.0
+                if self._normalize_text(
+                    account_last4_a
+                )
+                and self._normalize_text(
+                    account_last4_a
+                )
+                == self._normalize_text(
+                    account_last4_b
+                )
+                else 0.0
+            )
+
+            # -------------------------------------------------
+            # Probabilistic / contextual banking evidence
+            # -------------------------------------------------
+
+            institution_name_score = (
+                self._similarity(
+                    institution_name_a,
+                    institution_name_b,
+                )
+            )
+
+            account_type_score = (
+                1.0
+                if self._normalize_text(
+                    account_type_a
+                )
+                and self._normalize_text(
+                    account_type_a
+                )
+                == self._normalize_text(
+                    account_type_b
+                )
+                else 0.0
+            )
+
+            currency_score = (
+                1.0
+                if self._normalize_text(
+                    currency_a
+                )
+                and self._normalize_text(
+                    currency_a
+                )
+                == self._normalize_text(
+                    currency_b
+                )
+                else 0.0
+            )
+
+            phone_score = (
+                SimilarityEngine.phone_similarity(
+                    banking_phone_a,
+                    banking_phone_b,
+                )
+            )
+
+            phone_weight = (
+                domain_weights.get(
+                    "phone_match",
+                    0.0,
+                )
+                if phone_score is not None
+                else 0.0
+            )
+
+            phone_score_value = (
+                phone_score
+                if phone_score is not None
+                else 0.0
+            )
+
+            banking_email_similarity = (
+                SimilarityEngine.email_similarity(
+                    banking_email_a,
+                    banking_email_b,
+                )
+            )
+
+            banking_domain_a = (
+                banking_email_a.split("@")[1]
+                if "@" in banking_email_a
+                else ""
+            )
+
+            banking_domain_b = (
+                banking_email_b.split("@")[1]
+                if "@" in banking_email_b
+                else ""
+            )
+
+            banking_domain_trust_score = min(
+                email_domain_trust(
+                    banking_domain_a
+                ),
+                email_domain_trust(
+                    banking_domain_b
+                ),
+            )
+
+            email_score = min(
+                banking_email_similarity
+                * banking_domain_trust_score,
+                1.0,
+            )
+
+            banking_email_match_level = (
+                "DIFFERENT"
+            )
+
+            if email_score >= 0.99:
+                banking_email_match_level = (
+                    "EXACT"
+                )
+            elif email_score >= 0.90:
+                banking_email_match_level = (
+                    "SIMILAR"
+                )
+            elif email_score >= 0.70:
+                banking_email_match_level = (
+                    "FUZZY"
+                )
+
+            # -------------------------------------------------
+            # Composite banking score
+            # -------------------------------------------------
+
+            match_score = (
+                account_id_score
+                * domain_weights.get(
+                    "account_id_match",
+                    0.0,
+                )
+                + customer_id_score
+                * domain_weights.get(
+                    "customer_id_match",
+                    0.0,
+                )
+                + sap_business_partner_id_score
+                * domain_weights.get(
+                    "sap_business_partner_id_match",
+                    0.0,
+                )
+                + routing_number_score
+                * domain_weights.get(
+                    "routing_number_match",
+                    0.0,
+                )
+                + account_number_last4_score
+                * domain_weights.get(
+                    "account_number_last4_match",
+                    0.0,
+                )
+                + institution_name_score
+                * domain_weights.get(
+                    "institution_name_similarity",
+                    0.0,
+                )
+                + account_type_score
+                * domain_weights.get(
+                    "account_type_match",
+                    0.0,
+                )
+                + currency_score
+                * domain_weights.get(
+                    "currency_match",
+                    0.0,
+                )
+                + email_score
+                * domain_weights.get(
+                    "email_match",
+                    0.0,
+                )
+                + phone_score_value
+                * domain_weights.get(
+                    "phone_match",
+                    0.0,
+                )
+                + source_score
+                * domain_weights.get(
+                    "source_trust",
+                    0.0,
+                )
+                + learning_score
+                * domain_weights.get(
+                    "steward_learning",
+                    0.0,
+                )
+            )
+
+            # Reinforcement rules.
+            # Avoid allowing last-four alone to drive a high-confidence match.
+            if (
+                account_id_score == 1.0
+                and routing_number_score == 1.0
+            ):
+                match_score = max(
+                    match_score,
+                    0.95,
+                )
+
+            elif (
+                customer_id_score == 1.0
+                and sap_business_partner_id_score
+                == 1.0
+            ):
+                match_score = max(
+                    match_score,
+                    0.92,
+                )
+
+            elif (
+                routing_number_score == 1.0
+                and account_number_last4_score
+                == 1.0
+                and institution_name_score
+                >= 0.90
+            ):
+                match_score = max(
+                    match_score,
+                    0.82,
+                )
+
+            match_score = min(
+                match_score,
+                1.0,
+            )
+
+            # -------------------------------------------------
+            # Explainability signals
+            # -------------------------------------------------
+
+            signals.append(
+                self._build_signal(
+                    "account_id_match",
+                    account_id_score,
+                    domain_weights.get(
+                        "account_id_match",
+                        0.0,
+                    ),
+                    self._account_id_detail(
+                        account_id_a,
+                        account_id_b,
+                    ),
+                    signal_type="deterministic",
+                )
+            )
+
+            signals.append(
+                self._build_signal(
+                    "customer_id_match",
+                    customer_id_score,
+                    domain_weights.get(
+                        "customer_id_match",
+                        0.0,
+                    ),
+                    self._customer_id_detail(
+                        banking_customer_id_a,
+                        banking_customer_id_b,
+                    ),
+                    signal_type="deterministic",
+                )
+            )
+
+            signals.append(
+                self._build_signal(
+                    "sap_business_partner_id_match",
+                    sap_business_partner_id_score,
+                    domain_weights.get(
+                        "sap_business_partner_id_match",
+                        0.0,
+                    ),
+                    self._sap_business_partner_id_detail(
+                        sap_bp_id_a,
+                        sap_bp_id_b,
+                    ),
+                    signal_type="deterministic",
+                )
+            )
+
+            signals.append(
+                self._build_signal(
+                    "routing_number_match",
+                    routing_number_score,
+                    domain_weights.get(
+                        "routing_number_match",
+                        0.0,
+                    ),
+                    self._routing_number_detail(
+                        routing_number_a,
+                        routing_number_b,
+                    ),
+                    signal_type="deterministic",
+                )
+            )
+
+            signals.append(
+                self._build_signal(
+                    "account_number_last4_match",
+                    account_number_last4_score,
+                    domain_weights.get(
+                        "account_number_last4_match",
+                        0.0,
+                    ),
+                    self._account_last4_detail(
+                        account_last4_a,
+                        account_last4_b,
+                    ),
+                    signal_type="deterministic",
+                )
+            )
+
+            signals.append(
+                self._build_signal(
+                    "institution_name_similarity",
+                    institution_name_score,
+                    domain_weights.get(
+                        "institution_name_similarity",
+                        0.0,
+                    ),
+                    (
+                        "Compared financial institution names "
+                        f"'{institution_name_a or 'UNKNOWN'}' and "
+                        f"'{institution_name_b or 'UNKNOWN'}'."
+                    ),
+                    signal_type="probabilistic",
+                )
+            )
+
+            signals.append(
+                self._build_signal(
+                    "account_type_match",
+                    account_type_score,
+                    domain_weights.get(
+                        "account_type_match",
+                        0.0,
+                    ),
+                    (
+                        "Compared banking account types "
+                        f"'{account_type_a or 'UNKNOWN'}' and "
+                        f"'{account_type_b or 'UNKNOWN'}'."
+                    ),
+                    signal_type="deterministic",
+                )
+            )
+
+            signals.append(
+                self._build_signal(
+                    "currency_match",
+                    currency_score,
+                    domain_weights.get(
+                        "currency_match",
+                        0.0,
+                    ),
+                    (
+                        "Compared account currencies "
+                        f"'{currency_a or 'UNKNOWN'}' and "
+                        f"'{currency_b or 'UNKNOWN'}'."
+                    ),
+                    signal_type="deterministic",
+                )
+            )
+
+            signals.append(
+                self._build_signal(
+                    "email_match",
+                    email_score,
+                    domain_weights.get(
+                        "email_match",
+                        0.0,
+                    ),
+                    self._email_detail(
+                        banking_email_a,
+                        banking_email_b,
+                    ),
+                    match_level=(
+                        banking_email_match_level
+                    ),
+                    domain_trust=(
+                        banking_domain_trust_score
+                    ),
+                    signal_type="probabilistic",
+                )
+            )
+
+            signals.append(
+                self._build_signal(
+                    "phone_match",
+                    (
+                        phone_score
+                        if phone_score is not None
+                        else 0.5
+                    ),
+                    phone_weight,
+                    self._phone_detail(
+                        banking_phone_a,
+                        banking_phone_b,
+                    ),
+                    signal_type="deterministic",
+                )
+            )
+
+            signals.append(
+                self._build_signal(
+                    "source_trust",
+                    source_score,
+                    domain_weights.get(
+                        "source_trust",
+                        0.0,
+                    ),
+                    self._source_detail(
+                        record_a.source_system,
+                        record_b.source_system,
+                    ),
+                    signal_type="probabilistic",
+                )
+            )
+
+            raw_entity_score = round(
+                match_score
+                * risk_multiplier,
+                4,
+            )
             
         
         signal_scores = self._domain_signal_scores(
@@ -1923,6 +2714,19 @@ class EntityResolutionEngine:
             provider_email_score=provider_email_score,
             specialty_score=specialty_score,
             sku_score=sku_score,
+            account_id_score=account_id_score,
+            customer_id_score=customer_id_score,
+            sap_business_partner_id_score=(
+                sap_business_partner_id_score
+            ),
+            routing_number_score=routing_number_score,
+            account_number_last4_score=(
+                account_number_last4_score
+            ),
+            institution_name_score=institution_name_score,
+            account_type_score=account_type_score,
+            currency_score=currency_score,
+
         )
         signal_contributions = self._build_signal_contributions(
             signal_scores=signal_scores,
@@ -1935,10 +2739,10 @@ class EntityResolutionEngine:
 
         effective_multiplier = risk_multiplier
 
-        if domain in {"SUPPLIER", "PRODUCT", "PROVIDER", "PATIENT"}:
-            effective_multiplier = max(risk_multiplier, 0.90)
+        if domain in {"SUPPLIER", "PRODUCT", "PROVIDER", "PATIENT", "BANKING"}:
+            effective_multiplier = max(risk_multiplier), 0.90
 
-        if domain in {"SUPPLIER", "PRODUCT", "PROVIDER", "PATIENT"}:
+        if domain in {"SUPPLIER", "PRODUCT", "PROVIDER", "PATIENT", "BANKING"}:
 
             domain_confidence_score = round(
                 match_score * effective_multiplier * 100,
@@ -2203,6 +3007,14 @@ class EntityResolutionEngine:
         provider_email_score: float = 0.0,
         specialty_score: float = 0.0,
         sku_score: float = 0.0,
+        account_id_score: float = 0.0,
+        customer_id_score: float = 0.0,
+        sap_business_partner_id_score: float = 0.0,
+        routing_number_score: float = 0.0,
+        account_number_last4_score: float = 0.0,
+        institution_name_score: float = 0.0,
+        account_type_score: float = 0.0,
+        currency_score: float = 0.0,
     ) -> dict[str, float]:
 
         normalized_domain = (domain or "CUSTOMER").upper()
@@ -2256,10 +3068,33 @@ class EntityResolutionEngine:
         else:
             return {
                 "member_id_match": member_id_score,
+                "phone_match": phone_score,
                 "name_similarity": name_score,
                 "dob_match": dob_score,
                 "email_match": email_score,
                 "address_similarity": address_score,
+                "source_trust": source_score,
+                "steward_learning": learning_score,
+            }
+
+        if normalized_domain == "BANKING":
+            return {
+                "account_id_match": account_id_score,
+                "customer_id_match": customer_id_score,
+                "sap_business_partner_id_match": (
+                    sap_business_partner_id_score
+                ),
+                "routing_number_match": routing_number_score,
+                "account_number_last4_match": (
+                    account_number_last4_score
+                ),
+                "institution_name_similarity": (
+                    institution_name_score
+                ),
+                "account_type_match": account_type_score,
+                "currency_match": currency_score,
+                "email_match": email_score,
+                "phone_match": phone_score,
                 "source_trust": source_score,
                 "steward_learning": learning_score,
             }
@@ -3135,6 +3970,15 @@ class EntityResolutionEngine:
                 "Customer identity evidence supports this match. "
                 "Governance policy requires steward validation before automated merge."
             )
+
+        elif normalized_domain == "BANKING":
+            return (
+                "Banking account and customer identity evidence "
+                "were evaluated using account identifiers, SAP Business "
+                "Partner evidence, routing information, institution context, "
+                "and supporting contact signals. Governance policy requires "
+                "steward validation before automated consolidation."
+    )
 
             
         risk_text = (

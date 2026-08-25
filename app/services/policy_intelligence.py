@@ -851,15 +851,26 @@ class PolicyIntelligenceEngine:
         effective_domain = self._normalize_domain(domain)
         effective_organization_id = self._require_organization_id(organization_id)
 
-        active_cfg, _ = self._get_active_policy_config(
-            effective_domain,
-            effective_organization_id,
+        if policy_version:
+            effective_policy_version = (
+                self._normalize_policy_version(
+                    policy_version
+                )
+            )
+        else:
+            active_cfg, _ = (
+                self._get_active_policy_config(
+                    effective_domain,
+                    effective_organization_id,
+                )
+            )
+
+            effective_policy_version = (
+                self._normalize_policy_version(
+                    active_cfg.get("policy_version")
         )
-        effective_policy_version = (
-            self._normalize_policy_version(policy_version)
-            if policy_version
-            else self._normalize_policy_version(active_cfg.get("policy_version"))
-        )
+    )
+
 
         config_query = f"""
         SELECT
@@ -1026,10 +1037,13 @@ class PolicyIntelligenceEngine:
             policy_version=policy_version,
         )
         current_config = current_bundle.get("config") or self._default_policy_config(domain)
-        current_thresholds = current_bundle.get("thresholds") or self._default_policy_thresholds(
-            domain,
-            policy_version,
-        )
+        current_thresholds = (current_bundle.get("thresholds")
+            or self._default_policy_thresholds(
+                effective_organization_id,
+                domain,
+                policy_version,
+    )
+)
 
         config_row = {
             "policy_id": str(

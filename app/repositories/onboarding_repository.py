@@ -772,44 +772,38 @@ class OnboardingRepository:
         # INSERT ... SELECT ensures subscriptions can only be created
         # beneath an existing active organization.
         query = f"""
-        INSERT INTO `{self.subscriptions_table}`
-        (
-            subscription_id,
-            organization_id,
-            plan_name,
-            billing_status,
-            stripe_customer_id,
-            stripe_subscription_id,
-            trial_end_date,
-            renewal_date,
-            max_users,
-            max_connections,
-            max_monthly_explanations,
-            created_at,
-            updated_at
-        )
-        SELECT
-            @subscription_id,
-            @organization_id,
-            @plan_name,
-            @billing_status,
-            @stripe_customer_id,
-            @stripe_subscription_id,
-            @trial_end_date,
-            @renewal_date,
-            @max_users,
-            @max_connections,
-            @max_monthly_explanations,
-            @created_at,
-            @updated_at
-        FROM (SELECT 1) AS tenant_guard
-        WHERE EXISTS (
-            SELECT 1
-            FROM `{self.organizations_table}`
-            WHERE organization_id = @organization_id
-              AND is_active = TRUE
-        )
-        """
+            INSERT INTO `{self.subscriptions_table}`
+            (
+                subscription_record_id,
+                organization_id,
+                plan_code,
+                subscription_status,
+                stripe_customer_id,
+                stripe_subscription_id,
+                trial_ends_at,
+                current_period_ends_at,
+                seat_limit,
+                connection_limit,
+                monthly_explanation_limit,
+                created_at,
+                updated_at
+            )
+            SELECT
+                @subscription_record_id,
+                @organization_id,
+                @plan_code,
+                @subscription_status,
+                @stripe_customer_id,
+                @stripe_subscription_id,
+                @trial_ends_at,
+                @current_period_ends_at,
+                @seat_limit,
+                @connection_limit,
+                @monthly_explanation_limit,
+                @created_at,
+                @updated_at
+            ...
+            """
 
         job_config = bigquery.QueryJobConfig(
             query_parameters=[
@@ -817,6 +811,42 @@ class OnboardingRepository:
                     "subscription_id",
                     "STRING",
                     record["subscription_id"],
+                ),
+
+                bigquery.ScalarQueryParameter(
+                    "plan_code",
+                    "STRING",
+                    record["plan_name"],
+                ),
+                bigquery.ScalarQueryParameter(
+                    "subscription_status",
+                    "STRING",
+                    record["billing_status"],
+                ),
+                bigquery.ScalarQueryParameter(
+                    "trial_ends_at",
+                    "TIMESTAMP",
+                    record.get("trial_end_date"),
+                ),
+                bigquery.ScalarQueryParameter(
+                    "current_period_ends_at",
+                    "TIMESTAMP",
+                    record.get("renewal_date"),
+                ),
+                bigquery.ScalarQueryParameter(
+                    "seat_limit",
+                    "INT64",
+                    record.get("max_users"),
+                ),
+                bigquery.ScalarQueryParameter(
+                    "connection_limit",
+                    "INT64",
+                    record.get("max_connections"),
+                ),
+                bigquery.ScalarQueryParameter(
+                    "monthly_explanation_limit",
+                    "INT64",
+                    record.get("max_monthly_explanations"),
                 ),
                 bigquery.ScalarQueryParameter(
                     "organization_id",

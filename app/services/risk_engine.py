@@ -26,6 +26,12 @@ HIGH_RISK_CONFLICTS = {
         "member_id",
         "human_id",
     },
+      "BANKING": {
+        "account_id",
+        "banking_customer_id",
+        "sap_business_partner_id",
+        "routing_number",
+    },
 }
 
 MEDIUM_RISK_CONFLICTS = {
@@ -54,30 +60,52 @@ MEDIUM_RISK_CONFLICTS = {
         "address",
         "email",
     },
+     "BANKING": {
+        "account_number_last4",
+        "institution_name",
+        "account_type",
+        "currency",
+        "account_status",
+        "email",
+        "phone_number",
+    },
 }
 
 RISK_DRIVER_RANK = {
-    "member_id": 1,
-    "patient_id": 2,
-    "human_id": 3,
-    "provider_id": 4,
-    "supplier_id": 5,
-    "product_id": 6,
-    "npi": 7,
-    "gtin": 8,
-    "tax_id": 9,
-    "dob": 10,
-    "dob_invalid_format": 11,
-    "name": 20,
-    "product_variant": 25,
-    "item_category": 26,
-    "product_name": 27,
-    "sku": 28,
-    "address": 30,
-    "email": 40,
-    "phone_number": 45,
-    "specialty": 50,
-    "source_system": 60,
+    "banking_identity": 0,
+    "account_id": 1,
+    "banking_customer_id": 2,
+    "sap_business_partner_id": 3,
+    "routing_number": 4,
+
+    "member_id": 5,
+    "patient_id": 6,
+    "human_id": 7,
+    "provider_id": 8,
+    "supplier_id": 9,
+    "product_id": 10,
+    "npi": 11,
+    "gtin": 12,
+    "tax_id": 13,
+    "dob": 14,
+    "dob_invalid_format": 15,
+
+    "account_number_last4": 20,
+    "institution_name": 21,
+    "account_type": 22,
+    "currency": 23,
+    "account_status": 24,
+
+    "name": 30,
+    "product_variant": 35,
+    "item_category": 36,
+    "product_name": 37,
+    "sku": 38,
+    "address": 40,
+    "email": 50,
+    "phone_number": 55,
+    "specialty": 60,
+    "source_system": 70,
 }
 
 
@@ -118,8 +146,17 @@ def _val(
 
         return digits
 
-    return str(value).strip().lower()
+    if field in {
+        "routing_number",
+        "account_number_last4",
+    }:
+        return re.sub(
+            r"\D",
+            "",
+            str(value),
+        )
 
+    return str(value).strip().lower()
 
 def normalize_risk_driver(
     driver: str,
@@ -271,6 +308,40 @@ def evaluate_risk(
 
     if medium_conflicts:
         risk_score += 20
+
+        if normalized_domain == "BANKING":
+            banking_identity_conflicts = {
+                "account_id",
+                "banking_customer_id",
+                "sap_business_partner_id",
+                "routing_number",
+            }.intersection(
+                high_conflicts
+            )
+
+            # Multiple conflicting banking identity anchors
+            # represent a severe consolidation risk.
+            if len(banking_identity_conflicts) >= 2:
+                risk_score = max(
+                    risk_score,
+                    90,
+                )
+                risk_drivers.append(
+                    "banking_identity"
+                )
+
+            # Routing + last-four conflict is stronger
+            # than either supporting field independently.
+            if (
+                "routing_number"
+                in high_conflicts
+                and "account_number_last4"
+                in medium_conflicts
+            ):
+                risk_score = max(
+                    risk_score,
+                    85,
+                )
 
     if (
         normalized_domain

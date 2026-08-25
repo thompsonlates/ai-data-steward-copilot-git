@@ -357,24 +357,263 @@ DQ CONTEXT:
 """.strip()
 
 
-def _extract_quality_json(raw: Any) -> Dict[str, Any]:
+def _extract_quality_json(
+    raw: object,
+) -> dict:
+    """
+    Parse structured DQ recommendation JSON from an LLM response.
+
+    Tolerates:
+      - already-parsed dicts
+      - markdown ```json fences
+      - explanatory text before/after JSON
+      - trailing commas before } or ]
+      - multiple candidate JSON objects
+
+    Does NOT invent or auto-complete genuinely truncated JSON.
+    """
+
+    import json
+    import re
+    from typing import Any
+
     if isinstance(raw, dict):
         return raw
-    text = _text(raw)
+
+    if raw is None:
+        raise ValueError(
+            "LLM returned no content."
+        )
+
+    text = str(raw).strip()
+
     if not text:
-        raise ValueError("LLM returned an empty response.")
-    text = re.sub(r"^\s*```(?:json)?\s*", "", text, flags=re.I)
-    text = re.sub(r"\s*```\s*$", "", text)
+        raise ValueError(
+            "LLM returned empty content."
+        )
+
+    # ---------------------------------------------------------
+    # 1. Remove common Markdown code fences
+    # ---------------------------------------------------------
+
+    text = re.sub(
+        r"^\s*```(?:json)?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    text = re.sub(
+        r"\s*```\s*$",
+        "",
+        text,
+    )
+
+    text = text.strip()
+
+    # ---------------------------------------------------------
+    # 2. Try exact response first
+    # ---------------------------------------------------------
+
     try:
         value = json.loads(text)
+
+        if not isinstance(value, dict):
+            raise ValueError(
+                "LLM JSON root must be an object."
+            )
+
+        return value
+
     except json.JSONDecodeError:
-        start, end = text.find("{"), text.rfind("}")
-        if start < 0 or end <= start:
-            raise ValueError("No JSON object found in LLM response.")
-        value = json.loads(text[start:end + 1])
-    if not isinstance(value, dict):
-        raise ValueError("LLM response was not a JSON object.")
-    return value
+        pass
+
+    # ---------------------------------------------------------
+    # 3. Conservative cleanup:
+    #    trailing commas before closing braces/brackets
+    # ---------------------------------------------------------
+
+    cleaned_text = re.sub(
+        r",\s*([}\]])",
+        r"\1",
+        text,
+    )
+
+    if cleaned_text != text:
+        try:
+            value = json.loads(
+                cleaned_text
+            )
+
+            if isinstance(
+                value,
+                dict,
+            ):
+                return value
+
+        except json.JSONDecodeError:
+            pass
+
+    # ---------------------------------------------------------
+    # 4. Extract balanced JSON candidates.
+    #
+    #    Important:
+    #    Do this string-aware so braces inside strings
+    #    do not break parsing.
+    # ---------------------------------------------------------
+
+    def _balanced_candidates(
+        source: str,
+    ) -> list[str]:
+        candidates: list[str] = []
+
+        for start_index, char in enumerate(
+            source
+        ):
+            if char not in "{[":
+                continue
+
+            opening = char
+            closing = (
+                "}"
+                if opening == "{"
+                else "]"
+            )
+
+            depth = 0
+            in_string = False
+            escaped = False
+
+            for index in range(
+                start_index,
+                len(source),
+            ):
+                current = source[index]
+
+                if in_string:
+                    if escaped:
+                        escaped = False
+                        continue
+
+                    if current == "\\":
+                        escaped = True
+                        continue
+
+                    if current == '"':
+                        in_string = False
+
+                    continue
+
+                if current == '"':
+                    in_string = True
+                    continue
+
+                if current == opening:
+                    depth += 1
+
+                elif current == closing:
+                    depth -= 1
+
+                    if depth == 0:
+                        candidates.append(
+                            source[
+                                start_index:
+                                index + 1
+                            ]
+                        )
+                        break
+
+        return candidates
+
+    candidates = (
+        _balanced_candidates(
+            cleaned_text
+        )
+    )
+
+    # Prefer larger candidates first because the complete
+    # response object will usually contain nested objects.
+    candidates.sort(
+        key=len,
+        reverse=True,
+    )
+
+    last_error: Exception | None = None
+
+    for candidate in candidates:
+        candidate = re.sub(
+            r",\s*([}\]])",
+            r"\1",
+            candidate,
+        )
+
+        try:
+            value: Any = json.loads(
+                candidate
+            )
+
+            if isinstance(
+                value,
+                dict,
+            ):
+                return value
+
+        except json.JSONDecodeError as exc:
+            last_error = exc
+
+    # ---------------------------------------------------------
+    # 5. Detect likely truncation explicitly.
+    #
+    #    We deliberately do not fabricate closing quotes,
+    #    braces, fields, or recommendation content.
+    # ---------------------------------------------------------
+
+    open_braces = (
+        cleaned_text.count("{")
+        - cleaned_text.count("}")
+    )
+
+    open_brackets = (
+        cleaned_text.count("[")
+        - cleaned_text.count("]")
+    )
+
+    quote_count = len(
+        re.findall(
+            r'(?<!\\)"',
+            cleaned_text,
+        )
+    )
+
+    likely_truncated = (
+        open_braces > 0
+        or open_brackets > 0
+        or quote_count % 2 != 0
+    )
+
+    preview = (
+        cleaned_text[:500]
+        .replace("\n", " ")
+    )
+
+    if likely_truncated:
+        raise ValueError(
+            "LLM returned truncated or incomplete "
+            "JSON. Deterministic fallback should be "
+            f"used. Response preview: {preview}"
+        )
+
+    if last_error:
+        raise ValueError(
+            "Unable to parse structured DQ JSON "
+            f"from LLM response: {last_error}. "
+            f"Response preview: {preview}"
+        )
+
+    raise ValueError(
+        "No valid JSON object found in LLM "
+        f"response. Response preview: {preview}"
+    )
 
 
 def _validate_quality_rule_suggestions(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -769,8 +1008,10 @@ def build_quality_rule_suggestions(
         return fallback_quality_rule_suggestions(context)
     try:
         result = generate_structured_quality_rule_suggestions(
-            build_quality_rule_prompt(context), provider=provider
-        )
+                build_quality_rule_prompt(context),
+                organization_id=organization_id,
+                provider=provider,
+            )
         if not result.get("suggested_rules"):
             return fallback_quality_rule_suggestions(context)
         if not result.get("supporting_evidence"):

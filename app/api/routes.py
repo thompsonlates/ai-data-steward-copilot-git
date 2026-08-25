@@ -1,5 +1,8 @@
 from datetime import datetime, timezone
 
+import time
+from typing import Any
+
 from http import client
 import traceback
 import uuid
@@ -13,8 +16,18 @@ from fastapi.responses import RedirectResponse
 
 from app.api.auth import AuthUser, get_current_user, get_current_tenant_user
 
+from app.services.dq_ai_recommendation_service import (
+    DqAiRecommendationService,
+)
+
+from app.api.schemas import (
+    AiRecommendationFeedbackRequest,
+)
+
 from app.api.schemas import (
     ConnectionTestResponse,
+    CustomConnectionRequestCreate,
+    CustomConnectionRequestResponse,
     EnterpriseConnectionCreate,
     EnterpriseConnectionListResponse,
     EnterpriseConnectionResponse,
@@ -57,10 +70,50 @@ from app.api.customer_user_schemas import (
 from app.repositories.customer_user_repository import (
     CustomerUserRepository,
 )
+
+from app.services.email_service import EmailService
+
 from app.services.customer_user_service import (
     CustomerUserService,
 )
 
+from app.repositories.custom_connection_repository import (
+    CustomConnectionRepository,
+)
+from app.services.custom_connection_service import (
+    CustomConnectionService,
+)
+
+from app.repositories.record_search_repository import (
+    RecordSearchRepository,
+)
+
+from app.workflow.connectors.google_sheets_connector import (
+    GoogleSheetsConnector,
+)
+
+from app.services.quality_profiler_service import (
+    QualityFieldConfig,
+    QualityProfileConfig,
+    QualityProfilerService,
+)
+
+from app.repositories.quality_profiler_repository import (
+    QualityProfilerRepository,
+)
+
+from app.api.schemas import (
+    GoogleSheetsConnectionTestRequest,
+    GoogleSheetsPreviewRequest,
+    GoogleSheetsProfileRequest,
+)
+
+from app.services.quality_profile_config_factory import (
+    build_quality_profile_config,
+)
+
+
+record_search_repository = RecordSearchRepository()
 
 entitlement_repository = EntitlementRepository()
 
@@ -76,7 +129,6 @@ customer_user_service = CustomerUserService(
 )
 
 
-
 PROJECT_ID = os.getenv(
     "GOOGLE_CLOUD_PROJECT",
     "api-project-503305938314",
@@ -90,10 +142,6 @@ DATASET_ID = os.getenv(
 onboarding_repository = OnboardingRepository(
     project_id=PROJECT_ID,
     dataset_id=DATASET_ID,
-)
-
-onboarding_service = OnboardingService(
-    repository=onboarding_repository,
 )
 
 connection_repository = ConnectionRepository(
@@ -114,6 +162,34 @@ google_oauth_service = GoogleOAuthService(
     repository=connection_repository,
     secret_manager=secret_manager_service,
 
+)
+email_service = EmailService()
+
+
+custom_connection_repository = (
+    CustomConnectionRepository(
+        project_id=PROJECT_ID,
+        dataset_id=DATASET_ID,
+    )
+)
+
+custom_connection_service = (
+    CustomConnectionService(
+        repository=custom_connection_repository,
+        email_service=email_service,
+    )
+)
+
+customer_user_service = CustomerUserService(
+    repository=customer_user_repository,
+    entitlement_service=entitlement_service,
+    email_service=email_service,
+)
+
+onboarding_service = OnboardingService(
+    repository=onboarding_repository,
+    entitlement_service=entitlement_service,
+    email_service=email_service,
 )
 
 from app.services.record_search_service import RecordSearchService
@@ -159,6 +235,10 @@ from app.api.schemas import (
     GovernanceBlocker,
     GovernancePolicyActivity,
 )
+
+from app.repositories.ai_recommendation_feedback_repository import (
+    AiRecommendationFeedbackRepository,
+)
 from app.services.address_intelligence_service import AddressIntelligenceService
 from app.services.bq_logger import BigQueryLogger
 from app.services.bq_metrics import BigQueryMetrics
@@ -190,11 +270,45 @@ from app.api.schemas import (
     GovernancePolicyActivity,
 )
 
+import json
+
+from fastapi import File, Form, UploadFile
+
+from app.api.schemas import (
+    CsvPreviewResponse,
+    CsvProfileResponse,
+)
+
+from app.services.csv_ingestion_service import (
+    CsvIngestionError,
+    CsvIngestionService,
+)
+
+from app.services.quality_profiler_service import (
+    QualityFieldConfig,
+    QualityProfileConfig,
+    QualityProfilerService,
+)
+
+from app.repositories.quality_profiler_repository import (
+    QualityProfilerRepository,
+)
+
 router = APIRouter()
 
 policy_engine = PolicyIntelligenceEngine()
 bq = BigQueryLogger()
 metrics = BigQueryMetrics()
+
+csv_ingestion_service = CsvIngestionService()
+
+csv_quality_profiler_service = (
+    QualityProfilerService()
+)
+
+csv_quality_profiler_repository = (
+    QualityProfilerRepository()
+)
 
 DEFAULT_PROMPT_VERSION = "match-explain-v1"
 DEFAULT_FEATURE_SCHEMA_VERSION = "v1"
@@ -260,6 +374,54 @@ def build_retry_prompt(prompt: str) -> str:
         + "\nUse double quotes for all strings."
         + "\nDo not use trailing commas."
     )
+
+# ============================================================
+# DQ Rule Suggestions Cache
+# ============================================================
+
+_DQ_RULE_SUGGESTION_CACHE: dict[
+    str,
+    dict[str, Any],
+] = {}
+
+_DQ_RULE_SUGGESTION_TTL_SECONDS = 600  # 10 minutes
+
+
+def _get_cached_dq_rule_suggestions(
+    cache_key: str,
+) -> Any | None:
+    cached = _DQ_RULE_SUGGESTION_CACHE.get(
+        cache_key
+    )
+
+    if cached is None:
+        return None
+
+    expires_at = float(
+        cached.get("expires_at", 0)
+    )
+
+    if time.time() >= expires_at:
+        _DQ_RULE_SUGGESTION_CACHE.pop(
+            cache_key,
+            None,
+        )
+        return None
+
+    return cached.get("data")
+
+
+def _set_cached_dq_rule_suggestions(
+    cache_key: str,
+    data: Any,
+) -> None:
+    _DQ_RULE_SUGGESTION_CACHE[cache_key] = {
+        "data": data,
+        "expires_at": (
+            time.time()
+            + _DQ_RULE_SUGGESTION_TTL_SECONDS
+        ),
+    }
 
 
 def normalize_ai_payload(payload: dict) -> dict:
@@ -783,6 +945,576 @@ def invite_customer_user(
         **result
     )
 
+@router.post(
+    "/connections/custom-request",
+    response_model=CustomConnectionRequestResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_custom_connection_request(
+    request: CustomConnectionRequestCreate,
+    current_user: AuthUser = Depends(
+        get_current_tenant_user
+    ),
+) -> CustomConnectionRequestResponse:
+
+    organization_id = (
+        require_current_organization_id(current_user)
+    )
+
+    if not current_user.customer_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "A valid customer membership is required "
+                "to request a custom connection."
+            ),
+        )
+
+    return custom_connection_service.create_request(
+        request=request,
+        organization_id=organization_id,
+        customer_id=current_user.customer_id,
+        requested_by=str(current_user.email),
+        contact_email=str(current_user.email),
+    )
+
+@router.post(
+    "/connections/google-sheets/test",
+)
+def test_google_sheets_connection(
+    req: GoogleSheetsConnectionTestRequest,
+    current_user: AuthUser = Depends(
+        get_current_tenant_user
+    ),
+):
+    organization_id = (
+        require_current_organization_id(
+            current_user
+        )
+    )
+
+    connector = GoogleSheetsConnector()
+
+    result = connector.test_connection(
+        spreadsheet_id=req.spreadsheet_url
+    )
+
+    sheets = connector.list_sheets(
+        spreadsheet_id=req.spreadsheet_url
+    )
+
+    return {
+        "success": True,
+        "organization_id": organization_id,
+        "spreadsheet_id": (
+            result["spreadsheet_id"]
+        ),
+        "spreadsheet_title": (
+            result.get("spreadsheet_title")
+        ),
+        "sheets": sheets,
+    }
+
+@router.post(
+    "/connections/google-sheets/preview",
+)
+def preview_google_sheet(
+    req: GoogleSheetsPreviewRequest,
+    current_user: AuthUser = Depends(
+        get_current_tenant_user
+    ),
+):
+    require_current_organization_id(
+        current_user
+    )
+
+    connector = GoogleSheetsConnector()
+
+    rows = connector.read_rows(
+        spreadsheet_id=req.spreadsheet_url,
+        sheet_name=req.sheet_name,
+        header_row=req.header_row,
+        limit=req.preview_limit,
+    )
+
+    headers = (
+        list(rows[0].keys())
+        if rows
+        else []
+    )
+
+    return {
+        "headers": headers,
+        "rows": rows,
+        "row_count": len(rows),
+    }
+
+@router.post(
+    "/connections/csv/preview",
+    response_model=CsvPreviewResponse,
+)
+async def preview_csv_upload(
+    file: UploadFile = File(...),
+    preview_rows: int = Form(25),
+    current_user: AuthUser = Depends(
+        get_current_tenant_user
+    ),
+) -> CsvPreviewResponse:
+    organization_id = (
+        require_current_organization_id(
+            current_user
+        )
+    )
+
+    try:
+        file_bytes = await file.read()
+
+        result = (
+            csv_ingestion_service.preview_csv(
+                organization_id=organization_id,
+                file_name=file.filename,
+                file_bytes=file_bytes,
+                preview_rows=preview_rows,
+            )
+        )
+
+        return CsvPreviewResponse(
+            organization_id=organization_id,
+            file_name=result.file_name,
+            columns=result.columns,
+            rows=result.rows,
+            total_preview_rows=(
+                result.total_preview_rows
+            ),
+            delimiter=result.delimiter,
+            encoding=result.encoding,
+        )
+
+    except CsvIngestionError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+    except Exception as exc:
+        logger.exception(
+            "CSV preview failed for "
+            "organization_id=%s",
+            organization_id,
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Unable to preview CSV file: "
+                f"{str(exc)}"
+            ),
+        ) from exc
+
+@router.post(
+    "/dq/profile/csv",
+    response_model=CsvProfileResponse,
+)
+async def profile_csv_upload(
+    file: UploadFile = File(...),
+    domain: str = Form(...),
+    business_key_field: str = Form(...),
+    column_mappings: str = Form(...),
+    minimum_record_score: float = Form(80.0),
+    current_user: AuthUser = Depends(
+        get_current_tenant_user
+    ),
+) -> CsvProfileResponse:
+    organization_id = (
+        require_current_organization_id(
+            current_user
+        )
+    )
+
+    try:
+        normalized_domain = str(
+            domain or ""
+        ).strip().upper()
+
+        if not normalized_domain:
+            raise ValueError(
+                "domain is required."
+            )
+
+        normalized_business_key = str(
+            business_key_field or ""
+        ).strip()
+
+        if not normalized_business_key:
+            raise ValueError(
+                "business_key_field is required."
+            )
+
+        try:
+            raw_mappings = json.loads(
+                column_mappings
+            )
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "column_mappings must be valid JSON."
+            ) from exc
+
+        if not isinstance(raw_mappings, list):
+            raise ValueError(
+                "column_mappings must be a JSON array."
+            )
+
+        normalized_mappings = []
+
+        seen_source_columns: set[str] = set()
+        seen_target_fields: set[str] = set()
+
+        for item in raw_mappings:
+            if not isinstance(item, dict):
+                raise ValueError(
+                    "Each column mapping must be "
+                    "a JSON object."
+                )
+
+            source_column = str(
+                item.get("source_column")
+                or ""
+            ).strip()
+
+            target_field = str(
+                item.get("target_field")
+                or ""
+            ).strip()
+
+            if not source_column:
+                raise ValueError(
+                    "source_column is required "
+                    "for every mapping."
+                )
+
+            if not target_field:
+                raise ValueError(
+                    "target_field is required "
+                    "for every mapping."
+                )
+
+            if (
+                source_column
+                in seen_source_columns
+            ):
+                raise ValueError(
+                    "Each CSV source column can "
+                    "only be mapped once."
+                )
+
+            if (
+                target_field
+                in seen_target_fields
+            ):
+                raise ValueError(
+                    "Each target field can only "
+                    "be mapped once."
+                )
+
+            seen_source_columns.add(
+                source_column
+            )
+
+            seen_target_fields.add(
+                target_field
+            )
+
+            normalized_mappings.append(
+                {
+                    "source_column":
+                        source_column,
+                    "target_field":
+                        target_field,
+                }
+            )
+
+        if not normalized_mappings:
+            raise ValueError(
+                "At least one column mapping "
+                "is required."
+            )
+
+        if (
+            normalized_business_key
+            not in seen_target_fields
+        ):
+            raise ValueError(
+                "business_key_field must be "
+                "included in column_mappings."
+            )
+
+        file_bytes = await file.read()
+
+        parsed = (
+            csv_ingestion_service
+            .parse_csv_records(
+                organization_id=(
+                    organization_id
+                ),
+                file_name=file.filename,
+                file_bytes=file_bytes,
+            )
+        )
+
+        source_columns = set(
+            parsed["columns"]
+        )
+
+        for mapping in normalized_mappings:
+            if (
+                mapping["source_column"]
+                not in source_columns
+            ):
+                raise ValueError(
+                    "Mapped CSV column was not "
+                    "found in the uploaded file: "
+                    f"{mapping['source_column']}"
+                )
+
+        mapped_rows = []
+
+        for source_row in parsed["records"]:
+            mapped_row = {
+                mapping["target_field"]:
+                    source_row.get(
+                        mapping[
+                            "source_column"
+                        ]
+                    )
+                for mapping
+                in normalized_mappings
+            }
+
+            mapped_rows.append(
+                mapped_row
+            )
+
+        if not mapped_rows:
+            raise ValueError(
+                "CSV file contains no data rows."
+            )
+
+
+        source_name = (
+            f"CSV:{parsed['file_name']}"
+        )
+
+        config = build_quality_profile_config(
+                domain=normalized_domain,
+                source_name=source_name,
+                business_key_field=normalized_business_key,
+                mapped_fields={
+                    mapping["target_field"]
+                    for mapping in normalized_mappings
+                },
+                minimum_record_score=minimum_record_score,
+)
+
+        result = (
+            csv_quality_profiler_service
+            .profile_rows(
+                organization_id=(
+                    organization_id
+                ),
+                rows=mapped_rows,
+                config=config,
+                source_name=source_name,
+            )
+        )
+
+        csv_quality_profiler_repository.save_profile_result(
+            result=result
+        )
+
+        return CsvProfileResponse(
+            organization_id=organization_id,
+            profile_run_id=(
+                result.profile_run_id
+            ),
+            file_name=parsed["file_name"],
+            domain=result.domain,
+            record_count=parsed[
+                "record_count"
+            ],
+            total_records=(
+                result.total_records
+            ),
+            avg_record_score=(
+                result.avg_record_score
+            ),
+            records_below_threshold=(
+                result.records_below_threshold
+            ),
+            records_with_findings=(
+                result.records_with_findings
+            ),
+            total_findings=(
+                result.total_findings
+            ),
+            duplicate_record_count=(
+                result.duplicate_record_count
+            ),
+            source_type="CSV",
+            generated_at=(
+                result.generated_at
+            ),
+        )
+
+    except (
+        CsvIngestionError,
+        ValueError,
+    ) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+    except Exception as exc:
+        logger.exception(
+            "CSV DQ profile failed for "
+            "organization_id=%s",
+            organization_id,
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Unable to profile CSV file: "
+                f"{str(exc)}"
+            ),
+        ) from exc
+
+@router.post(
+    "/dq/profile/google-sheets",
+)
+def profile_google_sheet(
+    req: GoogleSheetsProfileRequest,
+    current_user: AuthUser = Depends(
+        get_current_tenant_user
+    ),
+):
+    organization_id = (
+        require_current_organization_id(
+            current_user
+        )
+    )
+
+    connector = GoogleSheetsConnector()
+
+    raw_rows = connector.read_rows(
+        spreadsheet_id=req.spreadsheet_url,
+        sheet_name=req.sheet_name,
+        header_row=req.header_row,
+        limit=100_000,
+    )
+
+    mapping = {
+        item.source_column: item.target_field
+        for item in req.column_mappings
+    }
+
+    normalized_rows = []
+
+    for raw_row in raw_rows:
+        normalized_row = {}
+
+        for source_column, target_field in mapping.items():
+            normalized_row[target_field] = (
+                raw_row.get(source_column)
+            )
+
+        normalized_rows.append(
+            normalized_row
+        )
+
+    normalized_domain = (
+        req.domain.strip().upper()
+    )
+
+    if normalized_domain != "PRODUCT":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Google Sheets DQ profiling currently "
+                "supports PRODUCT during this rollout."
+            ),
+        )
+
+    config = QualityProfileConfig(
+        domain="PRODUCT",
+        source_table="unused.for.google.sheets",
+        business_key_field=(
+            req.business_key_field
+        ),
+        minimum_record_score=85.0,
+        fields=[
+            QualityFieldConfig(
+                field_name="product_id",
+                required=True,
+                uniqueness_key=True,
+                weight=2.0,
+                severity="CRITICAL",
+            ),
+            QualityFieldConfig(
+                field_name="product_name",
+                required=True,
+                uniqueness_key=False,
+                weight=2.0,
+                severity="HIGH",
+            ),
+            QualityFieldConfig(
+                field_name="item_category",
+                required=True,
+                uniqueness_key=False,
+                weight=1.0,
+                severity="MEDIUM",
+            ),
+        ],
+    )
+
+    profiler = QualityProfilerService()
+
+    result = profiler.profile_rows(
+        organization_id=organization_id,
+        rows=normalized_rows,
+        config=config,
+        source_name=(
+            f"GOOGLE_SHEETS:{req.sheet_name}"
+        ),
+    )
+
+    repository = QualityProfilerRepository()
+
+    repository.save_profile_result(
+        result=result
+    )
+
+    return {
+        "success": True,
+        "organization_id": organization_id,
+        "profile_run_id": result.profile_run_id,
+        "domain": result.domain,
+        "total_records": result.total_records,
+        "avg_record_score": result.avg_record_score,
+        "records_below_threshold": (
+            result.records_below_threshold
+        ),
+        "records_with_findings": (
+            result.records_with_findings
+        ),
+        "total_findings": (
+            result.total_findings
+        ),
+        "duplicate_record_count": (
+            result.duplicate_record_count
+        ),
+    }
+
 @router.get(
     "/metrics/governance-overview",
     response_model=GovernanceOverviewResponse,
@@ -793,9 +1525,20 @@ def get_governance_overview(
 ):
     project_id = "api-project-503305938314"
     dataset_id = "ai_data_steward_mvp"
-    organization_id = require_current_organization_id(current_user)
+    organization_id = require_current_organization_id(
+        current_user
+    )
 
-    bq_client = bigquery.Client(project=project_id)
+    ai_feedback_metrics = (
+        metrics.get_ai_recommendation_feedback_metrics(
+            organization_id=organization_id,
+            days=days,
+        )
+    )
+
+    bq_client = bigquery.Client(
+        project=project_id
+    )
 
     kpi_sql = f"""
     SELECT *
@@ -880,7 +1623,6 @@ def get_governance_overview(
             ).result()
         ]
         enriched_dataset_rows = []
-        import pprint
 
         import pprint
 
@@ -959,6 +1701,7 @@ def get_governance_overview(
             dataset_statuses=dataset_statuses,
             top_blockers=top_blockers,
             policy_activity=policy_activity,
+            ai_feedback_metrics=ai_feedback_metrics,
         )
 
     except HTTPException:
@@ -968,7 +1711,91 @@ def get_governance_overview(
             status_code=500,
             detail=f"Failed to load governance overview: {str(e)}",
         )
+@router.post(
+    "/dq/profiles/{profile_run_id}/ai-analysis"
+)
+def analyze_dq_profile(
+    profile_run_id: str,
+    current_user: AuthUser = Depends(
+        get_current_tenant_user
+    ),
+):
+    organization_id = (
+        require_current_organization_id(
+            current_user
+        )
+    )
 
+    try:
+        service = (
+            DqAiRecommendationService()
+        )
+
+        return service.analyze_profile(
+            organization_id=organization_id,
+            profile_run_id=profile_run_id,
+        )
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+@router.post(
+    "/ai-recommendations/feedback"
+)
+def submit_ai_recommendation_feedback(
+    req: AiRecommendationFeedbackRequest,
+    current_user: AuthUser = Depends(
+        get_current_tenant_user
+    ),
+):
+    organization_id = (
+        require_current_organization_id(
+            current_user
+        )
+    )
+
+    repository = (
+        AiRecommendationFeedbackRepository()
+    )
+
+    return repository.save_feedback(
+        organization_id=organization_id,
+        recommendation_id=(
+            req.recommendation_id
+        ),
+        recommendation_type=(
+            req.recommendation_type
+        ),
+        profile_run_id=req.profile_run_id,
+        domain=req.domain,
+        rule_id=req.rule_id,
+        ai_recommendation=(
+            req.ai_recommendation
+        ),
+        ai_confidence=req.ai_confidence,
+        steward_decision=(
+            req.steward_decision
+        ),
+        steward_comment=(
+            req.steward_comment
+        ),
+        override_reason=(
+            req.override_reason
+        ),
+        submitted_by=(
+            getattr(
+                current_user,
+                "email",
+                None,
+            )
+        ),
+        source_component=(
+            req.source_component
+        ),
+    )
 
 @router.get(
     "/metrics/dq-overview",
@@ -1128,15 +1955,29 @@ def google_oauth_callback(
 @router.post(
     "/connections",
     response_model=EnterpriseConnectionResponse,
-    status_code=status.HTTP_201_CREATED,
 )
 def create_enterprise_connection(
-    request: EnterpriseConnectionCreate,current_user: AuthUser = Depends(get_current_tenant_user
-),
+    request: EnterpriseConnectionCreate,
+    current_user: AuthUser = Depends(
+        get_current_tenant_user
+    ),
 ) -> EnterpriseConnectionResponse:
+
+    if not current_user.customer_id:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "A valid customer membership is required "
+                "to create an enterprise connection."
+            ),
+        )
+
     return connection_service.create_connection(
         request=request,
-        organization_id=require_current_organization_id(current_user),
+        organization_id=require_current_organization_id(
+            current_user
+        ),
+        customer_id=current_user.customer_id,
         created_by=str(current_user.email),
     )
 
@@ -1172,6 +2013,7 @@ def list_enterprise_connections(
         organization_id=require_current_organization_id(current_user),
         
     )
+
 @router.get(
     "/connections/{connection_id}",
     response_model=EnterpriseConnectionResponse,
@@ -1201,67 +2043,137 @@ def test_enterprise_connection(
         tested_by=str(current_user.email),
     )
 
-@router.get("/records/search",
+@router.get(
+    "/records/search",
     response_model=RecordSearchResponse,
 )
 async def search_records(
     domain: str,
     q: str,
-    current_user: AuthUser = Depends(get_current_tenant_user),
+    current_user: AuthUser = Depends(
+        get_current_tenant_user
+    ),
 ):
+    organization_id = (
+        require_current_organization_id(
+            current_user
+        )
+    )
 
     rows = record_search_service.search_records(
         domain=domain,
         search_text=q,
-        organization_id=require_current_organization_id(current_user),
+        organization_id=organization_id,
     )
 
     return {
+        "organization_id": organization_id,
         "results": [
             {
+                "organization_id": organization_id,
                 "record_id": row["record_id"],
                 "mdm_id": row["mdm_id"],
                 "domain": row["domain"],
                 "display_name": row["display_name"],
                 "source_system": row["source_system"],
-                "golden_record_flag": row["golden_record_flag"],
+                "golden_record_flag": row[
+                    "golden_record_flag"
+                ],
                 "human_id": row.get("human_id"),
-                "phone_number": row.get("phone_number"),
+                "phone_number": row.get(
+                    "phone_number"
+                ),
                 "record": {
-                    "member_id": row.get("member_id"),
-                    "patient_id": row.get("patient_id"),
-                    "provider_id": row.get("provider_id"),
-                    "supplier_id": row.get("supplier_id"),
-                    "product_id": row.get("product_id"),
+                    "member_id": row.get(
+                        "member_id"
+                    ),
+                    "patient_id": row.get(
+                        "patient_id"
+                    ),
+                    "provider_id": row.get(
+                        "provider_id"
+                    ),
+                    "supplier_id": row.get(
+                        "supplier_id"
+                    ),
+                    "product_id": row.get(
+                        "product_id"
+                    ),
 
                     # Supplier fields
-                    "supplier_name": row.get("supplier_name"),
-                    "supplier_name_line_1": row.get("supplier_name_line_1") or row.get("supplier_name"),
-                    "supplier_name_line_2": row.get("supplier_name_line_2"),
-                    "contact_email": row.get("contact_email") or row.get("email"),
-                    "supplier_address": row.get("supplier_address") or row.get("address"),
+                    "supplier_name": row.get(
+                        "supplier_name"
+                    ),
+                    "supplier_name_line_1": (
+                        row.get(
+                            "supplier_name_line_1"
+                        )
+                        or row.get(
+                            "supplier_name"
+                        )
+                    ),
+                    "supplier_name_line_2": (
+                        row.get(
+                            "supplier_name_line_2"
+                        )
+                    ),
+                    "contact_email": (
+                        row.get(
+                            "contact_email"
+                        )
+                        or row.get("email")
+                    ),
+                    "supplier_address": (
+                        row.get(
+                            "supplier_address"
+                        )
+                        or row.get("address")
+                    ),
 
-                    "first_name": row.get("first_name"),
-                    "last_name": row.get("last_name"),
+                    "first_name": row.get(
+                        "first_name"
+                    ),
+                    "last_name": row.get(
+                        "last_name"
+                    ),
                     "email": row.get("email"),
-                    "address": row.get("address"),
+                    "address": row.get(
+                        "address"
+                    ),
                     "dob": row.get("dob"),
                     "npi": row.get("npi"),
-                    "phone_number": row.get("phone_number"),
-                    "specialty": row.get("specialty"),
-                    "tax_id": row.get("tax_id"),
+                    "phone_number": row.get(
+                        "phone_number"
+                    ),
+                    "specialty": row.get(
+                        "specialty"
+                    ),
+                    "tax_id": row.get(
+                        "tax_id"
+                    ),
                     "gtin": row.get("gtin"),
                     "sku": row.get("sku"),
-                    "product_name": row.get("product_name"),
-                    "product_variant": row.get("product_variant"),
-                    "effective_lot_date": row.get("effective_lot_date"),
-                    "item_category": row.get("item_category"),
-                    "source_system": row.get("source_system"),
-},
-
+                    "product_name": row.get(
+                        "product_name"
+                    ),
+                    "product_variant": row.get(
+                        "product_variant"
+                    ),
+                    "effective_lot_date": (
+                        row.get(
+                            "effective_lot_date"
+                        )
+                    ),
+                    "item_category": row.get(
+                        "item_category"
+                    ),
+                    "source_system": row.get(
+                        "source_system"
+                    ),
+                },
             }
             for row in rows
-        ]
+        ],
     }
 
 @router.get(
@@ -1431,21 +2343,39 @@ def get_policy_config(
 def save_policy_config_draft(
     payload: PolicyDraftRequest,
     current_user: AuthUser = Depends(
-    get_current_tenant_user
-),
+        get_current_tenant_user
+    ),
 ):
     try:
         policy_payload = payload.model_dump()
 
-        policy_payload["created_by"] = current_user.email
-        policy_payload["updated_by"] = current_user.email
+        organization_id = (
+            require_current_organization_id(
+                current_user
+            )
+        )
+
+        entitlement_service.require_domain_entitlement(
+            organization_id=organization_id,
+            domain=payload.domain,
+        )
+
+        policy_payload["created_by"] = (
+            current_user.email
+        )
+        policy_payload["updated_by"] = (
+            current_user.email
+        )
 
         result = policy_engine.save_policy_draft(
             policy_payload,
-            organization_id=require_current_organization_id(current_user),
+            organization_id=organization_id,
         )
 
         return PolicyDraftResponse(**result)
+
+    except HTTPException:
+        raise
 
     except Exception as exc:
         raise HTTPException(
@@ -1463,25 +2393,49 @@ def save_policy_config_draft(
 )
 def publish_policy_config(
     payload: PolicyPublishRequest,
-    current_user: AuthUser = Depends(get_current_tenant_user),
+    current_user: AuthUser = Depends(
+        get_current_tenant_user
+    ),
 ):
     try:
+        organization_id = (
+            require_current_organization_id(
+                current_user
+            )
+        )
+
+        entitlement_service.require_domain_entitlement(
+            organization_id=organization_id,
+            domain=payload.domain,
+        )
+
         result = policy_engine.publish_policy_version(
             domain=payload.domain,
             policy_version=payload.policy_version,
-            organization_id=require_current_organization_id(current_user),
+            organization_id=organization_id,
             published_by=str(current_user.email),
         )
+
         return PolicyPublishResponse(**result)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
+
+    except HTTPException:
+        raise
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=str(exc),
+        ) from exc
+
+    except Exception as exc:
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to publish policy config: {str(e)}",
-        )
-
-
+            detail=(
+                "Failed to publish policy config: "
+                f"{str(exc)}"
+            ),
+        ) from exc
+    
 def build_ai_insight_prompt(
     domain: str,
     ai_decision: str,
@@ -1518,15 +2472,34 @@ Requirements:
 """.strip()
 
 
-def generate_text_insight(llm: LLMService, prompt: str) -> str | None:
-    """Generate a plain-text insight with whichever LLM method is available."""
+def generate_text_insight(
+    llm: LLMService,
+    prompt: str,
+    *,
+    organization_id: str,
+) -> str | None:
+    """
+    Generate a tenant-scoped plain-text insight
+    with whichever LLM method is available.
+    """
     try:
         if hasattr(llm, "ask"):
-            value = llm.ask(prompt)
+            value = llm.ask(
+                prompt,
+                organization_id=organization_id,
+            )
+
         elif hasattr(llm, "generate_text"):
-            value = llm.generate_text(prompt)
+            value = llm.generate_text(
+                prompt,
+                organization_id=organization_id,
+            )
+
         else:
-            value = llm.generate_explanation(prompt)
+            value = llm.generate_explanation(
+                prompt,
+                organization_id=organization_id,
+            )
 
         if isinstance(value, str):
             cleaned = value.strip()
@@ -1542,13 +2515,42 @@ def generate_text_insight(llm: LLMService, prompt: str) -> str | None:
                 "content",
             ):
                 candidate = value.get(key)
-                if isinstance(candidate, str) and candidate.strip():
+
+                if (
+                    isinstance(candidate, str)
+                    and candidate.strip()
+                ):
                     return candidate.strip()
 
         return None
+
     except Exception as e:
-        print(f"AI insight generation failed: {e}")
+        print(
+            f"AI insight generation failed: {e}"
+        )
         return None
+    
+@router.get("/entitlements/domains")
+def get_enabled_domains(
+    current_user: AuthUser = Depends(
+        get_current_tenant_user
+    ),
+):
+    organization_id = (
+        require_current_organization_id(
+            current_user
+        )
+    )
+
+    enabled_domains = (
+        entitlement_service.list_enabled_domains(
+            organization_id=organization_id,
+        )
+    )
+
+    return {
+        "enabled_domains": enabled_domains,
+    }
 
 @router.post("/match/explain")
 async def match_explain(
@@ -1558,7 +2560,7 @@ async def match_explain(
     provider: str = Query(DEFAULT_LLM_PROVIDER, pattern="^(gemini|claude)$"),
 ):
 
-    try:  
+    try: 
         user_agent = request.headers.get("User-Agent")
         integration_source = request.headers.get("X-Integration-Source")
 
@@ -1895,17 +2897,17 @@ async def match_explain(
                         },
                     )
         
-                policy_recommended_action = str(
+        policy_recommended_action = str(
                     policy_rec.get("recommendation") or ""
                 ).strip().upper()
-                final_recommended_action = (
+        final_recommended_action = (
                     policy_recommended_action
                     if policy_recommended_action in VALID_DECISIONS
                     else ai_payload["recommended_action"]
                 )
 
       
-                insight_prompt = build_ai_insight_prompt(
+        insight_prompt = build_ai_insight_prompt(
                     domain=domain,
                     ai_decision=ai_payload["ai_decision"],
                     recommended_action=final_recommended_action,
@@ -1919,26 +2921,13 @@ async def match_explain(
                     ),
                     signal_contributions=entity_resolution.get("signal_contributions"),
                 )
-        ai_insight = generate_text_insight(llm, insight_prompt)
-
-
-        print("===== FINAL SCORE DEBUG =====")
-        print("match_score:", entity_resolution.get("match_score"))
-        print(
-            "decision_confidence_score:",
-            entity_resolution.get("decision_confidence_score"),
-        )
-        print(
-            "automation_readiness_score:",
-            entity_resolution.get("automation_readiness_score"),
-        )
-        print(
-            "automation_policy_status:",
-            entity_resolution.get("automation_policy_status"),
-        )
-        print("=============================")
-        print(req.record_a.item_category)
-        print(req.record_b.item_category)
+        ai_insight = generate_text_insight(
+                    llm,
+                    insight_prompt,
+                    organization_id=require_current_organization_id(
+                        current_user
+    ),
+)
 
         response_obj = MatchExplainResponse(
             explanation_id=explanation_id,
@@ -2072,6 +3061,35 @@ async def match_explain(
             organization_id=require_current_organization_id(current_user),
         )
 
+                # ---------------------------------------------------
+        # Tenant-aware Record Search Index Upsert
+        # ---------------------------------------------------
+        try:
+                record_search_repository.upsert_record(
+                    organization_id=organization_id,
+                    domain=domain,
+                    record=req.record_a.model_dump(),
+                    created_by=current_user.email,
+                    record_origin="MANUAL_ENTRY",
+                )
+
+                record_search_repository.upsert_record(
+                    organization_id=organization_id,
+                    domain=domain,
+                    record=req.record_b.model_dump(),
+                    created_by=current_user.email,
+                    record_origin="MANUAL_ENTRY",
+                )
+
+        except Exception as index_error:
+            logger.exception(
+                "Record search index upsert failed. "
+                "organization_id=%s explanation_id=%s error=%s",
+                organization_id,
+                explanation_id,
+                index_error,
+            )
+
         return JSONResponse(content=jsonable_encoder(response_obj))
 
     except HTTPException:
@@ -2126,11 +3144,13 @@ def match_feedback(req: MatchFeedbackRequest, current_user: AuthUser = Depends(g
         request_id = ensure_request_id(req.request_id)
         decision_id = f"dec_{uuid.uuid4().hex[:12]}"
         submitted_at = utc_now_iso()
+        organization_id = require_current_organization_id(current_user)
 
+        
         recommended_action = metrics.get_recommended_action(
-            req.explanation_id,
-            organization_id=require_current_organization_id(current_user),
-        )
+                req.explanation_id,
+                organization_id=organization_id,
+            )
 
         if recommended_action is None:
             raise HTTPException(status_code=404, detail="explanation_id not found")
@@ -2139,10 +3159,10 @@ def match_feedback(req: MatchFeedbackRequest, current_user: AuthUser = Depends(g
 
         row = bq.log_feedback_event(
             explanation_id=req.explanation_id,
+            organization_id=organization_id,
             steward_decision=req.steward_decision,
             steward_user=current_user.email,
             steward_override_flag=override_flag,
-            organization_id=require_current_organization_id(current_user),
             request_id=request_id,
             decision_id=decision_id,
             domain=req.domain,
@@ -2153,6 +3173,7 @@ def match_feedback(req: MatchFeedbackRequest, current_user: AuthUser = Depends(g
         )
 
         payload = MatchFeedbackResponse(
+            organization_id=organization_id,
             decision_id=decision_id,
             explanation_id=req.explanation_id,
             status="RECORDED",

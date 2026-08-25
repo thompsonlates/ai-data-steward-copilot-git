@@ -13,6 +13,7 @@ class BigQueryMetrics:
         explain_table: Optional[str] = None,
         feedback_table: Optional[str] = None,
         dq_dashboard_view: Optional[str] = None,
+        dq_ai_recommendations_table: Optional[str] = None,
     ):
         self.project_id = (
             project_id
@@ -41,6 +42,11 @@ class BigQueryMetrics:
             or os.getenv("BQ_DQ_DASHBOARD_VIEW")
             or "DQ_INTELLIGENCE_DASHBOARD_VW"
         )
+        self.dq_ai_recommendations_table = (
+            dq_ai_recommendations_table
+            or os.getenv("BQ_DQ_AI_RECOMMENDATIONS_TABLE")
+            or "DQ_AI_RECOMMENDATIONS"
+        )
 
         self.client = bigquery.Client(project=self.project_id)
         self.explain_table_id = (
@@ -51,6 +57,10 @@ class BigQueryMetrics:
         )
         self.dq_dashboard_view_id = (
             f"{self.project_id}.{self.dataset}.{self.dq_dashboard_view}"
+        )
+        self.dq_ai_recommendations_table_id = (
+            f"{self.project_id}.{self.dataset}."
+            f"{self.dq_ai_recommendations_table}"
         )
 
         self._table_columns_cache: Dict[str, set[str]] = {}
@@ -123,6 +133,136 @@ class BigQueryMetrics:
             return f"TIMESTAMP({alias}.submitted_at)"
 
         return "CURRENT_TIMESTAMP()"
+
+    def get_dq_ai_rule_suggestions(
+        self,
+        days: int = 30,
+        domain: Optional[str] = None,
+        limit: int = 25,
+        *,
+        organization_id: str,
+    ) -> List[Dict[str, Any]]:
+        organization_id = self._require_organization_id(
+            organization_id
+        )
+
+        normalized_domain = (
+            str(domain).strip().upper()
+            if domain
+            else None
+        )
+
+        safe_limit = max(
+            1,
+            min(int(limit), 100),
+        )
+
+        query = f"""
+            SELECT
+            organization_id,
+            created_at,
+            profile_run_id,
+            recommendation_id,
+            domain,
+            record_id,
+            rule_id,
+            field_name,
+            dimension,
+            severity,
+            priority,
+            status,
+            COALESCE(finding_count, 0) AS finding_count,
+            COALESCE(affected_record_count, 0) AS affected_record_count,
+            COALESCE(affected_percent, 0.0) AS affected_percent,
+            recommendation_title,
+            recommendation_summary,
+            business_impact,
+            reasoning_summary,
+            suggested_action,
+            suggested_rule_type,
+            suggested_sql,
+            suggested_regex,
+            current_threshold,
+            suggested_threshold,
+            automation_recommendation,
+            automation_confidence,
+            steward_approval_required,
+            confidence_score,
+            ai_provider,
+            ai_model
+            FROM `{self.dq_ai_recommendations_table_id}`
+            WHERE organization_id = @organization_id
+            AND recommendation_id IS NOT NULL
+            AND created_at >= TIMESTAMP_SUB(
+                CURRENT_TIMESTAMP(),
+                INTERVAL @days DAY
+            )
+            AND (
+                @domain IS NULL
+                OR domain = @domain
+            )
+            ORDER BY
+            created_at DESC,
+            recommendation_id DESC
+            LIMIT @limit
+            """
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter(
+                    "organization_id",
+                    "STRING",
+                    organization_id,
+                ),
+                bigquery.ScalarQueryParameter(
+                    "days",
+                    "INT64",
+                    days,
+                ),
+                bigquery.ScalarQueryParameter(
+                    "domain",
+                    "STRING",
+                    normalized_domain,
+                ),
+                bigquery.ScalarQueryParameter(
+                    "limit",
+                    "INT64",
+                    safe_limit,
+                ),
+            ]
+        )
+
+        rows = self.client.query(
+            query,
+            job_config=job_config,
+        ).result()
+
+        suggestions: List[Dict[str, Any]] = []
+
+        for row in rows:
+            item = dict(row.items())
+
+            returned_organization_id = str(
+                item.get("organization_id") or ""
+            ).strip()
+
+            if returned_organization_id != organization_id:
+                raise RuntimeError(
+                    "DQ AI recommendation query returned data "
+                    "for a different organization."
+                )
+
+            created_at = item.get("created_at")
+            if created_at is not None:
+                item["created_at"] = created_at.isoformat()
+
+            for key, value in list(item.items()):
+                if hasattr(value, "item"):
+                    item[key] = value.item()
+
+            suggestions.append(item)
+
+        return suggestions
 
     def get_dq_dashboard_overview(
       self,
@@ -282,15 +422,270 @@ class BigQueryMetrics:
 
       latest = rows[0] if rows else None
 
+      ai_rule_suggestions = self.get_dq_ai_rule_suggestions(
+          days=days,
+          domain=domain,
+          limit=25,
+          organization_id=organization_id,
+      )
+
       return {
           "days": days,
           "domain": domain,
           "rows": rows,
           "latest": latest,
+          "ai_rule_suggestions": ai_rule_suggestions,
           "generated_at": (
               datetime.now(timezone.utc).isoformat()
           ),
       }
+
+
+    def get_ai_recommendation_feedback_metrics(
+            self,
+            *,
+            organization_id: str,
+            days: int = 30,
+            recommendation_type: Optional[str] = None,
+        ) -> Dict[str, Any]:
+            """
+            Aggregate steward feedback for AI-generated DQ and Governance
+            recommendations.
+
+            Tenant isolation is enforced by organization_id.
+
+            Metrics are calculated from the latest steward decision for each
+            recommendation_id so repeated feedback does not double-count a
+            recommendation.
+            """
+
+            organization_id = self._require_organization_id(
+                organization_id
+            )
+
+            normalized_type = (
+                str(recommendation_type).strip().upper()
+                if recommendation_type
+                else None
+            )
+
+            if normalized_type not in (None, "DQ", "GOVERNANCE"):
+                raise ValueError(
+                    "recommendation_type must be DQ or GOVERNANCE"
+                )
+
+            feedback_table_id = (
+                f"{self.project_id}.{self.dataset}."
+                f"{os.getenv('BQ_AI_RECOMMENDATION_FEEDBACK_TABLE', 'AI_RECOMMENDATION_FEEDBACK')}"
+            )
+
+            query = f"""
+            WITH scoped_feedback AS (
+            SELECT
+                organization_id,
+                feedback_id,
+                recommendation_id,
+                recommendation_type,
+                profile_run_id,
+                domain,
+                rule_id,
+                ai_recommendation,
+                ai_confidence,
+                UPPER(TRIM(steward_decision)) AS steward_decision,
+                steward_comment,
+                override_reason,
+                source_component,
+                submitted_at
+            FROM `{feedback_table_id}`
+            WHERE organization_id = @organization_id
+                AND submitted_at >= TIMESTAMP_SUB(
+                CURRENT_TIMESTAMP(),
+                INTERVAL @days DAY
+                )
+                AND (
+                @recommendation_type IS NULL
+                OR UPPER(recommendation_type) = @recommendation_type
+                )
+            ),
+
+            latest_feedback AS (
+            SELECT * EXCEPT(row_num)
+            FROM (
+                SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY
+                    organization_id,
+                    recommendation_id
+                    ORDER BY submitted_at DESC
+                ) AS row_num
+                FROM scoped_feedback
+            )
+            WHERE row_num = 1
+            )
+
+            SELECT
+            COUNT(*) AS total_feedback,
+
+            COUNTIF(
+                steward_decision = 'APPROVE'
+            ) AS approved_count,
+
+            COUNTIF(
+                steward_decision = 'REJECT'
+            ) AS rejected_count,
+
+            COUNTIF(
+                steward_decision = 'MODIFY'
+            ) AS modified_count,
+
+            COUNTIF(
+                steward_decision = 'DEFER'
+            ) AS deferred_count,
+
+            SAFE_DIVIDE(
+                COUNTIF(steward_decision = 'APPROVE'),
+                NULLIF(COUNT(*), 0)
+            ) AS acceptance_rate,
+
+            SAFE_DIVIDE(
+                COUNTIF(
+                steward_decision IN ('REJECT', 'MODIFY')
+                ),
+                NULLIF(COUNT(*), 0)
+            ) AS override_rate,
+
+            SAFE_DIVIDE(
+                COUNTIF(steward_decision = 'DEFER'),
+                NULLIF(COUNT(*), 0)
+            ) AS defer_rate,
+
+            AVG(ai_confidence) AS avg_ai_confidence,
+
+            AVG(
+                CASE
+                WHEN steward_decision = 'APPROVE'
+                THEN ai_confidence
+                ELSE NULL
+                END
+            ) AS avg_approved_ai_confidence,
+
+            AVG(
+                CASE
+                WHEN steward_decision IN ('REJECT', 'MODIFY')
+                THEN ai_confidence
+                ELSE NULL
+                END
+            ) AS avg_override_ai_confidence,
+
+            COUNTIF(
+                recommendation_type = 'DQ'
+            ) AS dq_feedback_count,
+
+            COUNTIF(
+                recommendation_type = 'GOVERNANCE'
+            ) AS governance_feedback_count,
+
+            MAX(submitted_at) AS latest_feedback_at
+
+            FROM latest_feedback
+            """
+
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter(
+                        "organization_id",
+                        "STRING",
+                        organization_id,
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "days",
+                        "INT64",
+                        days,
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "recommendation_type",
+                        "STRING",
+                        normalized_type,
+                    ),
+                ]
+            )
+
+            rows = list(
+                self.client.query(
+                    query,
+                    job_config=job_config,
+                ).result()
+            )
+
+            row = dict(rows[0].items()) if rows else {}
+
+            def i0(value: Any) -> int:
+                return int(value or 0)
+
+            def f_or_none(value: Any) -> Optional[float]:
+                return (
+                    float(value)
+                    if value is not None
+                    else None
+                )
+
+            latest_feedback_at = row.get(
+                "latest_feedback_at"
+            )
+
+            return {
+                "total_feedback": i0(
+                    row.get("total_feedback")
+                ),
+                "approved_count": i0(
+                    row.get("approved_count")
+                ),
+                "rejected_count": i0(
+                    row.get("rejected_count")
+                ),
+                "modified_count": i0(
+                    row.get("modified_count")
+                ),
+                "deferred_count": i0(
+                    row.get("deferred_count")
+                ),
+                "acceptance_rate": f_or_none(
+                    row.get("acceptance_rate")
+                ),
+                "override_rate": f_or_none(
+                    row.get("override_rate")
+                ),
+                "defer_rate": f_or_none(
+                    row.get("defer_rate")
+                ),
+                "avg_ai_confidence": f_or_none(
+                    row.get("avg_ai_confidence")
+                ),
+                "avg_approved_ai_confidence": f_or_none(
+                    row.get(
+                        "avg_approved_ai_confidence"
+                    )
+                ),
+                "avg_override_ai_confidence": f_or_none(
+                    row.get(
+                        "avg_override_ai_confidence"
+                    )
+                ),
+                "dq_feedback_count": i0(
+                    row.get("dq_feedback_count")
+                ),
+                "governance_feedback_count": i0(
+                    row.get(
+                        "governance_feedback_count"
+                    )
+                ),
+                "latest_feedback_at": (
+                    latest_feedback_at.isoformat()
+                    if latest_feedback_at
+                    else None
+                ),
+            }
 
     def overview(
         self,

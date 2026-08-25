@@ -8,6 +8,10 @@ from typing import Any, Dict, List
 
 from app.services.llm_service import LLMService
 
+from app.repositories.governance_ai_recommendation_repository import (
+    GovernanceAiRecommendationRepository,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -558,10 +562,14 @@ def build_governance_ai_recommendation(
         )
     )
 
+    # --------------------------------------------------
+    # 1. Build the recommendation
+    # --------------------------------------------------
+
     if not context.get(
         "recommendation_required"
     ):
-        return {
+        recommendation = {
             "headline": (
                 "Continue governance monitoring"
             ),
@@ -586,36 +594,104 @@ def build_governance_ai_recommendation(
             "confidence": 0.90,
         }
 
-    try:
-        prompt = (
-            build_governance_recommendation_prompt(
-                context,
-                organization_id=(
-                    effective_organization_id
-                ),
+    else:
+        try:
+            prompt = (
+                build_governance_recommendation_prompt(
+                    context,
+                    organization_id=(
+                        effective_organization_id
+                    ),
+                )
             )
-        )
 
-        return (
-            generate_structured_governance_recommendation(
-                prompt,
-                organization_id=(
-                    effective_organization_id
-                ),
-                provider=provider,
+            recommendation = (
+                generate_structured_governance_recommendation(
+                    prompt,
+                    organization_id=(
+                        effective_organization_id
+                    ),
+                    provider=provider,
+                )
             )
-        )
 
-    except Exception:
-        return (
-            fallback_governance_recommendation(
-                context,
-                organization_id=(
-                    effective_organization_id
-                ),
+        except Exception:
+            recommendation = (
+                fallback_governance_recommendation(
+                    context,
+                    organization_id=(
+                        effective_organization_id
+                    ),
+                )
             )
-        )
 
+    # --------------------------------------------------
+    # 2. Persist / reuse Governance recommendation
+    # --------------------------------------------------
+
+    repository = (
+        GovernanceAiRecommendationRepository()
+    )
+
+    persisted = repository.get_or_create_recommendation(
+        organization_id=effective_organization_id,
+        dataset_id=str(
+            dataset_row.get("dataset_id")
+            or ""
+        ),
+        dataset_name=str(
+            dataset_row.get("dataset_name")
+            or ""
+        ),
+        domain=(
+            str(dataset_row.get("domain"))
+            if dataset_row.get("domain")
+            is not None
+            else None
+        ),
+        headline=str(
+            recommendation.get("headline")
+            or ""
+        ),
+        summary=str(
+            recommendation.get("summary")
+            or ""
+        ),
+        priority=str(
+            recommendation.get("priority")
+            or "MEDIUM"
+        ),
+        recommended_actions=(
+            recommendation.get(
+                "recommended_actions"
+            )
+            or []
+        ),
+        supporting_evidence=(
+            recommendation.get(
+                "supporting_evidence"
+            )
+            or []
+        ),
+        confidence=(
+            float(
+                recommendation.get(
+                    "confidence"
+                )
+            )
+            if recommendation.get(
+                "confidence"
+            )
+            is not None
+            else None
+        ),
+    )
+
+    recommendation[
+        "recommendation_id"
+    ] = persisted["recommendation_id"]
+
+    return recommendation
 
 def fallback_governance_recommendation(
     context: Dict[str, Any],

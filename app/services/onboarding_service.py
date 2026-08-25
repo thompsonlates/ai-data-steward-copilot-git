@@ -11,6 +11,10 @@ from app.api.auth import AuthUser
 from app.api.schemas import OrganizationOnboardingRequest
 from app.repositories.onboarding_repository import OnboardingRepository
 
+from app.services.entitlement_service import (
+    EntitlementService,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +32,12 @@ class OnboardingService:
     def __init__(
         self,
         repository: OnboardingRepository,
+        entitlement_service: EntitlementService,
+        email_service: Any | None = None,
     ) -> None:
         self.repository = repository
+        self.entitlement_service = entitlement_service
+        self.email_service = email_service
 
     @staticmethod
     def _require_organization_id(
@@ -290,7 +298,13 @@ class OnboardingService:
                 or email
             ),
             "role": "OWNER",
-            "auth_provider": "GOOGLE",
+            "auth_provider": (
+            str(current_user.auth_provider 
+                or "GOOGLE")
+
+            .strip()
+            .upper()
+),
             "last_login": now,
             "is_active": True,
             "created_at": now,
@@ -308,39 +322,72 @@ class OnboardingService:
                 user_record
             )
 
-            saved_subscription = self.start_trial(
-                organization_id=organization_id,
+            commercial_tenant = (
+                self.repository.provision_commercial_tenant(
+                    customer_id=customer_id,
+                    organization_id=organization_id,
+                    organization_name=organization_name,
+                    organization_slug=None,
+                    user_id=user_id,
+                    owner_email=email,
+                    display_name=(
+                        self._clean_optional_string(
+                            current_user.name
+                        )
+                        or email
+                    ),
+                    plan_code=self.TRIAL_PLAN,
+                    trial_started_at=now,
+                    trial_ends_at=trial_end,
+                    seat_limit=self.TRIAL_MAX_USERS,
+                    connection_limit=self.TRIAL_MAX_CONNECTIONS,
+                    monthly_explanation_limit=(
+                        self.TRIAL_MAX_MONTHLY_EXPLANATIONS
+                    ),
+                    monthly_dq_analysis_limit=None,
+                    created_by=email,
+                )
             )
 
-            # Provision the commercial SaaS tenant records used by
-            # authentication, billing, connections, and customer membership.
-            # The same customer_id / organization_id / user_id are persisted
-            # together so subsequent JWTs can carry authoritative tenant
-            # context.
-            self.repository.provision_commercial_tenant(
-                customer_id=customer_id,
+            selected_domain = str(
+                request.enabled_domains[0]
+            ).strip().upper()
+
+            self.entitlement_service.grant_domain_entitlement(
                 organization_id=organization_id,
-                organization_name=organization_name,
-                organization_slug=None,
-                user_id=user_id,
-                owner_email=email,
-                display_name=(
-                    self._clean_optional_string(
-                        current_user.name
-                    )
-                    or email
-                ),
-                plan_code=self.TRIAL_PLAN,
-                trial_started_at=now,
-                trial_ends_at=trial_end,
-                seat_limit=self.TRIAL_MAX_USERS,
-                connection_limit=self.TRIAL_MAX_CONNECTIONS,
-                monthly_explanation_limit=(
-                    self.TRIAL_MAX_MONTHLY_EXPLANATIONS
-                ),
-                monthly_dq_analysis_limit=None,
-                created_by=email,
+                domain=selected_domain,
+                granted_by=email,
             )
+
+            # Email delivery must never turn a successful onboarding
+            # into a failed onboarding response.
+            if self.email_service is not None:
+                try:
+                    self.email_service.send_welcome_email(
+                        to_email=email,
+                        recipient_name=(
+                            self._clean_optional_string(
+                                current_user.name
+                            )
+                            or email
+                        ),
+                        organization_name=organization_name,
+                        plan_code=self.TRIAL_PLAN,
+                        trial_end_date=trial_end,
+                        enabled_domain=selected_domain,
+                        max_connections=(
+                            self.TRIAL_MAX_CONNECTIONS
+                        ),
+                        max_monthly_explanations=(
+                            self.TRIAL_MAX_MONTHLY_EXPLANATIONS
+                        ),
+                    )
+                except Exception as email_exc:
+                    logger.exception(
+                        "Welcome email failed after successful "
+                        "onboarding: %s",
+                        type(email_exc).__name__,
+                    )
 
         except HTTPException:
             raise
@@ -371,29 +418,17 @@ class OnboardingService:
             "user_id": saved_user["user_id"],
             "email": saved_user["email"],
             "role": saved_user["role"],
-            "subscription_id": saved_subscription[
-                "subscription_id"
+            "subscription_id": commercial_tenant[
+                "subscription_record_id"
             ],
-            "subscription_plan": saved_subscription[
-                "plan_name"
-            ],
-            "subscription_status": saved_subscription[
-                "billing_status"
-            ],
+            "subscription_plan": self.TRIAL_PLAN,
+            "subscription_status": "TRIALING",
             "trial_start_date": now.isoformat(),
-            "trial_end_date": self._timestamp_to_iso(
-                saved_subscription.get("trial_end_date")
-            ),
-            "max_users": saved_subscription.get(
-                "max_users"
-            ),
-            "max_connections": saved_subscription.get(
-                "max_connections"
-            ),
+            "trial_end_date": trial_end.isoformat(),
+            "max_users": self.TRIAL_MAX_USERS,
+            "max_connections": self.TRIAL_MAX_CONNECTIONS,
             "max_monthly_explanations": (
-                saved_subscription.get(
-                    "max_monthly_explanations"
-                )
+                self.TRIAL_MAX_MONTHLY_EXPLANATIONS
             ),
             "onboarding_complete": True,
             "current_step": "COMPLETE",

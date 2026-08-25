@@ -7,6 +7,8 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 
 
+
+
 AuthenticationType = Literal[
     "PAT",
     "API_KEY",
@@ -179,6 +181,11 @@ class OrganizationOnboardingRequest(BaseModel):
     timezone: str = "America/New_York"
     company_size: str | None = None
 
+    enabled_domains: list[str] = Field(
+    min_length=1,
+    max_length=1,
+    )
+
 
 class OrganizationOnboardingResponse(TenantScopedResponseModel):
     organization_name: str
@@ -201,6 +208,46 @@ class OrganizationOnboardingResponse(TenantScopedResponseModel):
     onboarding_complete: bool
     current_step: str
 
+class CustomConnectionRequestCreate(BaseModel):
+    vendor_name: str = Field(
+        min_length=2,
+        max_length=100,
+    )
+    connection_type: str = Field(
+        min_length=2,
+        max_length=50,
+    )
+    environment: str = Field(
+        min_length=2,
+        max_length=50,
+    )
+    auth_preference: str | None = Field(
+        default=None,
+        max_length=100,
+    )
+    read_data_required: bool = False
+    metadata_required: bool = False
+    use_case: str | None = Field(
+        default=None,
+        max_length=2000,
+    )
+
+
+class CustomConnectionRequestResponse(BaseModel):
+    request_id: str
+    organization_id: str
+    customer_id: str
+    requested_by: str
+    vendor_name: str
+    connection_type: str
+    environment: str
+    auth_preference: str | None = None
+    read_data_required: bool
+    metadata_required: bool
+    use_case: str | None = None
+    contact_email: str
+    request_status: str
+    created_at: datetime
 
 class EnterpriseConnectionListResponse(TenantScopedResponseModel):
     items: list[EnterpriseConnectionResponse]
@@ -317,6 +364,118 @@ class EnterpriseConnectionCreate(BaseModel):
 
     tags: list[str] = Field(default_factory=list)
 
+class GoogleSheetsConnectionTestRequest(BaseModel):
+    spreadsheet_url: str
+
+
+class GoogleSheetsPreviewRequest(BaseModel):
+    spreadsheet_url: str
+    sheet_name: str
+    header_row: int = 1
+    preview_limit: int = 10
+
+
+class GoogleSheetsColumnMapping(BaseModel):
+    source_column: str
+    target_field: str
+
+
+class GoogleSheetsProfileRequest(BaseModel):
+    spreadsheet_url: str
+    sheet_name: str
+    domain: str
+    header_row: int = 1
+    business_key_field: str
+    column_mappings: list[GoogleSheetsColumnMapping]
+
+
+class GoogleSheetsConnectionTestResponse(BaseModel):
+    success: bool
+    spreadsheet_id: str
+    spreadsheet_title: str | None = None
+    sheets: list[dict[str, Any]] = []
+
+
+class GoogleSheetsPreviewResponse(BaseModel):
+    headers: list[str]
+    rows: list[dict[str, Any]]
+    row_count: int
+
+class DqAiRuleSuggestionResponse(BaseModel):
+    organization_id: str
+    created_at: str
+    profile_run_id: Optional[str] = None
+    recommendation_id: str
+    domain: str
+    record_id: Optional[str] = None
+    rule_id: str
+    field_name: Optional[str] = None
+    dimension: Optional[str] = None
+    severity: Optional[str] = None
+    priority: Optional[str] = None
+    status: Optional[str] = None
+    finding_count: int = 0
+    affected_record_count: int = 0
+    affected_percent: float = 0.0
+    recommendation_title: Optional[str] = None
+    recommendation_summary: Optional[str] = None
+    business_impact: Optional[str] = None
+    reasoning_summary: Optional[str] = None
+    suggested_action: Optional[str] = None
+    suggested_rule_type: Optional[str] = None
+    suggested_sql: Optional[str] = None
+    suggested_regex: Optional[str] = None
+    current_threshold: Optional[float] = None
+    suggested_threshold: Optional[float] = None
+    automation_recommendation: Optional[str] = None
+    automation_confidence: Optional[float] = None
+    steward_approval_required: Optional[bool] = None
+    confidence_score: Optional[float] = None
+    ai_provider: Optional[str] = None
+    ai_model: Optional[str] = None
+
+
+class DqDashboardResponse(BaseModel):
+    days: int
+    domain: Optional[str] = None
+    rows: List[dict] = Field(default_factory=list)
+    latest: Optional[dict] = None
+    ai_rule_suggestions: List[DqAiRuleSuggestionResponse] = Field(
+        default_factory=list
+    )
+    generated_at: str
+
+
+class AiRecommendationFeedbackRequest(BaseModel):
+    recommendation_id: str = Field(
+        min_length=1
+    )
+
+    recommendation_type: Literal[
+        "DQ",
+        "GOVERNANCE",
+    ]
+
+    profile_run_id: Optional[str] = None
+    domain: Optional[str] = None
+    rule_id: Optional[str] = None
+
+    ai_recommendation: Optional[str] = None
+    ai_confidence: Optional[float] = None
+
+    steward_decision: Literal[
+        "APPROVE",
+        "REJECT",
+        "MODIFY",
+        "DEFER",
+    ]
+
+    steward_comment: Optional[str] = None
+    override_reason: Optional[str] = None
+
+    source_component: Optional[str] = None
+
+
 
 class EnterpriseConnectionUpdate(BaseModel):
     connection_name: str | None = None
@@ -373,6 +532,7 @@ class MemberRecord(FlexibleBaseModel):
     last_name: Optional[str] = None
     dob: Optional[str] = None
     email: Optional[str] = None
+    phone_number: Optional[str] = None
     address: Optional[str] = None
 
     # Provider fields
@@ -406,6 +566,17 @@ class MemberRecord(FlexibleBaseModel):
     pack_size: Optional[str] = None
     product_description: Optional[str] = None
 
+    # Banking fields
+    account_id: Optional[str] = None
+    banking_customer_id: Optional[str] = None
+    sap_business_partner_id: Optional[str] = None
+    account_type: Optional[str] = None
+    routing_number: Optional[str] = None
+    account_number_last4: Optional[str] = None
+    institution_name: Optional[str] = None
+    currency: Optional[str] = None
+    account_status: Optional[str] = None
+
     # Source / audit fields
     source_system: Optional[str] = None
     source_id: Optional[str] = None
@@ -434,6 +605,50 @@ class ColumnMappingConfig(BaseModel):
     phone_column: Optional[str] = Field(None, description="Phone column")
     dob_column: Optional[str] = Field(None, description="Date of birth column")
     source_system_column: Optional[str] = Field(None, description="Source system column")
+    account_id_column: Optional[str] = Field(
+        None,
+        description="Banking account identifier column",
+    )
+
+    banking_customer_id_column: Optional[str] = Field(
+        None,
+        description="Banking customer identifier column",
+    )
+
+    sap_business_partner_id_column: Optional[str] = Field(
+        None,
+        description="SAP Business Partner identifier column",
+    )
+
+    account_type_column: Optional[str] = Field(
+        None,
+        description="Bank account type column",
+    )
+
+    routing_number_column: Optional[str] = Field(
+        None,
+        description="Bank routing / ABA number column",
+    )
+
+    account_number_last4_column: Optional[str] = Field(
+        None,
+        description="Last four digits of the bank account number",
+    )
+
+    institution_name_column: Optional[str] = Field(
+        None,
+        description="Financial institution name column",
+    )
+
+    currency_column: Optional[str] = Field(
+        None,
+        description="Account currency column",
+    )
+
+    account_status_column: Optional[str] = Field(
+        None,
+        description="Bank account status column",
+    )
     additional_columns: List[str] = Field(
         default_factory=list,
         description="Additional attributes to include in analysis",
@@ -1179,12 +1394,37 @@ class GovernancePolicyActivity(TenantScopedResponseModel):
     changed_at: Optional[datetime] = None
     publish_status: Optional[str] = None
 
+class AiRecommendationFeedbackMetrics(BaseModel):
+    total_feedback: int = 0
+
+    approved_count: int = 0
+    rejected_count: int = 0
+    modified_count: int = 0
+    deferred_count: int = 0
+
+    acceptance_rate: Optional[float] = None
+    override_rate: Optional[float] = None
+    defer_rate: Optional[float] = None
+
+    avg_ai_confidence: Optional[float] = None
+    avg_approved_ai_confidence: Optional[float] = None
+    avg_override_ai_confidence: Optional[float] = None
+
+    dq_feedback_count: int = 0
+    governance_feedback_count: int = 0
+
+    latest_feedback_at: Optional[str] = None
+
 
 class GovernanceOverviewResponse(TenantScopedResponseModel):
     kpis: GovernanceKPI
     dataset_statuses: List[GovernanceDatasetStatus]
     top_blockers: List[GovernanceBlocker]
     policy_activity: List[GovernancePolicyActivity]
+
+    ai_feedback_metrics: AiRecommendationFeedbackMetrics = Field(
+        default_factory=AiRecommendationFeedbackMetrics
+    )
 
 
 # -------------------------------------------------------------------
@@ -1396,6 +1636,11 @@ class DqDashboardResponse(TenantScopedResponseModel):
     domain: Optional[str] = None
     rows: List[DqDashboardRow]
     latest: Optional[DqDashboardRow] = None
+
+    ai_rule_suggestions: List[
+        DqAiRuleSuggestionResponse
+    ] = Field(default_factory=list)
+
     generated_at: Optional[str] = None
 
 
@@ -1487,4 +1732,37 @@ class DqRuleSuggestionsResponse(TenantScopedResponseModel):
     ai_rule_suggestions: DqRuleSuggestions
 
     generated_at: datetime
+
+class CsvPreviewResponse(TenantScopedResponseModel):
+    file_name: str
+    columns: List[str]
+    rows: List[Dict[str, Any]] = Field(
+        default_factory=list
+    )
+
+    total_preview_rows: int = 0
+
+    delimiter: str
+    encoding: str
+
+
+class CsvProfileResponse(TenantScopedResponseModel):
+    profile_run_id: str
+
+    file_name: str
+    domain: str
+
+    record_count: int
+
+    total_records: int
+    avg_record_score: Optional[float] = None
+
+    records_below_threshold: int = 0
+    records_with_findings: int = 0
+    total_findings: int = 0
+    duplicate_record_count: int = 0
+
+    source_type: str = "CSV"
+
+    generated_at: Optional[datetime] = None
     

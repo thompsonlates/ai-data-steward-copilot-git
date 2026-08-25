@@ -32,6 +32,20 @@ CLAUDE_MODEL = os.getenv(
     "claude-sonnet-4-6",
 )
 
+CLAUDE_MAX_TOKENS = int(
+    os.getenv(
+        "CLAUDE_MAX_TOKENS",
+        "6000",
+    )
+)
+
+GEMINI_MAX_OUTPUT_TOKENS = int(
+    os.getenv(
+        "GEMINI_MAX_OUTPUT_TOKENS",
+        "6000",
+    )
+)
+
 
 class LLMProvider:
     def ask(
@@ -165,7 +179,7 @@ class GeminiProvider(LLMProvider):
             prompt,
             generation_config={
                 "temperature": 0.15,
-                "max_output_tokens": 2000,
+                "max_output_tokens": 6000,
             },
         )
 
@@ -227,7 +241,7 @@ class ClaudeProvider(LLMProvider):
     ) -> str:
         response = self.client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=2000,
+             max_tokens=CLAUDE_MAX_TOKENS,
             temperature=0.15,
             messages=[
                 {
