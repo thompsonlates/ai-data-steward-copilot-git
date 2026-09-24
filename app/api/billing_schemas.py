@@ -5,9 +5,6 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
-from pydantic import BaseModel
-
-
 
 SubscriptionStatus = Literal[
     "TRIALING",
@@ -26,6 +23,7 @@ PaymentStatus = Literal[
     "FAILED",
     "REFUNDED",
 ]
+
 
 class CheckoutSessionRequest(BaseModel):
     plan_code: str
@@ -103,6 +101,11 @@ class BillingStatusResponse(BaseModel):
     connection_limit: int | None = None
     monthly_explanation_limit: int | None = None
     monthly_dq_analysis_limit: int | None = None
+
+    steward_intelligence_enabled: bool = False
+    governed_regex_execution_enabled: bool = False
+    governed_sql_execution_enabled: bool = False
+    policy_auto_execution_enabled: bool = False
 
     is_current: bool
 

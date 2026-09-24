@@ -51,6 +51,107 @@ class EntitlementRepository:
             f"{self.dataset_id}."
             "CUSTOMER_SUBSCRIPTIONS"
         )
+        
+    def get_current_subscription_for_organization(
+        self,
+        *,
+        organization_id: str,
+    ) -> dict[str, Any] | None:
+        effective_organization_id = (
+            self._require_organization_id(
+                organization_id
+            )
+        )
+
+        query = f"""
+        SELECT
+            subscription_record_id,
+            customer_id,
+            organization_id,
+            subscription_status,
+            plan_code,
+            billing_interval,
+            trial_started_at,
+            trial_ends_at,
+            trial_converted_at,
+            trial_expired_at,
+            subscription_started_at,
+            current_period_started_at,
+            current_period_ends_at,
+            cancel_at_period_end,
+            canceled_at,
+            ended_at,
+            stripe_customer_id,
+            stripe_subscription_id,
+            stripe_price_id,
+            stripe_product_id,
+            payment_status,
+            last_payment_at,
+            next_payment_at,
+            payment_failure_at,
+            payment_failure_reason,
+            seat_limit,
+            connection_limit,
+            monthly_explanation_limit,
+            monthly_dq_analysis_limit,
+            steward_intelligence_enabled,
+            governed_regex_execution_enabled,
+            governed_sql_execution_enabled,
+            policy_auto_execution_enabled,
+            is_current,
+            created_at,
+            updated_at
+        FROM `{self.subscriptions_table}`
+        WHERE organization_id = @organization_id
+        AND is_current = TRUE
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter(
+                    "organization_id",
+                    "STRING",
+                    effective_organization_id,
+                ),
+            ]
+        )
+
+        rows = self.client.query(
+            query,
+            job_config=job_config,
+        ).result()
+
+        row = next(
+            iter(rows),
+            None,
+        )
+
+        if row is None:
+            return None
+
+        result = dict(
+            row.items()
+        )
+
+        returned_organization_id = str(
+            result.get("organization_id")
+            or ""
+        ).strip()
+
+        if (
+            returned_organization_id
+            != effective_organization_id
+        ):
+            raise RuntimeError(
+                "Subscription query returned a "
+                "different organization than the "
+                "authenticated tenant."
+            )
+
+        return result
+
     def get_current_plan_for_organization(
         self,
         *,
@@ -68,10 +169,16 @@ class EntitlementRepository:
         FROM `{self.subscriptions_table}`
         WHERE organization_id = @organization_id
         AND is_current = TRUE
-        AND UPPER(subscription_status) IN (
-            'ACTIVE',
-            'TRIAL',
-            'TRIALING'
+        AND (UPPER(subscription_status) = 'ACTIVE'
+        OR (
+            UPPER(subscription_status) IN (
+                'TRIAL',
+                'TRIALING'
+            )
+            AND trial_ends_at IS NOT NULL
+            AND trial_ends_at > CURRENT_TIMESTAMP()
+            AND trial_expired_at IS NULL
+        )
         )
         AND plan_code IS NOT NULL
         ORDER BY updated_at DESC
@@ -493,7 +600,7 @@ class EntitlementRepository:
                 "PRODUCT",
                 "PROVIDER",
                 "PATIENT",
-                "OTHER",
+                "BANKING",
             }
 
             if normalized not in allowed_domains:

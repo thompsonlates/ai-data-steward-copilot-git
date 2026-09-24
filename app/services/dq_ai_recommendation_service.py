@@ -13,6 +13,7 @@ from app.repositories.quality_profiler_repository import (
 from app.services.llm_service import LLMService
 from app.services.prompt_builder import (
     build_dq_ai_recommendation_prompt,
+    build_dq_remediation_prompt,
 )
 
 
@@ -147,6 +148,13 @@ class DqAiRecommendationService:
             or 0.0
         )
 
+        # Preserve the persisted physical-source -> canonical-field
+        # mapping so deterministic recommendations can carry the exact
+        # source column used by governed execution.
+        column_mappings = self._normalize_column_mappings(
+            profile.get("column_mappings")
+        )
+
         # -----------------------------------------------------
         # 2. Aggregate persisted findings.
         # -----------------------------------------------------
@@ -189,6 +197,7 @@ class DqAiRecommendationService:
                 domain=domain,
                 total_records=total_records,
                 finding_rows=finding_rows,
+                column_mappings=column_mappings,
             )
         )
         analysis_recommendations = (
@@ -231,8 +240,11 @@ class DqAiRecommendationService:
 
         try:
             parsed = self._extract_json_object(
-                raw_response
-            )
+            raw_response
+        )
+
+            parsed["profile_run_id"] = profile_run_id
+            parsed["domain"] = domain
 
             raw_recommendations = parsed.get(
                 "recommendations",
@@ -314,6 +326,15 @@ class DqAiRecommendationService:
             ),
         )
 
+        self.repository.save_ai_recommendations(
+            organization_id=organization_id,
+            profile_run_id=profile_run_id,
+            domain=domain,
+            recommendations=validated["recommendations"],
+            provider=self.provider_name,
+            overall_analysis=validated["overall_analysis"],
+        )
+
         # -----------------------------------------------------
         # 8. Update existing dashboard summary counters.
         # -----------------------------------------------------
@@ -356,6 +377,753 @@ class DqAiRecommendationService:
                 validated["recommendations"]
             ),
         }
+    # ---------------------------------------------------------
+    # Generate implementation-ready remediation
+    # ---------------------------------------------------------
+
+    def generate_remediation(
+        self,
+        *,
+        organization_id: str,
+        recommendation_id: str,
+        source_table: str = "source_table",
+        sql_dialect: str = "BIGQUERY",
+        artifact_preference: str = "AUTO",
+    ) -> Dict[str, Any]:
+        """
+        Generate one implementation-ready remediation artifact for an
+        existing tenant-scoped DQ AI recommendation.
+
+        The LLM proposes the artifact. This service then applies deterministic
+        server-side safety validation before anything is persisted.
+        """
+        organization_id = self._require_organization_id(
+            organization_id
+        )
+
+        recommendation_id = str(
+            recommendation_id or ""
+        ).strip()
+
+        if not recommendation_id:
+            raise ValueError(
+                "recommendation_id is required."
+            )
+
+        source_table = str(
+            source_table or "source_table"
+        ).strip()
+
+        if not source_table:
+            raise ValueError(
+                "source_table is required."
+            )
+
+        sql_dialect = str(
+            sql_dialect or "BIGQUERY"
+        ).strip().upper()
+
+        if sql_dialect not in {
+            "BIGQUERY",
+            "SNOWFLAKE",
+            "DATABRICKS",
+            "GENERIC",
+        }:
+            raise ValueError(
+                "Unsupported SQL dialect."
+            )
+
+        artifact_preference = str(
+            artifact_preference or "AUTO"
+        ).strip().upper()
+
+        if artifact_preference not in {
+            "AUTO",
+            "SQL",
+            "REGEX",
+        }:
+            raise ValueError(
+                "Unsupported artifact_preference."
+            )
+
+        # -----------------------------------------------------
+        # 1. Load existing recommendation tenant-safely.
+        # -----------------------------------------------------
+
+        recommendation = (
+            self.repository.get_ai_recommendation(
+                organization_id=organization_id,
+                recommendation_id=recommendation_id,
+            )
+        )
+
+        if not recommendation:
+            raise ValueError(
+                "DQ AI recommendation was not found "
+                "for this organization."
+            )
+
+        recommendation_org_id = str(
+            recommendation.get("organization_id")
+            or ""
+        ).strip()
+
+        if recommendation_org_id != organization_id:
+            raise ValueError(
+                "DQ AI recommendation belongs to "
+                "a different organization."
+            )
+
+        profile_run_id = str(
+            recommendation.get("profile_run_id")
+            or ""
+        ).strip() or None
+
+        domain = str(
+            recommendation.get("domain")
+            or ""
+        ).strip().upper()
+
+        rule_id = str(
+            recommendation.get("rule_id")
+            or ""
+        ).strip().upper()
+
+        field_name = (
+            str(
+                recommendation.get("field_name")
+                or ""
+            ).strip()
+            or None
+        )
+
+        latest_change_request = None
+        revision_guidance = None
+
+        approval_status = str(
+            recommendation.get(
+                "remediation_approval_status"
+            )
+            or ""
+        ).strip().upper()
+
+        if approval_status == "CHANGES_REQUESTED":
+            latest_change_request = (
+                self.repository
+                .get_latest_remediation_change_request(
+                    organization_id=organization_id,
+                    recommendation_id=recommendation_id,
+                )
+            )
+
+            if latest_change_request:
+                revision_guidance = str(
+                    latest_change_request.get("note")
+                    or ""
+                ).strip()
+
+                if revision_guidance:
+                    logger.info(
+                        "Applying steward remediation revision guidance. "
+                        "organization_id=%s "
+                        "recommendation_id=%s",
+                        organization_id,
+                        recommendation_id,
+                    )
+
+
+        # -----------------------------------------------------
+        # 2. Build tenant-safe remediation prompt.
+        # -----------------------------------------------------
+
+        prompt = build_dq_remediation_prompt(
+            organization_id=organization_id,
+            revision_guidance=revision_guidance,
+            recommendation=recommendation,
+            source_table=source_table,
+            sql_dialect=sql_dialect,
+            artifact_preference=artifact_preference,
+        )
+
+        # -----------------------------------------------------
+        # 3. Generate remediation through configured LLM.
+        # -----------------------------------------------------
+
+        raw_response = (
+            LLMService(
+                provider=self.provider_name
+            ).ask(
+                prompt,
+                organization_id=organization_id,
+            )
+        )
+
+        # -----------------------------------------------------
+        # 4. Parse strict JSON response.
+        # -----------------------------------------------------
+
+        try:
+            parsed = self._extract_json_object(
+                raw_response
+            )
+
+        except Exception:
+            logger.exception(
+                "Failed to parse DQ remediation response. "
+                "organization_id=%s "
+                "recommendation_id=%s "
+                "raw_response_preview=%r",
+                organization_id,
+                recommendation_id,
+                str(raw_response)[:15000],
+            )
+            raise
+
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                "DQ remediation response must be "
+                "a JSON object."
+            )
+
+        # -----------------------------------------------------
+        # 5. Validate recommendation identity.
+        # -----------------------------------------------------
+
+        returned_recommendation_id = str(
+            parsed.get("recommendation_id")
+            or recommendation_id
+        ).strip()
+
+        if (
+            returned_recommendation_id
+            != recommendation_id
+        ):
+            raise ValueError(
+                "Generated remediation returned an "
+                "unexpected recommendation_id."
+            )
+
+        # The prompt intentionally strips tenant identifiers.
+        # If an organization_id is nevertheless returned, it
+        # must match the authenticated tenant.
+        returned_org_id = str(
+            parsed.get("organization_id")
+            or organization_id
+        ).strip()
+
+        if returned_org_id != organization_id:
+            raise ValueError(
+                "Generated remediation belongs to "
+                "a different organization."
+            )
+
+        # -----------------------------------------------------
+        # 6. Normalize artifact contract returned by prompt.
+        # -----------------------------------------------------
+
+        artifact_type = str(
+            parsed.get("artifact_type")
+            or parsed.get("implementation_type")
+            or ""
+        ).strip().upper()
+
+        if artifact_type not in {
+            "SQL",
+            "REGEX",
+            "MANUAL_REVIEW",
+        }:
+            raise ValueError(
+                "Generated remediation contains an "
+                "unsupported artifact_type."
+            )
+
+        # When a steward explicitly requests SQL, the LLM may
+        # return either:
+        #   - SQL: a controlled UPDATE, including regex predicates
+        #     inside the SQL WHERE clause when appropriate, or
+        #   - MANUAL_REVIEW: when no deterministic correction is safe.
+        #
+        # A standalone REGEX artifact is not accepted for an explicit
+        # SQL request because governed execution requires SQL.
+        if (
+            artifact_preference == "SQL"
+            and artifact_type == "REGEX"
+        ):
+            raise ValueError(
+                "SQL remediation was explicitly requested, but "
+                "the generated artifact was standalone REGEX. "
+                "Return SQL with any regex embedded in its WHERE "
+                "clause, or MANUAL_REVIEW when correction is not "
+                "deterministic."
+            )
+
+        if (
+            artifact_preference == "REGEX"
+            and artifact_type == "SQL"
+        ):
+            raise ValueError(
+                "REGEX remediation was explicitly requested, but "
+                "the generated artifact was SQL. "
+                "Return REGEX or MANUAL_REVIEW for this source."
+            )
+
+        remediation_sql = str(
+            parsed.get("remediation_sql")
+            or parsed.get("suggested_sql")
+            or ""
+        ).strip() or None
+
+        remediation_regex = str(
+            parsed.get("remediation_regex")
+            or parsed.get("suggested_regex")
+            or ""
+        ).strip() or None
+
+        reasoning_summary = str(
+            parsed.get("reasoning_summary")
+            or parsed.get("remediation_summary")
+            or parsed.get("recommended_remediation")
+            or recommendation.get(
+                "recommended_remediation"
+            )
+            or recommendation.get(
+                "suggested_action"
+            )
+            or ""
+        ).strip() or None
+
+        # -----------------------------------------------------
+        # 7. Enforce artifact-specific server-side safety.
+        # -----------------------------------------------------
+
+        safety_status = "REVIEW_REQUIRED"
+        steward_approval_required = True
+
+        if artifact_type == "SQL":
+            if not remediation_sql:
+                raise ValueError(
+                    "SQL remediation must include "
+                    "remediation_sql."
+                )
+
+            if remediation_regex:
+                raise ValueError(
+                    "SQL remediation must not also "
+                    "include remediation_regex."
+                )
+
+            remediation_sql = (
+                self._validate_generated_remediation_sql(
+                    sql=remediation_sql,
+                    source_table=source_table,
+                )
+            )
+
+            safety_status = "REVIEW_REQUIRED"
+
+        elif artifact_type == "REGEX":
+            if not remediation_regex:
+                raise ValueError(
+                    "REGEX remediation must include "
+                    "remediation_regex."
+                )
+
+            if remediation_sql:
+                raise ValueError(
+                    "REGEX remediation must not also "
+                    "include remediation_sql."
+                )
+
+            remediation_regex = (
+                self._validate_generated_remediation_regex(
+                    remediation_regex
+                )
+            )
+
+            # Regex is a validation/standardization artifact.
+            # It still requires steward approval before use.
+            safety_status = "SAFE_DIAGNOSTIC"
+
+        else:
+            # MANUAL_REVIEW intentionally carries no executable
+            # SQL or regex.
+            remediation_sql = None
+            remediation_regex = None
+            safety_status = "REVIEW_REQUIRED"
+
+        # -----------------------------------------------------
+        # 8. GTIN-specific hard safety rules.
+        # -----------------------------------------------------
+
+        if rule_id == "GTIN_CHECKSUM_VALIDITY":
+            # A recomputed check digit does not prove the base
+            # digits are commercially correct. Unless authoritative
+            # base digits are supplied separately, do not emit an
+            # executable correction.
+            if artifact_type == "SQL":
+                logger.warning(
+                    "Blocking executable GTIN checksum remediation. "
+                    "organization_id=%s recommendation_id=%s",
+                    organization_id,
+                    recommendation_id,
+                )
+
+                artifact_type = "MANUAL_REVIEW"
+                remediation_sql = None
+                remediation_regex = None
+                safety_status = "REVIEW_REQUIRED"
+
+                checksum_note = (
+                    "GTIN checksum correction requires authoritative "
+                    "confirmation of the preceding digits; recalculating "
+                    "the final check digit alone does not prove the GTIN "
+                    "is commercially correct."
+                )
+
+                reasoning_summary = (
+                    f"{reasoning_summary} {checksum_note}".strip()
+                    if reasoning_summary
+                    else checksum_note
+                )
+
+        if (
+            domain == "PRODUCT"
+            and (
+                (field_name or "").strip().lower() == "gtin"
+                or rule_id.startswith("GTIN_")
+            )
+            and artifact_type == "SQL"
+        ):
+            # Even deterministic-looking GTIN updates remain a
+            # steward-controlled proposal.
+            steward_approval_required = True
+            safety_status = "REVIEW_REQUIRED"
+
+        # -----------------------------------------------------
+        # 9. Persist immutable remediation version first.
+        # -----------------------------------------------------
+
+        generated_from_feedback_event_id = None
+
+        if (
+            approval_status == "CHANGES_REQUESTED"
+            and latest_change_request
+        ):
+            generated_from_feedback_event_id = str(
+                latest_change_request.get(
+                    "feedback_event_id"
+                )
+                or ""
+            ).strip() or None
+
+        latest_version_number = (
+            self.repository.get_latest_remediation_version_number(
+                organization_id=organization_id,
+                recommendation_id=recommendation_id,
+            )
+        )
+
+        if latest_version_number == 0:
+            generation_reason = "INITIAL_GENERATION"
+        elif approval_status == "CHANGES_REQUESTED":
+            generation_reason = "STEWARD_REVISION"
+        else:
+            generation_reason = "MANUAL_REGENERATION"
+
+        version_result = (
+            self.repository.save_remediation_version(
+                organization_id=organization_id,
+                recommendation_id=recommendation_id,
+                profile_run_id=profile_run_id,
+                artifact_type=artifact_type,
+                remediation_sql=remediation_sql,
+                remediation_regex=remediation_regex,
+                sql_dialect=sql_dialect,
+                safety_status=safety_status,
+                reasoning_summary=reasoning_summary,
+                steward_approval_required=(
+                    steward_approval_required
+                ),
+                generation_reason=generation_reason,
+                generated_from_feedback_event_id=(
+                    generated_from_feedback_event_id
+                ),
+                revision_guidance=revision_guidance,
+                ai_provider=self.provider_name,
+                ai_model=None,
+                generated_by=None,
+            )
+        )
+
+        # -----------------------------------------------------
+        # 10. Update current recommendation state.
+        # -----------------------------------------------------
+
+        self.repository.update_ai_recommendation_remediation(
+            organization_id=organization_id,
+            recommendation_id=recommendation_id,
+            remediation_sql=remediation_sql,
+            remediation_regex=remediation_regex,
+            artifact_type=artifact_type,
+            sql_dialect=sql_dialect,
+            safety_status=safety_status,
+            reasoning_summary=reasoning_summary,
+            steward_approval_required=(
+                steward_approval_required
+            ),
+        )
+
+        # -----------------------------------------------------
+        # 10.4 New version requires a fresh steward decision.
+        # -----------------------------------------------------
+
+        if approval_status == "CHANGES_REQUESTED":
+            self.repository.reset_remediation_approval_for_new_version(
+                organization_id=organization_id,
+                recommendation_id=recommendation_id,
+            )
+
+        logger.info(
+            "DQ remediation generated. "
+            "organization_id=%s "
+            "recommendation_id=%s "
+            "remediation_version_id=%s "
+            "version_number=%s "
+            "artifact_type=%s "
+            "safety_status=%s "
+            "has_sql=%s "
+            "has_regex=%s "
+            "provider=%s",
+            organization_id,
+            recommendation_id,
+            version_result.get(
+                "remediation_version_id"
+            ),
+            version_result.get(
+                "version_number"
+            ),
+            artifact_type,
+            safety_status,
+            bool(remediation_sql),
+            bool(remediation_regex),
+            self.provider_name,
+        )
+
+        # -----------------------------------------------------
+        # 10.5 Return API-ready result.
+        # -----------------------------------------------------
+
+        return {
+            "success": True,
+            "organization_id": organization_id,
+            "recommendation_id":
+                recommendation_id,
+            "profile_run_id":
+                profile_run_id,
+            "domain":
+                domain,
+            "rule_id":
+                rule_id,
+            "field_name":
+                field_name,
+            "remediation_version_id":
+                version_result.get(
+                    "remediation_version_id"
+                ),
+            "version_number":
+                version_result.get(
+                    "version_number"
+                ),
+            "artifact_type":
+                artifact_type,
+            "remediation_sql":
+                remediation_sql,
+            "remediation_regex":
+                remediation_regex,
+            "sql_dialect":
+                sql_dialect,
+            "safety_status":
+                safety_status,
+            "reasoning_summary":
+                reasoning_summary,
+            "steward_approval_required":
+                steward_approval_required,
+        }
+
+    @staticmethod
+    def _validate_generated_remediation_regex(
+        pattern: str,
+    ) -> str:
+        normalized = str(
+            pattern or ""
+        ).strip()
+
+        if not normalized:
+            raise ValueError(
+                "Generated remediation regex is empty."
+            )
+
+        if len(normalized) > 500:
+            raise ValueError(
+                "Generated remediation regex is too long."
+            )
+
+        try:
+            re.compile(normalized)
+        except re.error as exc:
+            raise ValueError(
+                "Generated remediation contains "
+                "an invalid regex."
+            ) from exc
+
+        return normalized
+
+    @staticmethod
+    def _validate_generated_remediation_sql(
+        *,
+        sql: str,
+        source_table: str,
+    ) -> str:
+        """
+        Allow one controlled UPDATE statement only.
+
+        This validator intentionally rejects all other DML/DDL,
+        comments, multi-statement SQL, and UPDATE statements that
+        do not contain a restrictive WHERE clause.
+        """
+        normalized = str(
+            sql or ""
+        ).strip()
+
+        if not normalized:
+            raise ValueError(
+                "Generated remediation SQL is empty."
+            )
+
+        if len(normalized) > 5000:
+            raise ValueError(
+                "Generated remediation SQL is too long."
+            )
+
+        if "--" in normalized or "/*" in normalized:
+            raise ValueError(
+                "Generated remediation SQL must not "
+                "contain comments."
+            )
+
+        # Allow one optional trailing semicolon, but no
+        # additional statements.
+        without_trailing_semicolon = (
+            normalized[:-1].rstrip()
+            if normalized.endswith(";")
+            else normalized
+        )
+
+        if ";" in without_trailing_semicolon:
+            raise ValueError(
+                "Generated remediation SQL must contain "
+                "exactly one statement."
+            )
+
+        upper_sql = without_trailing_semicolon.upper()
+
+        if not upper_sql.startswith("UPDATE "):
+            raise ValueError(
+                "Generated remediation SQL must be "
+                "a controlled UPDATE statement."
+            )
+
+        forbidden = re.compile(
+            r"\b("
+            r"DELETE|DROP|TRUNCATE|MERGE|ALTER|"
+            r"CREATE|INSERT|GRANT|REVOKE|CALL|"
+            r"EXECUTE"
+            r")\b",
+            flags=re.IGNORECASE,
+        )
+
+        if forbidden.search(
+            without_trailing_semicolon
+        ):
+            raise ValueError(
+                "Generated remediation SQL contains "
+                "a forbidden operation."
+            )
+
+        where_match = re.search(
+            r"\bWHERE\b",
+            without_trailing_semicolon,
+            flags=re.IGNORECASE,
+        )
+
+        if not where_match:
+            raise ValueError(
+                "Generated remediation UPDATE must "
+                "contain a WHERE clause."
+            )
+
+        where_clause = (
+            without_trailing_semicolon[
+                where_match.end():
+            ]
+            .strip()
+        )
+
+        if not where_clause:
+            raise ValueError(
+                "Generated remediation UPDATE has "
+                "an empty WHERE clause."
+            )
+
+        normalized_where = re.sub(
+            r"\s+",
+            "",
+            where_clause,
+        ).upper()
+
+        if normalized_where in {
+            "TRUE",
+            "1=1",
+            "(1=1)",
+        }:
+            raise ValueError(
+                "Generated remediation UPDATE WHERE "
+                "clause is not restrictive."
+            )
+
+        # Basic table-target guard. It deliberately avoids
+        # attempting to be a full SQL parser.
+        expected_table = str(
+            source_table or ""
+        ).strip()
+
+        if (
+            expected_table
+            and expected_table != "source_table"
+        ):
+            update_target_match = re.match(
+                r"^\s*UPDATE\s+(`[^`]+`|\"[^\"]+\"|[^\s]+)",
+                without_trailing_semicolon,
+                flags=re.IGNORECASE,
+            )
+
+            if update_target_match:
+                actual_target = (
+                    update_target_match
+                    .group(1)
+                    .strip("`\"")
+                )
+
+                if actual_target != expected_table.strip("`\""):
+                    raise ValueError(
+                        "Generated remediation SQL targets "
+                        "an unexpected source table."
+                    )
+
+        return (
+            without_trailing_semicolon
+            + ";"
+        )
 
     # ---------------------------------------------------------
     # Deterministic candidate fixes
@@ -369,6 +1137,7 @@ class DqAiRecommendationService:
         domain: str,
         total_records: int,
         finding_rows: List[Dict[str, Any]],
+        column_mappings: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
         recommendations: List[
             Dict[str, Any]
@@ -386,6 +1155,20 @@ class DqAiRecommendationService:
                     or ""
                 ).strip()
                 or None
+            )
+
+            source_column = (
+                self._source_column_for_target(
+                    column_mappings,
+                    field_name,
+                )
+                or (
+                    str(
+                        row.get("source_column")
+                        or ""
+                    ).strip()
+                    or None
+                )
             )
 
             dimension = str(
@@ -436,6 +1219,19 @@ class DqAiRecommendationService:
                 )
             )
 
+        evidence_samples: List[Dict[str, Any]] = []
+
+        if field_name:
+            evidence_samples = (
+                self.repository.get_finding_evidence(
+                    organization_id=organization_id,
+                    profile_run_id=profile_run_id,
+                    rule_id=rule_id,
+                    field_name=field_name,
+                    limit=5,
+                )
+            )
+
             recommendations.append(
                 {
                     "organization_id":
@@ -450,6 +1246,8 @@ class DqAiRecommendationService:
                         rule_id,
                     "field_name":
                         field_name,
+                    "source_column":
+                        source_column,
                     "dimension":
                         dimension,
                     "severity":
@@ -460,6 +1258,8 @@ class DqAiRecommendationService:
                         affected_record_count,
                     "affected_percent":
                         affected_percent,
+                    "evidence_samples":
+                        evidence_samples,
                     **candidate,
                 }
             )
@@ -732,6 +1532,104 @@ class DqAiRecommendationService:
 
         except json.JSONDecodeError:
             pass
+
+                # -----------------------------------------------------
+        # 4. Repair invalid JSON escapes and retry
+        # -----------------------------------------------------
+        #
+        # LLM responses occasionally contain regex notation such
+        # as \s, \S, \d, \(, or \) inside a JSON string without
+        # escaping the backslash for JSON.
+        #
+        # Only repair invalid escapes while inside quoted JSON
+        # strings. Preserve valid JSON escapes, including:
+        # \", \\, \/, \b, \f, \n, \r, \t, and \uXXXX.
+        #
+        # This retry occurs only after normal JSON parsing failed,
+        # so already-valid responses are never modified.
+
+        def repair_invalid_json_escapes(
+            json_text: str,
+        ) -> str:
+            repaired: List[str] = []
+            in_string = False
+            index = 0
+
+            valid_json_escapes = {
+                '"',
+                "\\",
+                "/",
+                "b",
+                "f",
+                "n",
+                "r",
+                "t",
+                "u",
+            }
+
+            while index < len(json_text):
+                char = json_text[index]
+
+                if char == '"':
+                    # A quote is escaped only when preceded by an
+                    # odd number of consecutive backslashes.
+                    backslash_count = 0
+                    previous_index = index - 1
+
+                    while (
+                        previous_index >= 0
+                        and json_text[previous_index] == "\\"
+                    ):
+                        backslash_count += 1
+                        previous_index -= 1
+
+                    if backslash_count % 2 == 0:
+                        in_string = not in_string
+
+                    repaired.append(char)
+                    index += 1
+                    continue
+
+                if (
+                    in_string
+                    and char == "\\"
+                    and index + 1 < len(json_text)
+                ):
+                    next_char = json_text[index + 1]
+
+                    if next_char not in valid_json_escapes:
+                        # Convert an invalid JSON escape such as
+                        # \s into the valid JSON representation \\s.
+                        repaired.append("\\")
+                        repaired.append("\\")
+                        repaired.append(next_char)
+                        index += 2
+                        continue
+
+                repaired.append(char)
+                index += 1
+
+            return "".join(repaired)
+
+        repaired_cleaned = repair_invalid_json_escapes(
+            cleaned
+        )
+
+        if repaired_cleaned != cleaned:
+            try:
+                value = json.loads(
+                    repaired_cleaned
+                )
+
+                if isinstance(value, dict):
+                    return value
+
+            except json.JSONDecodeError:
+                # Continue through balanced-object extraction so
+                # explanatory text around JSON remains supported.
+                pass
+
+        cleaned = repaired_cleaned
 
         # -----------------------------------------------------
         # 4. Extract balanced JSON object candidates
@@ -1119,6 +2017,10 @@ class DqAiRecommendationService:
                         rule_id,
                     "field_name":
                         field_name,
+                    "source_column":
+                        deterministic.get(
+                            "source_column"
+                        ),
                     "dimension":
                         dimension,
                     "severity":
@@ -1137,6 +2039,11 @@ class DqAiRecommendationService:
                         deterministic.get(
                             "affected_percent",
                             0.0,
+                        ),
+                    "evidence_samples":
+                        deterministic.get(
+                            "evidence_samples",
+                            [],
                         ),
                     "recommendation_title":
                         self._safe_text(
@@ -1301,6 +2208,82 @@ class DqAiRecommendationService:
     # ---------------------------------------------------------
     # Helpers
     # ---------------------------------------------------------
+
+    @staticmethod
+    def _normalize_column_mappings(
+        value: Any,
+    ) -> List[Dict[str, Any]]:
+        """
+        Normalize persisted column mappings into a predictable list.
+
+        BigQuery JSON values may arrive as a native list or as a JSON
+        string depending on the retrieval/serialization path.
+        """
+        if isinstance(value, list):
+            return [
+                item
+                for item in value
+                if isinstance(item, dict)
+            ]
+
+        if isinstance(value, str):
+            raw = value.strip()
+
+            if not raw:
+                return []
+
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                return []
+
+            if isinstance(parsed, list):
+                return [
+                    item
+                    for item in parsed
+                    if isinstance(item, dict)
+                ]
+
+        return []
+
+    @staticmethod
+    def _source_column_for_target(
+        column_mappings: Any,
+        target_field: str | None,
+    ) -> str | None:
+        """
+        Resolve the physical source column for a canonical target field.
+
+        The persisted mapping is treated as authoritative metadata.
+        Claude is never allowed to invent or override this value.
+        """
+        normalized_target = str(
+            target_field or ""
+        ).strip().lower()
+
+        if not normalized_target:
+            return None
+
+        for mapping in column_mappings or []:
+            if not isinstance(mapping, dict):
+                continue
+
+            mapped_target = str(
+                mapping.get("target_field")
+                or ""
+            ).strip().lower()
+
+            if mapped_target != normalized_target:
+                continue
+
+            source_column = str(
+                mapping.get("source_column")
+                or ""
+            ).strip()
+
+            return source_column or None
+
+        return None
 
     @staticmethod
     def _require_organization_id(

@@ -1,11 +1,7 @@
 from __future__ import annotations
-
 from datetime import date, datetime
 from typing import Any, Dict, List, Literal, Optional
-
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
-
-
 
 
 
@@ -23,6 +19,8 @@ AuthenticationType = Literal[
     "KEY_PAIR_JWT",
     "ACCESS_TOKEN",
     "GOOGLE_OAUTH",
+    "CONNECTION_STRING",
+    "MICROSOFT_OAUTH",
 ]
 
 # -------------------------------------------------------------------
@@ -41,54 +39,6 @@ AddressValidationStatus = str
 PostalMatchLevel = str
 OverrideReasonCode = str
 
-
-class TenantScopedResponseModel(BaseModel):
-    model_config = ConfigDict(
-        extra="ignore",
-        str_strip_whitespace=True,
-    )
-
-    organization_id: str
-
-    @field_validator("organization_id")
-    @classmethod
-    def validate_organization_id(
-        cls,
-        value: str,
-    ) -> str:
-        normalized = value.strip()
-
-        if not normalized:
-            raise ValueError(
-                "organization_id is required."
-            )
-
-        if not normalized.startswith("org_"):
-            raise ValueError(
-                "organization_id must use the org_ identifier standard."
-            )
-
-        return normalized
-
-
-#-----------------------------------
-# Search result models
-# These models represent the structure of search results returned by the API.
-# They include fields for record identifiers, domain, display name, source system, and golden record flag.
-#-------------------------------------
-
-class RecordSearchResult(TenantScopedResponseModel):
-    record_id: str
-    mdm_id: str | None = None
-    domain: str
-    display_name: str | None = None
-    source_system: str | None = None
-    golden_record_flag: bool | None = None
-    phone_number: str | None = None
-    record: dict | None = None  # Optional full record data for advanced use cases
-
-class RecordSearchResponse(TenantScopedResponseModel):
-    results: list[RecordSearchResult]
 
 # -------------------------------------------------------------------
 # Base reusable models
@@ -130,6 +80,25 @@ class TenantScopedResponseModel(BaseModel):
             )
 
         return normalized
+
+# -------------------------------------------------------------------
+# Search result models
+# -------------------------------------------------------------------
+
+class RecordSearchResult(TenantScopedResponseModel):
+    record_id: str
+    mdm_id: str | None = None
+    domain: str
+    display_name: str | None = None
+    source_system: str | None = None
+    golden_record_flag: bool | None = None
+    phone_number: str | None = None
+    record: dict[str, Any] | None = None
+
+
+class RecordSearchResponse(TenantScopedResponseModel):
+    results: list[RecordSearchResult]
+
 
 class OnboardingStatusResponse(BaseModel):
     user_exists: bool
@@ -182,9 +151,56 @@ class OrganizationOnboardingRequest(BaseModel):
     company_size: str | None = None
 
     enabled_domains: list[str] = Field(
-    min_length=1,
-    max_length=1,
+        min_length=1,
+        max_length=1,
     )
+
+class OneDriveOAuthStartRequest(BaseModel):
+    connection_id: str = Field(min_length=1)
+    return_url: str = Field(min_length=1)
+
+
+class OneDriveColumnMapping(BaseModel):
+    source_column: str
+    target_field: str
+
+
+class OneDriveConnectionTestRequest(BaseModel):
+    connection_id: str = Field(min_length=1)
+    workbook_url: str
+
+
+class OneDriveConnectionTestResponse(BaseModel):
+    success: bool
+    drive_id: str
+    item_id: str
+    workbook_name: str | None = None
+    sheets: list[dict[str, Any]] = []
+
+
+class OneDrivePreviewRequest(BaseModel):
+    connection_id: str = Field(min_length=1)
+    workbook_url: str
+    sheet_name: str
+    header_row: int = 1
+    preview_limit: int = 10
+
+
+class OneDrivePreviewResponse(BaseModel):
+    headers: list[str]
+    rows: list[dict[str, Any]]
+    row_count: int
+
+
+class OneDriveProfileRequest(BaseModel):
+    connection_id: str = Field(min_length=1)
+    workbook_url: str
+    sheet_name: str
+    domain: str
+    header_row: int = 1
+    business_key_field: str
+    column_mappings: list[OneDriveColumnMapping]
+
 
 
 class OrganizationOnboardingResponse(TenantScopedResponseModel):
@@ -270,10 +286,15 @@ class ConnectionDetailsInput(BaseModel):
         serialization_alias="schema",
     )
     warehouse: str | None = None
+    warehouse_id: str | None = None
     role: str | None = None
 
     catalog: str | None = None
+    project_id: str | None = None
+    dataset_id: str | None = None
+    table_name: str | None = None
     host: str | None = None
+    server: str | None = None
     port: int | None = Field(default=None, ge=1, le=65535)
 
 
@@ -364,29 +385,11 @@ class EnterpriseConnectionCreate(BaseModel):
 
     tags: list[str] = Field(default_factory=list)
 
-class GoogleSheetsConnectionTestRequest(BaseModel):
-    spreadsheet_url: str
-
-
-class GoogleSheetsPreviewRequest(BaseModel):
-    spreadsheet_url: str
-    sheet_name: str
-    header_row: int = 1
-    preview_limit: int = 10
 
 
 class GoogleSheetsColumnMapping(BaseModel):
     source_column: str
     target_field: str
-
-
-class GoogleSheetsProfileRequest(BaseModel):
-    spreadsheet_url: str
-    sheet_name: str
-    domain: str
-    header_row: int = 1
-    business_key_field: str
-    column_mappings: list[GoogleSheetsColumnMapping]
 
 
 class GoogleSheetsConnectionTestResponse(BaseModel):
@@ -400,6 +403,8 @@ class GoogleSheetsPreviewResponse(BaseModel):
     headers: list[str]
     rows: list[dict[str, Any]]
     row_count: int
+
+
 
 class DqAiRuleSuggestionResponse(BaseModel):
     organization_id: str
@@ -433,6 +438,445 @@ class DqAiRuleSuggestionResponse(BaseModel):
     confidence_score: Optional[float] = None
     ai_provider: Optional[str] = None
     ai_model: Optional[str] = None
+
+class DqRemediationGenerateRequest(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        str_strip_whitespace=True,
+    )
+
+    recommendation_id: str = Field(
+        min_length=1,
+    )
+    profile_run_id: Optional[str] = None
+    connection_id: Optional[str] = None
+    source_table: str = Field(
+        default="source_table",
+        min_length=1,
+    )
+    sql_dialect: Literal[
+        "BIGQUERY",
+        "SNOWFLAKE",
+        "DATABRICKS",
+        "GENERIC",
+    ] = "BIGQUERY"
+
+    # AUTO allows the remediation service to select the safest
+    # supported artifact for the recommendation.
+    #
+    # SQL explicitly requests a controlled SQL remediation artifact.
+    #
+    # REGEX explicitly requests a governed deterministic REGEX
+    # remediation artifact. If a safe REGEX artifact cannot be
+    # generated for the rule, the service must return MANUAL_REVIEW
+    # rather than silently substituting SQL.
+    artifact_preference: Literal[
+        "AUTO",
+        "SQL",
+        "REGEX",
+    ] = "AUTO"
+
+
+class DqRemediationGenerateResponse(
+    TenantScopedResponseModel
+):
+    recommendation_id: str
+    profile_run_id: Optional[str] = None
+
+    domain: str
+    rule_id: str
+    field_name: Optional[str] = None
+    remediation_version_id: str | None = None
+    version_number: int | None = None
+
+    artifact_type: Literal[
+        "SQL",
+        "REGEX",
+        "MANUAL_REVIEW",
+    ]
+
+    remediation_sql: Optional[str] = None
+    remediation_regex: Optional[str] = None
+
+    sql_dialect: Literal[
+        "BIGQUERY",
+        "SNOWFLAKE",
+        "DATABRICKS",
+        "GENERIC",
+    ]
+
+    safety_status: Literal[
+        "SAFE_DIAGNOSTIC",
+        "REVIEW_REQUIRED",
+        "BLOCKED",
+    ]
+
+    steward_approval_required: bool = True
+    reasoning_summary: Optional[str] = None
+
+
+class DqRemediationFeedbackRequest(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        str_strip_whitespace=True,
+    )
+
+    decision: Literal[
+        "APPROVE",
+        "REJECT",
+        "REQUEST_CHANGES",
+    ]
+
+    reason_code: Optional[str] = Field(
+        default=None,
+        max_length=100,
+    )
+    note: Optional[str] = Field(
+        default=None,
+        max_length=2000,
+    )
+
+
+class DqRemediationFeedbackResponse(
+    TenantScopedResponseModel
+):
+    feedback_event_id: str
+    recommendation_id: str
+    profile_run_id: Optional[str] = None
+
+    decision: Literal[
+        "APPROVE",
+        "REJECT",
+        "REQUEST_CHANGES",
+    ]
+
+    approval_status: Literal[
+        "APPROVED",
+        "REJECTED",
+        "CHANGES_REQUESTED",
+    ]
+
+    reason_code: Optional[str] = None
+    note: Optional[str] = None
+
+    steward_user: str
+    created_at: datetime
+
+# ============================================================
+# DQ Governed Execution
+# ============================================================
+
+class DqExecutionValidationRequest(BaseModel):
+    """
+    Validate an approved DQ remediation against a selected
+    Enterprise Connection without executing target SQL.
+
+    recommendation_id comes from the route path.
+    organization_id comes from the authenticated user.
+    requested_by comes from the authenticated user.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        str_strip_whitespace=True,
+    )
+
+    profile_run_id: str = Field(
+        min_length=1,
+    )
+
+    connection_id: str = Field(
+        min_length=1,
+    )
+
+    technical_approved_by: str = Field(
+        min_length=1,
+        max_length=320,
+    )
+
+
+class DqRemediationVersionResponse(BaseModel):
+    remediation_version_id: str
+    organization_id: str
+    recommendation_id: str
+    profile_run_id: str | None = None
+    version_number: int
+
+    artifact_type: str | None = None
+    remediation_sql: str | None = None
+    remediation_regex: str | None = None
+    sql_dialect: str | None = None
+
+    safety_status: str | None = None
+    reasoning_summary: str | None = None
+    steward_approval_required: bool | None = None
+    generation_reason: str | None = None
+    generated_from_feedback_event_id: str | None = None
+    revision_guidance: str | None = None
+
+    ai_provider: str | None = None
+    ai_model: str | None = None
+    generated_by: str | None = None
+
+    generated_at: datetime
+    created_at: datetime
+
+class DqRemediationVersionListResponse(BaseModel):
+    recommendation_id: str
+    versions: list[DqRemediationVersionResponse]
+
+class DqApprovedRecommendationResponse(BaseModel):
+    recommendation_id: str
+    organization_id: str
+    profile_run_id: str | None = None
+    domain: str | None = None
+    rule_id: str | None = None
+    field_name: str | None = None
+    dimension: str | None = None
+    severity: str | None = None
+
+    recommendation_title: str | None = None
+    recommendation_summary: str | None = None
+    suggested_action: str | None = None
+    suggested_rule_type: str | None = None
+    suggested_sql: str | None = None
+    suggested_regex: str | None = None
+
+    automation_recommendation: str | None = None
+    automation_confidence: float | None = None
+
+    # Remediation fields
+    remediation_sql: str | None = None
+    remediation_regex: str | None = None
+    remediation_sql_dialect: str | None = None
+    remediation_reasoning_summary: str | None = None
+    remediation_generated_at: datetime | None = None
+
+    remediation_approval_note: str | None = None
+
+    remediation_artifact_type: str | None = None
+    remediation_safety_status: str | None = None
+    remediation_approval_status: str | None = None
+    remediation_approved_by: str | None = None
+    remediation_approved_at: datetime | None = None
+
+    # Tenant-bound source target persisted with the profile run.
+    source_type: str | None = None
+    connection_id: str | None = None
+    project_id: str | None = None
+    dataset_id: str | None = None
+    table_id: str | None = None
+    spreadsheet_id: str | None = None
+    drive_id: str | None = None
+    item_id: str | None = None
+    sheet_name: str | None = None
+    header_row: int | None = None
+
+    created_at: datetime | None = None
+
+
+class DqApprovedRecommendationListResponse(BaseModel):
+    organization_id: str
+    count: int
+    recommendations: list[DqApprovedRecommendationResponse]
+
+
+
+class DqExecutionRequest(
+    DqExecutionValidationRequest
+):
+    """
+    Execute an already validated, steward-approved remediation.
+
+    Explicit confirmation is required so an API/UI caller cannot
+    accidentally execute by simply posting the connection details.
+    """
+
+    confirm_execution: Literal[True]
+
+
+class GoogleSheetsDqExecutionRequest(
+    DqExecutionValidationRequest
+):
+    """
+    Execute an exact steward-approved REGEX remediation against a
+    tenant-authorized Google Sheet.
+
+    The recommendation_id is supplied by the route path.
+    organization_id and requested_by are derived from the authenticated user.
+    """
+
+    spreadsheet_id: str = Field(
+        min_length=1,
+    )
+    sheet_name: str = Field(
+        min_length=1,
+        max_length=200,
+    )
+    header_row: int = Field(
+        default=1,
+        ge=1,
+        le=1000,
+    )
+    confirm_execution: Literal[True]
+
+
+class OneDriveDqExecutionRequest(
+    DqExecutionValidationRequest
+):
+    """
+    Execute an exact steward-approved REGEX remediation against an
+    Excel worksheet stored in OneDrive / SharePoint.
+
+    The recommendation_id is supplied by the route path.
+    organization_id and requested_by are derived from the authenticated user.
+    """
+
+    drive_id: str = Field(min_length=1)
+    item_id: str = Field(min_length=1)
+    sheet_name: str = Field(min_length=1, max_length=200)
+    header_row: int = Field(default=1, ge=1, le=1000)
+    confirm_execution: Literal[True]
+
+
+class DqExecutionResponse(
+    TenantScopedResponseModel
+):
+    execution_id: str
+
+    recommendation_id: str
+    profile_run_id: str
+
+    remediation_version_id: Optional[str] = None
+
+    connection_id: str
+
+    vendor: Literal[
+    "DATABRICKS",
+    "SNOWFLAKE",
+    "BIGQUERY",
+    "GOOGLE_BIGQUERY",
+    "GOOGLE",
+    "ONEDRIVE",
+    "MICROSOFT_ONEDRIVE",
+    "SHAREPOINT",
+]
+
+    # existing Google fields
+    spreadsheet_id: Optional[str] = None
+    sheet_name: Optional[str] = None
+
+    # Microsoft Excel / OneDrive
+    drive_id: Optional[str] = None
+    item_id: Optional[str] = None
+    workbook_name: Optional[str] = None
+
+    environment: str
+
+    domain: Optional[str] = None
+
+    artifact_type: Literal[
+        "SQL",
+        "REGEX",
+    ]
+
+    artifact_hash: str
+
+    approval_status: Literal[
+        "APPROVED",
+    ]
+
+    safety_status: str
+
+    sql_dialect: Optional[
+        Literal[
+            "SNOWFLAKE",
+            "DATABRICKS",
+            "BIGQUERY",
+            "GENERIC",
+        ]
+    ] = None
+
+    requested_by: str
+    technical_approved_by: str
+
+    execution_status: Literal[
+        "VALIDATED_NOT_EXECUTED",
+        "SUCCEEDED",
+        "FAILED",
+    ]
+
+    vendor_status: str
+
+    rows_affected: Optional[int] = None
+    rows_evaluated: Optional[int] = None
+    rows_changed: Optional[int] = None
+    rows_skipped: Optional[int] = None
+
+    statement_id: Optional[str] = None
+
+    execution_target: Optional[str] = None
+    rule_id: Optional[str] = None
+    field_name: Optional[str] = None
+
+    reprofile_required: Optional[bool] = None
+    policy_verification_status: Optional[str] = None
+
+    started_at: Optional[datetime] = None
+    executed_at: Optional[datetime] = None
+    validated_at: datetime
+
+    error_message: Optional[str] = None
+
+
+
+class GoogleSheetsConnectionTestRequest(BaseModel):
+    connection_id: str = Field(min_length=1)
+    spreadsheet_url: str
+
+
+class GoogleSheetsPreviewRequest(BaseModel):
+    connection_id: str = Field(min_length=1)
+    spreadsheet_url: str
+    sheet_name: str
+    header_row: int = 1
+    preview_limit: int = 10
+
+
+
+class GoogleSheetsProfileRequest(BaseModel):
+    connection_id: str = Field(min_length=1)
+    spreadsheet_url: str
+    sheet_name: str
+    domain: str
+    header_row: int = 1
+    business_key_field: str
+    column_mappings: list[GoogleSheetsColumnMapping]
+
+class DatabricksPreviewRequest(BaseModel):
+    connection_id: str = Field(min_length=1)
+    preview_limit: int = Field(default=25, ge=1, le=100)
+
+
+class DatabricksProfileRequest(BaseModel):
+    connection_id: str = Field(min_length=1)
+    domain: str
+    business_key_field: str
+    column_mappings: list[GoogleSheetsColumnMapping]
+    row_limit: int = Field(default=100_000, ge=1, le=100_000)
+
+
+class BigQueryPreviewRequest(BaseModel):
+    connection_id: str = Field(min_length=1)
+    preview_limit: int = Field(default=25, ge=1, le=100)
+
+
+class BigQueryProfileRequest(BaseModel):
+    connection_id: str = Field(min_length=1)
+    domain: str
+    business_key_field: str
+    column_mappings: list[GoogleSheetsColumnMapping]
+    row_limit: int = Field(default=100_000, ge=1, le=100_000)
 
 
 class DqDashboardResponse(BaseModel):
@@ -565,6 +1009,25 @@ class MemberRecord(FlexibleBaseModel):
     uom: Optional[str] = None
     pack_size: Optional[str] = None
     product_description: Optional[str] = None
+
+        # Location fields
+    location_id: Optional[str] = None
+    site_id: Optional[str] = None
+    location_code: Optional[str] = None
+    location_name: Optional[str] = None
+    location_type: Optional[str] = None
+    location_address: Optional[str] = None
+    parent_location_id: Optional[str] = None
+
+    # Organization entity fields
+    # NOTE: organization_id is reserved for the ADMS tenant boundary
+    # and must not be reused as a mastered entity identifier.
+    organization_entity_id: Optional[str] = None
+    organization_code: Optional[str] = None
+    organization_name: Optional[str] = None
+    organization_type: Optional[str] = None
+    parent_organization_id: Optional[str] = None
+    organization_status: Optional[str] = None
 
     # Banking fields
     account_id: Optional[str] = None
@@ -1416,6 +1879,107 @@ class AiRecommendationFeedbackMetrics(BaseModel):
     latest_feedback_at: Optional[str] = None
 
 
+class GovernanceDqPolicyRuleResult(BaseModel):
+    dq_rule_id: str
+    authoritative: bool = False
+    required: bool = False
+    severity: Optional[str] = None
+
+    compliance_status: Literal[
+        "MET",
+        "AT_RISK",
+        "NOT_MET",
+        "NOT_EVALUATED",
+    ]
+
+    required_compliance_rate: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=1,
+    )
+    measured_compliance_rate: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=1,
+    )
+
+    execution_status: Optional[str] = None
+
+    evaluated_record_count: int = Field(default=0, ge=0)
+    passed_record_count: int = Field(default=0, ge=0)
+    failed_record_count: int = Field(default=0, ge=0)
+    skipped_record_count: int = Field(default=0, ge=0)
+
+    governed_rule_description: Optional[str] = None
+    diagnostic_rule_ids: List[str] = Field(default_factory=list)
+
+    compliance_evidence_id: Optional[str] = None
+
+    remediation_approval_status: Optional[str] = None
+    remediation_recommendation_id: Optional[str] = None
+    remediation_version_id: Optional[str] = None
+
+    # Governed remediation rollup
+    remediation_status: Optional[
+        Literal[
+            "AUTHORITATIVE_APPROVED",
+            "ALL_DIAGNOSTICS_APPROVED",
+            "PARTIALLY_APPROVED",
+            "PENDING_REVIEW",
+            "NOT_STARTED",
+        ]
+    ] = None
+
+    authoritative_remediation_approval_status: Optional[str] = None
+    authoritative_remediation_recommendation_id: Optional[str] = None
+    authoritative_remediation_version_id: Optional[str] = None
+
+    diagnostic_rule_count: int = Field(default=0, ge=0)
+    diagnostic_recommendation_rule_count: int = Field(default=0, ge=0)
+    approved_diagnostic_rule_count: int = Field(default=0, ge=0)
+
+    approved_diagnostic_rule_ids: List[str] = Field(
+        default_factory=list
+    )
+
+    diagnostic_remediation_states: List[
+        Dict[str, Any]
+    ] = Field(
+        default_factory=list
+    )
+
+    reason: Optional[str] = None
+
+
+class GovernanceDqPolicyComplianceResponse(
+    TenantScopedResponseModel
+):
+    policy_id: Optional[str] = None
+    policy_version: Optional[str] = None
+    domain: str
+    profile_run_id: str
+
+    policy_compliance_status: Literal[
+        "MET",
+        "AT_RISK",
+        "NOT_MET",
+        "NOT_EVALUATED",
+    ]
+
+    mapped_rule_count: int = Field(default=0, ge=0)
+    required_rule_count: int = Field(default=0, ge=0)
+    met_rule_count: int = Field(default=0, ge=0)
+    at_risk_rule_count: int = Field(default=0, ge=0)
+    not_met_rule_count: int = Field(default=0, ge=0)
+    not_evaluated_rule_count: int = Field(default=0, ge=0)
+
+    evaluated_at: Optional[str] = None
+
+    rule_results: List[
+        GovernanceDqPolicyRuleResult
+    ] = Field(default_factory=list)
+
+
 class GovernanceOverviewResponse(TenantScopedResponseModel):
     kpis: GovernanceKPI
     dataset_statuses: List[GovernanceDatasetStatus]
@@ -1546,6 +2110,7 @@ class DqDashboardRow(TenantScopedResponseModel):
     avg_record_score: Optional[float] = None
     records_below_threshold: int
     records_below_threshold_rate: Optional[float] = None
+    profile_run_id: str | None = None
 
     dq_health_score: Optional[float] = None
     dq_risk_score: Optional[float] = None
@@ -1733,6 +2298,112 @@ class DqRuleSuggestionsResponse(TenantScopedResponseModel):
 
     generated_at: datetime
 
+class UniversalSemanticTypeResponse(BaseModel):
+    semantic_type: str
+    confidence: float | None = None
+    source: str | None = None
+    reason: str | None = None
+    requires_review: bool = False
+
+
+class UniversalProfileFindingResponse(BaseModel):
+    rule_id: str
+    rule_version: str | None = None
+    logical_key: str | None = None
+    rule_family: str | None = None
+    evaluator: str | None = None
+    severity: str | None = None
+
+    field_name: str | None = None
+    semantic_type: str | None = None
+
+    source_row_id: str | None = None
+    record_id: str | None = None
+
+    finding_message: str | None = None
+    observed_value: Any | None = None
+    proposed_value: Any | None = None
+
+    deterministic: bool = True
+    remediation_available: bool = False
+    remediation_type: str | None = None
+
+
+class UniversalProfileRulesShadowResponse(BaseModel):
+    mode: str = "SHADOW"
+    authoritative: bool = False
+
+    profile_run_id: str | None = None
+    total_records: int = 0
+
+    resolved_rule_count: int = 0
+    executed_rule_count: int = 0
+    total_findings: int = 0
+
+    semantic_types: dict[
+        str,
+        UniversalSemanticTypeResponse,
+    ] = Field(default_factory=dict)
+
+    findings: list[
+        UniversalProfileFindingResponse
+    ] = Field(default_factory=list)
+
+
+class UniversalProfileResponseMixin(BaseModel):
+    universal_rules_shadow_enabled: bool = False
+    universal_rules_shadow: (
+        UniversalProfileRulesShadowResponse | None
+    ) = None
+
+class GoogleSheetsProfileResponse(
+    TenantScopedResponseModel,
+    UniversalProfileResponseMixin,
+):
+    success: bool = True
+
+    profile_run_id: str
+    domain: str
+
+    total_records: int
+    avg_record_score: float | None = None
+
+    records_below_threshold: int = 0
+    records_with_findings: int = 0
+    total_findings: int = 0
+    duplicate_record_count: int = 0
+
+    spreadsheet_id: str
+    spreadsheet_title: str | None = None
+    sheet_name: str | None = None
+
+    source_type: str = "GOOGLE_SHEETS"
+
+
+class OneDriveProfileResponse(
+    TenantScopedResponseModel,
+    UniversalProfileResponseMixin,
+):
+    success: bool = True
+
+    profile_run_id: str
+    domain: str
+
+    total_records: int
+    avg_record_score: float | None = None
+
+    records_below_threshold: int = 0
+    records_with_findings: int = 0
+    total_findings: int = 0
+    duplicate_record_count: int = 0
+
+    drive_id: str
+    item_id: str
+    workbook_name: str | None = None
+    sheet_name: str | None = None
+
+    source_type: str = "ONEDRIVE_EXCEL"
+
 class CsvPreviewResponse(TenantScopedResponseModel):
     file_name: str
     columns: List[str]
@@ -1746,7 +2417,7 @@ class CsvPreviewResponse(TenantScopedResponseModel):
     encoding: str
 
 
-class CsvProfileResponse(TenantScopedResponseModel):
+class CsvProfileResponse(TenantScopedResponseModel,UniversalProfileResponseMixin):
     profile_run_id: str
 
     file_name: str
@@ -1765,4 +2436,3 @@ class CsvProfileResponse(TenantScopedResponseModel):
     source_type: str = "CSV"
 
     generated_at: Optional[datetime] = None
-    

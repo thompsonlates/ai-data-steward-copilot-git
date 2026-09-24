@@ -333,6 +333,7 @@ class ConnectionRepository:
             api_endpoint,
             workspace_name,
             authentication_type,
+            credential_reference,
             connection_capabilities,
             health_status,
             is_active,
@@ -589,6 +590,96 @@ class ConnectionRepository:
         if query_job.num_dml_affected_rows != 1:
             raise RuntimeError(
                 "Google OAuth completed, but the "
+                "enterprise connection record was not "
+                "updated for the authenticated organization. "
+                f"connection_id={effective_connection_id}, "
+                f"organization_id={effective_organization_id}, "
+                f"created_by={normalized_created_by}, "
+                "rows_updated="
+                f"{query_job.num_dml_affected_rows}"
+            )
+
+    def complete_microsoft_oauth_connection(
+        self,
+        *,
+        connection_id: str,
+        organization_id: str,
+        created_by: str,
+        credential_reference: str,
+        updated_at: datetime,
+    ) -> None:
+        effective_connection_id = (
+            self._require_connection_id(
+                connection_id
+            )
+        )
+        effective_organization_id = (
+            self._require_organization_id(
+                organization_id
+            )
+        )
+        normalized_created_by = str(
+            created_by or ""
+        ).strip().lower()
+
+        if not normalized_created_by:
+            raise ValueError(
+                "created_by is required for Microsoft OAuth "
+                "connection completion."
+            )
+
+        sql = f"""
+        UPDATE `{self.registry_table}`
+        SET
+            authentication_type = 'MICROSOFT_OAUTH',
+            credential_reference = @credential_reference,
+            health_status = 'HEALTHY',
+            is_active = TRUE,
+            updated_at = @updated_at
+        WHERE connection_id = @connection_id
+          AND organization_id = @organization_id
+          AND LOWER(created_by) = @created_by
+        """
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter(
+                    "connection_id",
+                    "STRING",
+                    effective_connection_id,
+                ),
+                bigquery.ScalarQueryParameter(
+                    "organization_id",
+                    "STRING",
+                    effective_organization_id,
+                ),
+                bigquery.ScalarQueryParameter(
+                    "created_by",
+                    "STRING",
+                    normalized_created_by,
+                ),
+                bigquery.ScalarQueryParameter(
+                    "credential_reference",
+                    "STRING",
+                    credential_reference,
+                ),
+                bigquery.ScalarQueryParameter(
+                    "updated_at",
+                    "TIMESTAMP",
+                    updated_at,
+                ),
+            ]
+        )
+
+        query_job = self.client.query(
+            sql,
+            job_config=job_config,
+        )
+        query_job.result()
+
+        if query_job.num_dml_affected_rows != 1:
+            raise RuntimeError(
+                "Microsoft OAuth completed, but the "
                 "enterprise connection record was not "
                 "updated for the authenticated organization. "
                 f"connection_id={effective_connection_id}, "

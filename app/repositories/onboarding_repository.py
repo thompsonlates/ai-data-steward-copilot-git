@@ -140,6 +140,249 @@ class OnboardingRepository:
 
         return normalized
 
+    def get_onboarding_status_context(
+        self,
+        *,
+        email: str,
+        organization_id: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Load the complete onboarding status context in one BigQuery job.
+
+        This replaces three sequential reads used by the returning-user
+        onboarding status flow while preserving authenticated tenant isolation.
+        """
+        normalized_email = self._require_email(email)
+
+        query_parameters: list[
+            bigquery.ScalarQueryParameter
+        ] = [
+            bigquery.ScalarQueryParameter(
+                "email",
+                "STRING",
+                normalized_email,
+            ),
+        ]
+
+        user_tenant_filter = ""
+        customer_tenant_filter = ""
+
+        if organization_id is not None:
+            effective_organization_id = (
+                self._require_organization_id(
+                    organization_id
+                )
+            )
+
+            user_tenant_filter = (
+                "AND organization_id = @organization_id"
+            )
+
+            customer_tenant_filter = (
+                "AND customer.organization_id = "
+                "@organization_id"
+            )
+
+            query_parameters.append(
+                bigquery.ScalarQueryParameter(
+                    "organization_id",
+                    "STRING",
+                    effective_organization_id,
+                )
+            )
+
+        query = f"""
+        WITH user_match AS (
+            SELECT
+                user_id,
+                organization_id,
+                email,
+                role,
+                updated_at,
+                created_at
+            FROM `{self.ai_users_table}`
+            WHERE LOWER(email) = @email
+              AND is_active = TRUE
+              {user_tenant_filter}
+            ORDER BY
+                updated_at DESC,
+                created_at DESC
+            LIMIT 1
+        ),
+
+        organization_match AS (
+            SELECT
+                customer.customer_id,
+                customer.organization_id,
+                customer.organization_name,
+                customer.organization_slug,
+                customer.owner_user_id AS owner_user_id,
+                customer.owner_email,
+                customer.customer_status,
+                customer.default_plan_code,
+                customer.onboarding_status,
+                customer.updated_at,
+                customer.created_at,
+                ai_user.role AS organization_user_role
+            FROM `{self.customers_table}` AS customer
+            LEFT JOIN `{self.ai_users_table}` AS ai_user
+              ON ai_user.organization_id =
+                 customer.organization_id
+             AND LOWER(ai_user.email) = @email
+             AND ai_user.is_active = TRUE
+            WHERE customer.is_active = TRUE
+              AND (
+                    LOWER(customer.owner_email) = @email
+                    OR ai_user.email IS NOT NULL
+              )
+              {customer_tenant_filter}
+            ORDER BY
+                customer.updated_at DESC,
+                customer.created_at DESC
+            LIMIT 1
+        ),
+
+        subscription_match AS (
+            SELECT
+                subscription_record_id,
+                customer_id,
+                organization_id,
+                subscription_status,
+                plan_code,
+                trial_ends_at,
+                current_period_ends_at,
+                seat_limit,
+                connection_limit,
+                monthly_explanation_limit,
+                updated_at,
+                created_at
+            FROM `{self.customer_subscriptions_table}`
+            WHERE organization_id = (
+                SELECT organization_id
+                FROM organization_match
+                LIMIT 1
+            )
+              AND is_current = TRUE
+              AND UPPER(subscription_status) IN (
+                  'ACTIVE',
+                  'TRIAL',
+                  'TRIALING'
+              )
+            ORDER BY
+                updated_at DESC,
+                created_at DESC
+            LIMIT 1
+        )
+
+        SELECT
+            EXISTS(
+                SELECT 1
+                FROM user_match
+            ) AS user_exists,
+
+            EXISTS(
+                SELECT 1
+                FROM organization_match
+            ) AS organization_exists,
+
+            EXISTS(
+                SELECT 1
+                FROM subscription_match
+            ) AS subscription_exists,
+
+            (
+                SELECT organization_id
+                FROM organization_match
+                LIMIT 1
+            ) AS organization_id,
+
+            (
+                SELECT organization_name
+                FROM organization_match
+                LIMIT 1
+            ) AS organization_name,
+
+            COALESCE(
+                (
+                    SELECT organization_user_role
+                    FROM organization_match
+                    LIMIT 1
+                ),
+                (
+                    SELECT role
+                    FROM user_match
+                    LIMIT 1
+                )
+            ) AS user_role,
+
+            (
+                SELECT plan_code
+                FROM subscription_match
+                LIMIT 1
+            ) AS subscription_plan,
+
+            (
+                SELECT
+                    CASE
+                        WHEN UPPER(subscription_status)
+                             IN ('TRIAL', 'TRIALING')
+                        THEN 'TRIAL'
+                        ELSE subscription_status
+                    END
+                FROM subscription_match
+                LIMIT 1
+            ) AS subscription_status,
+
+            (
+                SELECT trial_ends_at
+                FROM subscription_match
+                LIMIT 1
+            ) AS trial_end_date
+        """
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=query_parameters
+        )
+
+        rows = self.client.query(
+            query,
+            job_config=job_config,
+        ).result()
+
+        row = next(iter(rows), None)
+
+        if row is None:
+            return {
+                "user_exists": False,
+                "organization_exists": False,
+                "subscription_exists": False,
+                "organization_id": None,
+                "organization_name": None,
+                "user_role": None,
+                "subscription_plan": None,
+                "subscription_status": None,
+                "trial_end_date": None,
+            }
+
+        result = dict(row.items())
+
+        resolved_organization_id = str(
+            result.get("organization_id") or ""
+        ).strip()
+
+        if (
+            organization_id is not None
+            and resolved_organization_id
+            and resolved_organization_id
+            != effective_organization_id
+        ):
+            raise RuntimeError(
+                "Resolved onboarding organization does not match "
+                "the authenticated organization."
+            )
+
+        return result
+
     def get_user_by_email(
         self,
         *,

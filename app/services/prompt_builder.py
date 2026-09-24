@@ -121,8 +121,22 @@ def _resolve_entity_id(record: Any, domain: str) -> str:
         "PROVIDER": ["provider_id", "npi", "member_id"],
         "SUPPLIER": ["supplier_id", "vendor_id", "tax_id", "member_id"],
         "PRODUCT": ["product_id", "gtin", "sku", "upc", "member_id"],
-        "BANKING": [ "account_id","banking_customer_id", "sap_business_partner_id",
-    ],
+        "BANKING": [
+            "account_id",
+            "banking_customer_id",
+            "sap_business_partner_id",
+        ],
+        "LOCATION": [
+            "location_id",
+            "site_id",
+            "location_code",
+            "member_id",
+        ],
+        "ORGANIZATION": [
+            "organization_entity_id",
+            "organization_code",
+            "member_id",
+        ],
     }
 
     for field in fields_by_domain.get(normalized_domain, ["member_id"]):
@@ -211,6 +225,7 @@ Return exactly this JSON structure:
   "confidence": 0.0
 }}
 """.strip()
+
 
 def build_dq_ai_recommendation_prompt(
     *,
@@ -319,11 +334,31 @@ def build_dq_ai_recommendation_prompt(
     # ---------------------------------------------------------
 
     safe_recommendations = (
-        _strip_tenant_metadata(
-            deterministic_recommendations
-            or []
-        )
+    _strip_tenant_metadata(
+        deterministic_recommendations
+        or []
     )
+)
+
+# ---------------------------------------------------------
+# Row-level finding evidence is for steward/UI visibility,
+# not LLM analysis.
+#
+# Keep deterministic counts/rules/candidate remediation
+# available to Claude while preventing observed/proposed
+# source values and record identifiers from entering the
+# LLM prompt.
+# ---------------------------------------------------------
+
+    safe_recommendations = [
+    {
+        key: value
+        for key, value in recommendation.items()
+        if key != "evidence_samples"
+    }
+    for recommendation in safe_recommendations
+    if isinstance(recommendation, dict)
+]
     # Keep the LLM request bounded. The repository/service
     # should already aggregate findings by rule.
     safe_recommendations = (
@@ -376,8 +411,11 @@ CORE RESPONSIBILITIES:
 2. Validate the deterministic remediation recommendation.
 
 3. Review the proposed remediation logic. Only improve
-   SQL or regex when the supplied evidence supports it.
-   Keep SQL short, diagnostic, and non-destructive.
+   the artifact type selected by the recommendation when the
+   supplied evidence supports it. Do not generate an alternate
+   SQL artifact for a REGEX remediation, or an alternate REGEX
+   artifact for a SQL remediation. Keep SQL short, diagnostic,
+   and non-destructive when SQL is the selected implementation.
 
 4. Recommend a practical passing threshold.
 
@@ -398,8 +436,10 @@ STRICT DATA SAFETY RULES:
 
 - Keep the entire JSON response concise.
 
-- suggested_sql must be null or a short diagnostic
-  SELECT statement no longer than 500 characters.
+- suggested_sql must be null unless implementation_type is SQL.
+
+- When implementation_type is SQL, suggested_sql may contain a
+  short diagnostic SELECT statement no longer than 500 characters.
 
 - Do not generate multi-step SQL scripts, long CASE
   expressions, CTE chains, DDL, DML, or procedural SQL.
@@ -412,7 +452,17 @@ STRICT DATA SAFETY RULES:
   suggested_sql must be null.
 
 - suggested_regex must be concise and only returned
-  when regex is clearly appropriate.
+  when implementation_type is REGEX and regex is clearly appropriate.
+
+- When implementation_type is REGEX, suggested_sql must be null.
+
+- When implementation_type is SQL, suggested_regex must be null.
+  Regex predicates needed by SQL belong inside suggested_sql rather
+  than in a separate suggested_regex artifact.
+
+- Return only the implementation artifact relevant to the selected
+  implementation_type. Do not provide SQL and REGEX alternatives for
+  the same recommendation.
 
 - Keep business_impact, recommended_remediation,
   and reasoning_summary each concise.
@@ -467,7 +517,45 @@ STRICT DATA SAFETY RULES:
 
 - Never expose or mention internal organization_id,
   customer_id, or user_id values.
-    
+
+PRODUCT VARIANT / UOM INTERPRETATION RULES:
+
+- Apply these rules only when DOMAIN is PRODUCT and the supplied
+  deterministic recommendation concerns product_variant or UOM.
+
+- "3 OZ" is a canonical Product Variant example.
+
+- "3   OZ" is noncanonical because repeated separator whitespace
+  violates the one-space Product Variant format.
+
+- Distinguish FORMAT VALIDITY from STANDARDIZATION:
+  * STANDARDIZATION means the semantic quantity/UOM can be preserved
+    while safely normalizing presentation such as trim, case, or
+    repeated whitespace.
+  * FORMAT VALIDITY means the value fails the governed structural
+    quantity + UOM pattern and may require validation or steward review.
+
+- Distinguish UOM POLICY from FORMAT:
+  a value can be structurally valid while its UOM token is not in the
+  currently approved governed vocabulary.
+
+- Never claim an unapproved UOM is factually wrong unless the supplied
+  evidence proves that. It may require tenant-specific policy approval.
+
+- Never substitute one UOM for another or convert units unless the
+  supplied evidence explicitly contains the authoritative business rule
+  and conversion basis.
+
+- Never change quantity merely to satisfy Product Variant validation.
+
+- Safe deterministic Product Variant standardization may recommend
+  trimming outer whitespace, collapsing repeated separator whitespace
+  to one space, and uppercasing the UOM token when business meaning is
+  unchanged.
+
+- PRODUCT_VARIANT_UOM_ALLOWED_VALUE should normally require steward or
+  configuration review rather than automatic source-data mutation.
+
 DOMAIN:
 
 {normalized_domain}
@@ -555,6 +643,7 @@ CRITICAL RECOMMENDATION COVERAGE RULE:
     its corresponding output object.
     - Every recommendation_id supplied in the input must
     appear exactly once in the output.
+    
 
 
 OUTPUT RULES:
@@ -568,9 +657,28 @@ OUTPUT RULES:
 - Preserve field_name exactly.
 - Preserve dimension exactly.
 - Preserve severity exactly.
+- For deterministic formatting and canonicalization rules, prefer REGEX
+  when the transformation can be expressed without changing business meaning.
+- Use SQL as an implementation example, not as the canonical rule type,
+  when the same remediation may apply to Google Sheets or other non-SQL sources.
+- PRODUCT_VARIANT_STANDARDIZATION must use implementation_type REGEX.
+- PRODUCT_VARIANT_STANDARDIZATION must set suggested_sql to null.
+- PRODUCT_VARIANT_STANDARDIZATION must set steward_approval_required to true.
+- FULL_NAME_STANDARDIZATION must use implementation_type REGEX.
+- FULL_NAME_STANDARDIZATION must set suggested_sql to null.
+- For FULL_NAME_STANDARDIZATION, suggested_regex may contain only the
+  governed presentation-normalization pattern; do not provide SQL as
+  an alternative implementation.
+- AUTO_FIX_CANDIDATE means the remediation is eligible for governed
+  automation AFTER explicit steward approval; it does not mean approval
+  may be bypassed.
+- Any remediation artifact capable of modifying source data must require
+  steward approval before execution.
 - Do not manufacture additional findings.
-- suggested_sql must be null when SQL is not appropriate.
-- suggested_regex must be null when regex is not appropriate.
+- suggested_sql must be null whenever implementation_type is not SQL.
+- suggested_regex must be null whenever implementation_type is not REGEX.
+- Never return both suggested_sql and suggested_regex as populated values
+  for the same recommendation.
 - SQL must be non-destructive.
 - Do not use DELETE, DROP, TRUNCATE, or MERGE.
 - Do not return UPDATE statements that modify source data.
@@ -585,6 +693,7 @@ OUTPUT RULES:
 - Do not return SQL containing long CASE expressions.
 - Keep each recommendation compact.
 """.strip()
+
 
 def _domain_guidance(domain: str | None) -> str:
     d = (domain or "").upper()
@@ -619,20 +728,46 @@ def _domain_guidance(domain: str | None) -> str:
         )
 
     if d == "BANKING":
-            return (
-                "Use banking customer and account identity language. "
-                "Treat Account ID, Customer ID, and SAP Business Partner ID as strong "
-                "identity evidence when exact and authoritative. "
-                "Treat routing number as bank or institution evidence, not as a unique "
-                "customer or account identifier. "
-                "Treat account last four digits as supporting evidence only because "
-                "they are not globally unique. "
-                "Use customer name, account type, currency, institution name, "
-                "email, address, phone number, and source-system trust as supporting evidence. "
-                "A conflicting Account ID, Customer ID, or SAP Business Partner ID must "
-                "materially reduce merge confidence. "
-                "Never recommend AUTO_MERGE based only on routing number, account last four, "
-                "name similarity, or other non-unique banking attributes."
+        return (
+            "Use banking customer and account identity language. "
+            "Treat Account ID, Customer ID, and SAP Business Partner ID as strong "
+            "identity evidence when exact and authoritative. "
+            "Treat routing number as bank or institution evidence, not as a unique "
+            "customer or account identifier. "
+            "Treat account last four digits as supporting evidence only because "
+            "they are not globally unique. "
+            "Use customer name, account type, currency, institution name, "
+            "email, address, phone number, and source-system trust as supporting evidence. "
+            "A conflicting Account ID, Customer ID, or SAP Business Partner ID must "
+            "materially reduce merge confidence. "
+            "Never recommend AUTO_MERGE based only on routing number, account last four, "
+            "name similarity, or other non-unique banking attributes."
+        )
+
+    if d == "LOCATION":
+        return (
+            "Use physical-site/location identity language. Treat Location ID, Site ID, and "
+            "Location Code as strong deterministic location identifiers when exact and authoritative. "
+            "Use Location Name, physical address, Parent Location ID, Organization Entity ID, "
+            "Location Type, and source-system trust as supporting evidence. A matching physical "
+            "address alone does not prove the same Location because multiple departments, suites, "
+            "operational locations, or sites may share an address. Conflicting authoritative Location "
+            "ID, Site ID, or Location Code values must materially reduce merge confidence. Parent "
+            "Location ID represents hierarchy evidence; do not infer a child_location_id. Missing "
+            "location identifiers are unavailable evidence, not conflicting evidence."
+        )
+
+    if d == "ORGANIZATION":
+        return (
+            "Use enterprise organization identity language. Treat Organization Entity ID and "
+            "Organization Code as strong deterministic organization identifiers when exact and "
+            "authoritative. Use Organization Name, Organization Type, Parent Organization ID, "
+            "Organization Status, related location evidence, and source-system trust as supporting "
+            "evidence. Never confuse the mastered Organization entity identifier with the internal "
+            "tenant organization_id. Similar organization names alone do not prove entity identity. "
+            "Conflicting authoritative Organization Entity ID or Organization Code values must "
+            "materially reduce merge confidence. Parent Organization ID is hierarchy evidence and "
+            "must not be treated as proof that two child organizations are the same entity."
         )
 
     if d == "CUSTOMER":
@@ -649,6 +784,7 @@ def _domain_guidance(domain: str | None) -> str:
         "and source-system trust as key evidence."
     )
 
+
 def _dq_domain_guidance(
     domain: str | None,
 ) -> str:
@@ -662,10 +798,33 @@ def _dq_domain_guidance(
             "Product ID, GTIN, SKU, Product Name, "
             "Product Variant, Item Category, and "
             "Source System may be relevant. "
-            "Do not treat duplicate Product IDs as "
-            "automatically safe to merge. Duplicate "
-            "identifiers require comparison of supporting "
-            "product attributes before remediation."
+            "Treat Product Variant as a governed quantity + UOM value "
+            "when the deterministic evidence identifies it that way. "
+            "Canonical Product Variant format is numeric quantity, "
+            "exactly one separator space, and an uppercase UOM token; "
+            "examples include '3 OZ', '3.3 OZ', '3.75 LB', and '12 IN'. "
+            "Leading or trailing whitespace, repeated internal spaces, "
+            "lowercase UOM text, or a missing separator are "
+            "standardization/format defects when the deterministic "
+            "engine reports them. For example, '3 OZ' is canonical "
+            "while '3   OZ' is not. "
+            "Never change the numeric quantity or substitute one UOM "
+            "for another merely to make a Product Variant pass format "
+            "validation. Safe formatting normalization may trim "
+            "whitespace, collapse repeated separator whitespace to one "
+            "space, and uppercase the UOM token when business meaning "
+            "is preserved. "
+            "A structurally valid UOM that is outside the effective "
+            "approved UOM vocabulary is a governed-value issue, not "
+            "proof that the UOM is factually wrong. Do not silently map "
+            "or replace an unapproved UOM. Recommend steward/configuration "
+            "review unless authoritative evidence supports a correction. "
+            "Do not treat duplicate Product IDs as automatically safe "
+            "to merge. Duplicate identifiers require comparison of "
+            "supporting product attributes before remediation."
+            "GTIN checksum failure proves only that the supplied GTIN is not "
+            "checksum-valid; it does not prove which digit is incorrect or that "
+            "recomputing the check digit would produce the authoritative GTIN. "
         )
 
     if d == "SUPPLIER":
@@ -695,7 +854,7 @@ def _dq_domain_guidance(
             "duplicate issues should favor steward review "
             "because incorrect remediation can join "
             "different patients."
-    )
+        )
 
     if d == "BANKING":
         return (
@@ -711,7 +870,32 @@ def _dq_domain_guidance(
             "justify duplicate remediation or account consolidation. "
             "Duplicate or conflicting banking identity records should default to steward "
             "review unless deterministic evidence proves the remediation is safe."
-    )
+        )
+
+    if d == "LOCATION":
+        return (
+            "Use physical-site/location data-quality language. "
+            "Location ID, Site ID, Location Code, Location Name, Location Type, physical address, "
+            "Parent Location ID, Organization Entity ID, and source system may be relevant. "
+            "Do not treat a shared physical address as proof of a duplicate Location. "
+            "Location hierarchy must be represented through parent_location_id; do not fabricate "
+            "child identifiers or hierarchy relationships. Missing identifiers must not be invented. "
+            "Address standardization may normalize presentation when deterministic, but changing the "
+            "physical site, hierarchy, or organization relationship requires authoritative evidence "
+            "or steward review."
+        )
+
+    if d == "ORGANIZATION":
+        return (
+            "Use enterprise organization data-quality language. "
+            "Organization Entity ID, Organization Code, Organization Name, Organization Type, "
+            "Parent Organization ID, Organization Status, related location evidence, and source "
+            "system may be relevant. Never use internal tenant organization_id as mastered entity "
+            "data. Do not merge organizations based on name similarity alone. Missing organization "
+            "identifiers, parent relationships, types, or statuses must not be fabricated. Changes "
+            "to hierarchy, status, or organization identity require authoritative evidence or steward "
+            "review unless the supplied deterministic rule proves a presentation-only correction."
+        )
 
     if d == "CUSTOMER":
         return (
@@ -728,6 +912,973 @@ def _dq_domain_guidance(
         "Recommend deterministic, explainable, "
         "non-destructive remediation."
     )
+
+
+
+GTIN_REMEDIATION_GUARDRAILS = """
+GTIN REMEDIATION GUARDRAILS:
+
+- Never invent, guess, synthesize, or fabricate a GTIN.
+- Never replace an ambiguous GTIN with a value that is not explicitly supported
+  by authoritative evidence.
+- Never delete records as a GTIN remediation strategy.
+- Do not generate destructive DML without explicit safety justification.
+- Prefer a diagnostic SELECT preview and a proposed transformation explanation
+  before any corrective UPDATE.
+- Only generate UPDATE when the correction is deterministic, reversible, and
+  limited to the affected rows with a WHERE clause.
+- If the corrected GTIN cannot be derived safely from the supplied evidence,
+  return MANUAL_REVIEW.
+- If authoritative source confirmation is required, return MANUAL_REVIEW rather
+  than fabricating a correction.
+""".strip()
+
+
+GTIN_CHECKSUM_REMEDIATION_GUARDRAILS = """
+GTIN_CHECKSUM_VALIDITY SPECIAL RULES:
+
+- A failed GTIN checksum means the supplied GTIN is not checksum-valid.
+- Do NOT conclude that a specific digit is wrong unless authoritative
+  evidence identifies the incorrect digit.
+- Recalculating the final GTIN check digit does NOT prove that the
+  preceding digits are correct.
+- A mathematically valid replacement check digit can still produce a
+  commercially incorrect GTIN when any preceding digit is wrong,
+  missing, transposed, truncated, or otherwise corrupted.
+- Do not auto-correct a checksum failure unless the base digits are
+  explicitly known to be authoritative.
+- When the base digits are not authoritative, require steward review
+  and recommend validation against the source system, supplier master,
+  internal MDM golden record, or GS1-authoritative reference before
+  any production change.
+- Never imply that checksum recomputation alone verifies commercial
+  product identity.
+- Never state that the GTIN "itself is wrong" when the evidence only
+  proves checksum failure. State instead that the supplied GTIN is
+  not checksum-valid and requires authoritative verification.
+""".strip()
+
+GOVERNED_PRODUCT_VARIANT_STANDARDIZATION_REGEX = (
+    r"^\s*([0-9]+(?:\.[0-9]+)?)\s+([A-Za-z]+)\s*$"
+)
+
+GOVERNED_FULL_NAME_STANDARDIZATION_REGEX = (
+    r"^\s*(\S+(?:\s+\S+)*)\s*$"
+)
+
+
+PRODUCT_VARIANT_REMEDIATION_GUARDRAILS = """
+PRODUCT VARIANT / UOM REMEDIATION GUARDRAILS:
+- Treat product_variant as a semantic quantity + UOM value when the persisted
+  deterministic recommendation identifies that structure.
+- Canonical examples include: 3 OZ, 3.3 OZ, 3.75 LB, and 12 IN.
+- Canonical formatting requires:
+  * a numeric integer or decimal quantity,
+  * exactly one separator space,
+  * an uppercase UOM token,
+  * no leading whitespace,
+  * no trailing whitespace.
+- "3 OZ" is canonical.
+- "3   OZ" is not canonical and may be safely normalized to "3 OZ" only when
+  the supplied evidence establishes that the issue is formatting/standardization.
+- Formatting-only fixes may trim leading/trailing whitespace, collapse repeated
+  whitespace between quantity and UOM to one space, and uppercase the UOM token.
+- Never change the numeric quantity merely to satisfy a format rule.
+- Never convert units or substitute UOM semantics (for example LB -> KG, OZ -> G,
+  IN -> MM) unless an authoritative conversion requirement and conversion logic
+  are explicitly supplied in the persisted evidence.
+- Never invent or guess a missing UOM.
+- Never replace an unknown or unapproved UOM with a different allowed UOM merely
+  to make the value pass validation.
+- When a UOM is structurally valid but outside the approved governed vocabulary,
+  prefer steward/configuration review. The correct action may be to approve a new
+  tenant-specific UOM value rather than mutate source data.
+- Never fabricate a missing quantity or UOM value.
+- If the deterministic finding is PRODUCT_VARIANT_STANDARDIZATION
+  and the canonical result can be derived without changing
+  quantity or UOM meaning, prefer REGEX in AUTO mode.
+- A bounded UPDATE may be generated only when SQL is explicitly
+  requested as the artifact preference.
+- If the deterministic finding is PRODUCT_VARIANT_FORMAT_VALIDITY and the
+  corrected semantic value cannot be derived safely from formatting alone,
+  return REGEX for validation or MANUAL_REVIEW rather than fabricating a value.
+- If the deterministic finding is PRODUCT_VARIANT_UOM_ALLOWED_VALUE, do not
+  auto-substitute another UOM. Return MANUAL_REVIEW unless authoritative evidence
+  explicitly proves the required correction.
+""".strip()
+
+
+PRODUCT_VARIANT_FORMAT_REMEDIATION_GUARDRAILS = """
+PRODUCT_VARIANT_FORMAT_VALIDITY SPECIAL RULES:
+
+- The governed structural pattern is numeric quantity + one space + uppercase UOM.
+- A concise validation regex may use the generic structure:
+  ^[0-9]+(?:\\.[0-9]+)? [A-Z]+$
+- The regex validates structure only. It does not prove that the UOM token is
+  approved or semantically correct.
+- Do not use the regex to infer missing quantity or UOM values.
+- If a source value can be normalized deterministically by whitespace/case only,
+  a bounded standardization UPDATE may be appropriate.
+- If semantic correction is required, return MANUAL_REVIEW.
+""".strip()
+
+
+PRODUCT_VARIANT_UOM_REMEDIATION_GUARDRAILS = """
+PRODUCT_VARIANT_UOM_ALLOWED_VALUE SPECIAL RULES:
+
+- The UOM token has already passed structural parsing but is outside the effective
+  governed UOM vocabulary for this profiling configuration.
+- Do not assume the token is factually invalid solely because it is not currently
+  approved.
+- Do not auto-map the token to OZ, LB, KG, G, EA, CS, PK, IN, or any other UOM.
+- The safe remediation is normally steward/configuration review so an authorized
+  user can determine whether the UOM should be added to the tenant-specific policy
+  or corrected from an authoritative source.
+- Return MANUAL_REVIEW unless the persisted evidence explicitly contains the
+  authoritative replacement value.
+""".strip()
+
+FULL_NAME_STANDARDIZATION_REMEDIATION_GUARDRAILS = """
+FULL_NAME_STANDARDIZATION SPECIAL RULES:
+
+- Use REGEX for deterministic presentation-only normalization.
+- NORMALIZE_FULL_NAME trims whitespace, collapses repeated internal
+  whitespace, and uppercases alphabetic characters.
+- Do not claim SQL is required for casing or whitespace normalization.
+- Do not recommend SQL for spreadsheet execution targets.
+- Never add, remove, reorder, infer, or alter name components.
+- If semantic name correction is required, return MANUAL_REVIEW.
+""".strip()
+
+
+def _dq_remediation_domain_guardrails(
+    *,
+    domain: str,
+    rule_id: str | None,
+    field_name: str | None,
+) -> str:
+    """Return generic domain/rule-specific remediation guardrails."""
+    normalized_domain = str(domain or "").strip().upper()
+    normalized_rule_id = str(rule_id or "").strip().upper()
+    normalized_field_name = str(field_name or "").strip().lower()
+
+    guardrails: list[str] = []
+
+    if (
+        normalized_rule_id == "FULL_NAME_STANDARDIZATION"
+        and normalized_field_name == "full_name"
+    ):
+        guardrails.append(
+            FULL_NAME_STANDARDIZATION_REMEDIATION_GUARDRAILS
+        )
+
+    if (
+        normalized_domain == "PRODUCT"
+        and (
+            normalized_field_name == "gtin"
+            or normalized_rule_id.startswith("GTIN_")
+        )
+    ):
+        guardrails.append(GTIN_REMEDIATION_GUARDRAILS)
+
+    if normalized_rule_id == "GTIN_CHECKSUM_VALIDITY":
+        guardrails.append(
+            GTIN_CHECKSUM_REMEDIATION_GUARDRAILS
+        )
+
+    if (
+        normalized_domain == "PRODUCT"
+        and (
+            normalized_field_name == "product_variant"
+            or normalized_rule_id.startswith(
+                "PRODUCT_VARIANT_"
+            )
+        )
+    ):
+        guardrails.append(
+            PRODUCT_VARIANT_REMEDIATION_GUARDRAILS
+        )
+        
+
+    if (
+        normalized_rule_id
+        == "PRODUCT_VARIANT_FORMAT_VALIDITY"
+    ):
+        guardrails.append(
+            PRODUCT_VARIANT_FORMAT_REMEDIATION_GUARDRAILS
+        )
+
+    if (
+        normalized_rule_id
+        == "PRODUCT_VARIANT_UOM_ALLOWED_VALUE"
+    ):
+        guardrails.append(
+            PRODUCT_VARIANT_UOM_REMEDIATION_GUARDRAILS
+        )
+
+    return "\n\n".join(guardrails).strip()
+
+def build_dq_remediation_prompt(
+    *,
+    organization_id: str,
+    revision_guidance: str | None = None,
+    recommendation: Dict[str, Any],
+    source_table: str = "source_table",
+    sql_dialect: str = "BIGQUERY",
+    artifact_preference: str = "AUTO",
+) -> str:
+    """
+    Build a tenant-safe prompt for generating one
+    implementation-ready DQ remediation artifact.
+
+    The recommendation must already be persisted and
+    tenant-scoped before this function is called.
+    """
+
+    effective_organization_id = (
+        _require_organization_id(
+            organization_id
+        )
+    )
+
+    if not isinstance(
+        recommendation,
+        dict,
+    ):
+        raise ValueError(
+            "recommendation must be a dictionary."
+        )
+    
+
+    revision_section = ""
+
+    normalized_revision_guidance = str(
+        revision_guidance or ""
+    ).strip()
+
+    if normalized_revision_guidance:
+        revision_section = f"""
+    ------------------------------------------------------------
+    STEWARD REVISION GUIDANCE
+    ------------------------------------------------------------
+
+    A data steward reviewed the previous remediation and
+    requested changes.
+
+    Requested revision:
+
+    {normalized_revision_guidance}
+
+    Treat this as explicit steward revision guidance.
+
+    Revise the prior remediation to address this request
+    where it can be done safely and deterministically.
+
+    Do not simply repeat the prior remediation when it
+    conflicts with the requested revision.
+
+    The steward request does NOT override data-safety,
+    tenant-isolation, domain, or remediation guardrails.
+
+    If the requested change cannot be implemented safely
+    from the supplied evidence, return MANUAL_REVIEW and
+    explain why.
+    """.strip()
+
+    recommendation_organization_id = str(
+        recommendation.get(
+            "organization_id"
+        )
+        or ""
+    ).strip()
+
+    if (
+        recommendation_organization_id
+        and recommendation_organization_id
+        != effective_organization_id
+    ):
+        raise ValueError(
+            "DQ recommendation does not belong "
+            "to the authenticated organization."
+        )
+
+    recommendation_id = str(
+        recommendation.get(
+            "recommendation_id"
+        )
+        or ""
+    ).strip()
+
+    if not recommendation_id:
+        raise ValueError(
+            "recommendation_id is required."
+        )
+
+    normalized_domain = str(
+        recommendation.get(
+            "domain"
+        )
+        or ""
+    ).strip().upper()
+
+    if not normalized_domain:
+        raise ValueError(
+            "domain is required."
+        )
+
+    normalized_rule_id = str(
+        recommendation.get("rule_id") or ""
+    ).strip().upper()
+
+    normalized_field_name = str(
+        recommendation.get("field_name") or ""
+    ).strip().lower()
+
+    governed_remediation_regex: str | None = None
+
+    if (
+        normalized_domain == "PRODUCT"
+        and normalized_rule_id == "PRODUCT_VARIANT_STANDARDIZATION"
+        and normalized_field_name == "product_variant"
+    ):
+        governed_remediation_regex = (
+            GOVERNED_PRODUCT_VARIANT_STANDARDIZATION_REGEX
+        )
+
+    elif (
+            normalized_rule_id == "FULL_NAME_STANDARDIZATION"
+            and normalized_field_name == "full_name"
+        ):
+            governed_remediation_regex = (
+                GOVERNED_FULL_NAME_STANDARDIZATION_REGEX
+            )
+
+    remediation_domain_guardrails = (
+        _dq_remediation_domain_guardrails(
+            domain=normalized_domain,
+            rule_id=normalized_rule_id,
+            field_name=normalized_field_name,
+        )
+    )
+
+    normalized_source_table = str(
+        source_table
+        or "source_table"
+    ).strip()
+
+    if not normalized_source_table:
+        raise ValueError(
+            "source_table is required."
+        )
+
+    normalized_sql_dialect = str(
+        sql_dialect
+        or "BIGQUERY"
+    ).strip().upper()
+
+    if normalized_sql_dialect not in {
+        "BIGQUERY",
+        "SNOWFLAKE",
+        "DATABRICKS",
+        "GENERIC",
+    }:
+        raise ValueError(
+            "Unsupported SQL dialect."
+        )
+
+    normalized_artifact_preference = str(
+        artifact_preference or "AUTO"
+    ).strip().upper()
+
+    if normalized_artifact_preference not in {
+        "AUTO",
+        "SQL",
+        "REGEX",
+    }:
+        raise ValueError(
+            "Unsupported artifact_preference."
+        )
+
+    # ---------------------------------------------------------
+    # Validate tenant ownership first, then remove internal
+    # tenant metadata before sending context to the LLM.
+    # ---------------------------------------------------------
+
+    safe_recommendation = (
+        _strip_tenant_metadata(
+            recommendation
+        )
+    )
+
+    remediation_payload = {
+        "recommendation_id":
+            recommendation_id,
+
+        "domain":
+            normalized_domain,
+
+        "rule_id":
+            safe_recommendation.get(
+                "rule_id"
+            ),
+
+        "field_name":
+            safe_recommendation.get(
+                "field_name"
+            ),
+
+        "dimension":
+            safe_recommendation.get(
+                "dimension"
+            ),
+
+        "severity":
+            safe_recommendation.get(
+                "severity"
+            ),
+
+        "finding_count":
+            safe_recommendation.get(
+                "finding_count"
+            ),
+
+        "affected_record_count":
+            safe_recommendation.get(
+                "affected_record_count"
+            ),
+
+        "affected_percent":
+            safe_recommendation.get(
+                "affected_percent"
+            ),
+
+        "recommendation_title":
+            safe_recommendation.get(
+                "recommendation_title"
+            ),
+
+        "recommendation_summary":
+            safe_recommendation.get(
+                "recommendation_summary"
+            ),
+
+        "suggested_action":
+            safe_recommendation.get(
+                "suggested_action"
+            ),
+
+        "suggested_rule_type":
+            safe_recommendation.get(
+                "suggested_rule_type"
+            ),
+
+        "existing_suggested_sql":
+            safe_recommendation.get(
+                "suggested_sql"
+            ),
+
+        "existing_suggested_regex":
+            safe_recommendation.get(
+                "suggested_regex"
+            ),
+
+        "governed_remediation_regex":
+            governed_remediation_regex,
+
+        "automation_recommendation":
+            safe_recommendation.get(
+                "automation_recommendation"
+            ),
+
+        "automation_confidence":
+            safe_recommendation.get(
+                "automation_confidence"
+            ),
+
+        "status":
+            safe_recommendation.get(
+                "status"
+            ),
+
+        "source_table":
+            normalized_source_table,
+
+        "sql_dialect":
+            normalized_sql_dialect,
+
+        "artifact_preference":
+            normalized_artifact_preference,
+    }
+
+    if normalized_artifact_preference == "SQL":
+        artifact_preference_section = """
+    ------------------------------------------------------------
+    STEWARD ARTIFACT PREFERENCE
+    ------------------------------------------------------------
+
+    The steward explicitly requested a SQL remediation artifact.
+
+    - Prefer artifact_type SQL when a safe deterministic corrective
+      UPDATE can be generated from the persisted evidence.
+
+    - A regex may be used INSIDE the SQL WHERE clause as a predicate
+      to identify the affected rows.
+
+    - When regex is embedded inside SQL, artifact_type must remain SQL
+      and remediation_regex must be null.
+
+    - Do NOT return a standalone REGEX artifact for this request.
+
+    - The SQL must perform the deterministic correction; do not merely
+      return the existing diagnostic SELECT.
+
+    - If the exact corrective value or transformation cannot be derived
+      safely and deterministically from the supplied evidence, return
+      MANUAL_REVIEW.
+
+    - The steward's SQL preference never overrides domain guardrails,
+      authoritative-source requirements, GTIN protections, tenant
+      isolation, or SQL safety rules.
+        """.strip()
+    elif normalized_artifact_preference == "REGEX":
+        artifact_preference_section = """
+    ------------------------------------------------------------
+    STEWARD ARTIFACT PREFERENCE
+    ------------------------------------------------------------
+
+    The steward explicitly requested a REGEX remediation artifact.
+
+    - Return artifact_type REGEX when the persisted evidence
+      supports a safe deterministic governed normalization.
+
+    - remediation_regex must contain the governed regex pattern.
+
+    - The REGEX identifies values eligible for the governed
+      transformation. The approved deterministic execution
+      operation performs the actual normalization.
+
+    - A REGEX artifact does not need to perform casing,
+      whitespace collapsing, or other transformation by regex
+      replacement syntax itself.
+
+    - remediation_sql must be null.
+
+    - Do not convert the requested REGEX artifact into SQL.
+
+    - When governed_remediation_regex is non-null, copy it
+      EXACTLY into remediation_regex.
+
+    - Do not claim SQL is required merely because the approved
+      execution operation performs trim, whitespace normalization,
+      or casing changes.
+
+    - If the governed execution operation would require changing
+      business meaning, return MANUAL_REVIEW.
+
+    - REGEX preference never overrides domain guardrails,
+      authoritative-source requirements, or tenant isolation.
+    """.strip()
+    else:
+        artifact_preference_section = """
+    ------------------------------------------------------------
+    STEWARD ARTIFACT PREFERENCE
+    ------------------------------------------------------------
+
+    Artifact preference is AUTO.
+
+    Preserve the existing artifact-selection behavior:
+    choose SQL, REGEX, or MANUAL_REVIEW according to the evidence,
+    domain guardrails, and safety rules.
+        """.strip()
+
+    return f"""
+    You are the Data Quality Remediation Engineer inside
+    AI Data Steward Copilot.
+
+    Your task is to generate ONE implementation-ready
+    remediation artifact for ONE already-approved AI
+    recommendation candidate.
+
+    The deterministic DQ engine and persisted recommendation
+    are the source of truth.
+
+    You must not invent source data, business rules,
+    authoritative values, identifiers, policies, systems,
+    or record-level facts that are not present in the
+    supplied recommendation evidence.
+
+    Your output is for STEWARD REVIEW ONLY.
+    Never claim that generated SQL or regex has been executed.
+
+    ------------------------------------------------------------
+    PRIMARY GOAL
+    ------------------------------------------------------------
+
+    Generate exactly one of the following:
+
+    1. SQL
+    - A controlled remediation UPDATE statement.
+    - Must include a WHERE clause.
+    - Must be limited to rows affected by the stated issue.
+    - Must not update unrelated rows.
+
+    2. REGEX
+    - A concise validation or standardization regex.
+    - Only use REGEX when regex is clearly appropriate.
+
+    3. MANUAL_REVIEW
+    - Use when deterministic remediation cannot be safely
+    generated from the supplied evidence.
+
+    ------------------------------------------------------------
+    STRICT SQL SAFETY RULES
+    ------------------------------------------------------------
+
+    - SQL remediation may use UPDATE only.
+
+    - Every UPDATE must contain a WHERE clause.
+
+    - Never generate:
+    DELETE
+    DROP
+    TRUNCATE
+    MERGE
+    ALTER
+    CREATE
+    INSERT
+    GRANT
+    REVOKE
+
+    - Never generate multi-statement SQL.
+
+    - Never generate procedural SQL.
+
+    - Never generate stored procedures.
+
+    - Never generate dynamic SQL.
+
+    - Never generate a script that executes multiple changes.
+
+    - Never update all rows in a table.
+
+    - Never fabricate missing values.
+
+    - Never replace missing required values with guessed,
+    default, synthetic, or placeholder values.
+
+    - Never overwrite a field using an authoritative value
+    unless that authoritative value is explicitly present
+    in the supplied evidence.
+
+    - Never perform duplicate deletion or automatic merge
+    through remediation SQL.
+
+    - Duplicate or identity-related remediation should
+    normally return MANUAL_REVIEW.
+
+    - Completeness issues requiring enrichment should
+    normally return MANUAL_REVIEW unless the remediation
+    is purely deterministic formatting/standardization.
+
+    - Standardization fixes may return SQL when they are
+    deterministic, reversible, and limited by a WHERE clause.
+
+    - Validity fixes may return SQL only when the correction
+    rule is deterministic and does not invent data.
+
+    - Prefer a SELECT preview plus a proposed transformation
+    explanation before any corrective UPDATE when there is
+    uncertainty about the resulting value.
+
+    - Only generate UPDATE when the correction is deterministic,
+    reversible, evidence-supported, and limited by a WHERE clause.
+
+    - SQL must target this source table only:
+
+    {normalized_source_table}
+
+    ------------------------------------------------------------
+    SQL DIALECT
+    ------------------------------------------------------------
+
+    Requested dialect:
+
+    {normalized_sql_dialect}
+
+    Use syntax compatible with the requested dialect.
+
+    Dialect guidance:
+
+    BIGQUERY:
+    - Use BigQuery Standard SQL.
+    - CAST(... AS STRING) is acceptable.
+    - REGEXP_CONTAINS may be used when appropriate.
+
+    SNOWFLAKE:
+    - Use Snowflake SQL syntax.
+    - Prefer REGEXP_LIKE when regex predicates are needed.
+
+    DATABRICKS:
+    - Use Databricks SQL syntax.
+    - Prefer RLIKE when regex predicates are needed.
+    - IMPORTANT: When a regex pattern contains backslash escapes such as
+    \\s, \\d, \\., \\w, or similar regex metacharacters, use a
+    Databricks raw string literal with the r'...' syntax.
+    - Use raw regex literals consistently in RLIKE, REGEXP_EXTRACT,
+    REGEXP_REPLACE, REGEXP_LIKE, and other Databricks regex functions.
+    - Example:
+    product_variant RLIKE r'^\\s*([0-9]+(?:\\.[0-9]+)?)\\s+([A-Za-z]+)\\s*$'
+    - Example:
+    REGEXP_EXTRACT(
+        TRIM(product_variant),
+        r'^([0-9]+(?:\\.[0-9]+)?)\\s+([A-Za-z]+)\\s*$',
+        1
+    )
+    - Do not place a backslash-containing regex in an ordinary Databricks
+    SQL string literal such as '^\\s*...$' because SQL string parsing
+    may consume the backslash before the regex engine evaluates it.
+    - The SQL artifact shown to the steward must already contain the
+    correct Databricks raw regex literal. Do not rely on the execution
+    layer to rewrite or escape approved SQL.
+
+    GENERIC:
+    - Use broadly portable ANSI-style SQL where possible.
+
+    ------------------------------------------------------------
+    REGEX SAFETY RULES
+    ------------------------------------------------------------
+
+    - Return a regex only when the rule clearly requires one.
+
+    - Regex must be syntactically valid.
+
+    - Regex should validate or standardize format only.
+
+    - Do not use regex to infer or fabricate missing data.
+
+    - Keep regex concise.
+
+    - When governed_remediation_regex is non-null, it is an
+      authoritative executable remediation contract.
+
+    - When governed_remediation_regex is non-null and artifact_type
+      is REGEX, copy governed_remediation_regex EXACTLY into
+      remediation_regex.
+
+    - Do not simplify, rewrite, broaden, narrow, optimize, or replace
+      a supplied governed_remediation_regex.
+
+    - Do not substitute a validation-only regex when an exact governed
+      remediation regex has been supplied.
+
+    ------------------------------------------------------------
+    DOMAIN
+    ------------------------------------------------------------
+
+    {normalized_domain}
+
+    DOMAIN GUIDANCE:
+
+    {_dq_domain_guidance(normalized_domain)}
+
+    ------------------------------------------------------------
+    DOMAIN / RULE-SPECIFIC REMEDIATION GUARDRAILS
+    ------------------------------------------------------------
+
+    {remediation_domain_guardrails or "No additional domain-specific remediation guardrails."}
+
+    ------------------------------------------------------------
+    PERSISTED DQ RECOMMENDATION
+    ------------------------------------------------------------
+
+    {json.dumps(remediation_payload, indent=2)}
+
+    {revision_section}
+
+    {artifact_preference_section}
+
+    ------------------------------------------------------------
+    DECISION LOGIC
+    ------------------------------------------------------------
+
+    Choose artifact_type using these rules:
+
+    - When artifact_preference is SQL:
+      return SQL when a deterministic corrective UPDATE can be
+      generated safely. Regex predicates may be embedded inside
+      that UPDATE's WHERE clause. Otherwise return MANUAL_REVIEW.
+      Do not return standalone REGEX.
+
+    - When artifact_preference is AUTO:
+
+      SQL:
+      Use when a deterministic corrective UPDATE can be
+      generated safely.
+
+      REGEX:
+      Use when the issue is primarily a format-validation
+      or pattern-standardization problem.
+
+    - MANUAL_REVIEW:
+    Use when remediation requires:
+    authoritative source lookup,
+    steward interpretation,
+    record survivorship,
+    deduplication decisions,
+    identity resolution,
+    missing-value invention,
+    business context,
+    or non-deterministic correction.
+
+    PRODUCT VARIANT DECISION RULES:
+
+    - PRODUCT_VARIANT_STANDARDIZATION:
+
+      In AUTO mode, return artifact_type REGEX when the correction is
+      purely deterministic formatting and preserves both numeric quantity
+      and UOM meaning.
+
+      When governed_remediation_regex is supplied, remediation_regex
+      MUST equal governed_remediation_regex exactly.
+
+      Do not generate a different validation regex.
+
+      The governed regex captures the numeric quantity and UOM token so
+      the approved execution contract can preserve quantity, normalize
+      separator whitespace, and uppercase the UOM without changing
+      business meaning.
+
+      When artifact_preference is SQL, a bounded corrective UPDATE may
+      be generated instead, provided it preserves quantity and UOM
+      meaning and includes a WHERE clause.
+
+    - PRODUCT_VARIANT_FORMAT_VALIDITY:
+      In AUTO mode, prefer REGEX when the requested artifact is
+      validation of the quantity + UOM structure. When the steward
+      explicitly requests SQL, use SQL only when the exact corrected
+      value can be deterministically derived from formatting alone;
+      the structural regex may be embedded in the SQL WHERE predicate.
+      Otherwise use MANUAL_REVIEW.
+
+    - PRODUCT_VARIANT_UOM_ALLOWED_VALUE:
+      Prefer MANUAL_REVIEW. Do not replace an unapproved UOM with
+      another UOM. The appropriate remediation may be an authorized
+      tenant-specific configuration change rather than source-data
+      correction.
+
+    If the supplied recommendation already contains
+    diagnostic SQL, do NOT merely return the same diagnostic
+    SELECT.
+
+    The remediation SQL must perform the safe correction,
+    not just identify bad records.
+
+    ------------------------------------------------------------
+    EXPECTED EXAMPLES
+    ------------------------------------------------------------
+
+    Safe standardization SQL example:
+
+    UPDATE source_table
+    SET customer_name = UPPER(TRIM(customer_name))
+    WHERE customer_name IS NOT NULL
+    AND customer_name != UPPER(TRIM(customer_name));
+
+    Safe SQL-with-regex example for BIGQUERY when the correction
+    itself is deterministic:
+
+    UPDATE source_table
+    SET currency = UPPER(TRIM(CAST(currency AS STRING)))
+    WHERE currency IS NOT NULL
+    AND NOT REGEXP_CONTAINS(
+      UPPER(TRIM(CAST(currency AS STRING))),
+      r'^[A-Z]{3}$'
+    );
+
+    A regex in the WHERE clause does not make the artifact a REGEX
+    artifact. It remains artifact_type SQL.
+
+    Unsafe examples that must never be returned:
+
+    DELETE FROM source_table;
+
+    UPDATE source_table
+    SET customer_name = NULL;
+
+    UPDATE source_table
+    SET customer_name = 'UNKNOWN';
+
+    UPDATE source_table
+    SET customer_name = UPPER(TRIM(customer_name));
+
+    The last example is unsafe because it has no WHERE clause.
+
+    ------------------------------------------------------------
+    RETURN ONLY VALID JSON
+    ------------------------------------------------------------
+
+    Return exactly this structure:
+
+    {{
+    "recommendation_id":
+    "{recommendation_id}",
+
+    "artifact_type":
+    "SQL|REGEX|MANUAL_REVIEW",
+
+    "remediation_sql":
+    "single controlled UPDATE statement or null",
+
+    "remediation_regex":
+    "regex pattern or null",
+
+    "reasoning_summary":
+    "brief explanation grounded only in the persisted DQ recommendation"
+    }}
+
+    ------------------------------------------------------------
+    OUTPUT RULES
+    ------------------------------------------------------------
+
+    - Return raw JSON only.
+
+    - Do not return markdown.
+
+    - Do not return code fences.
+
+    - Do not return commentary before or after JSON.
+
+    - Preserve recommendation_id exactly.
+
+    - Return only one artifact.
+
+    - If artifact_type is SQL:
+    remediation_sql must be non-null.
+    remediation_regex must be null.
+    Regex logic may appear inside remediation_sql as a WHERE predicate
+    using syntax appropriate for the requested SQL dialect.
+
+    - If artifact_type is REGEX:
+    remediation_regex must be non-null.
+    remediation_sql must be null.
+    - If governed_remediation_regex is non-null and artifact_type is REGEX:
+      remediation_regex must exactly equal governed_remediation_regex.
+
+    - Never generate an alternative regex for an allow-listed governed
+      remediation rule.
+
+    - If artifact_type is MANUAL_REVIEW:
+    remediation_sql must be null.
+    remediation_regex must be null.
+
+    - Never expose or mention internal organization_id,
+    customer_id, or user_id values.
+
+    - Do not claim execution occurred.
+
+    - Steward approval is always required before any
+    generated remediation is executed.
+    """.strip()
 
 
 def build_match_explain_prompt(
@@ -865,7 +2016,7 @@ def build_match_explain_prompt(
     - GTIN: {getattr(record_b, "gtin", None)}
     - SKU: {getattr(record_b, "sku", None)}
 """
-     
+
     elif domain == "SUPPLIER":
         record_evidence = f"""
     Record A Supplier Evidence:
@@ -882,6 +2033,54 @@ def build_match_explain_prompt(
     - supplier_name: {_fmt(_get_value(record_b, "supplier_name") or _get_value(record_b, "first_name"))}
     - contact_email: {_fmt(_get_value(record_b, "contact_email") or _get_value(record_b, "email"))}
     - supplier_address: {_fmt(_get_value(record_b, "supplier_address") or _get_value(record_b, "address"))}
+    - source_system: {_fmt(_get_value(record_b, "source_system"))}
+    """
+
+    elif domain == "LOCATION":
+        record_evidence = f"""
+    Record A Location Evidence:
+    - location_id: {_fmt(_get_value(record_a, "location_id") or entity_id_a)}
+    - site_id: {_fmt(_get_value(record_a, "site_id"))}
+    - location_code: {_fmt(_get_value(record_a, "location_code"))}
+    - location_name: {_fmt(_get_value(record_a, "location_name"))}
+    - location_type: {_fmt(_get_value(record_a, "location_type"))}
+    - physical_address: {_fmt(_get_value(record_a, "location_address") or _get_value(record_a, "address"))}
+    - parent_location_id: {_fmt(_get_value(record_a, "parent_location_id"))}
+    - organization_entity_id: {_fmt(_get_value(record_a, "organization_entity_id"))}
+    - source_system: {_fmt(_get_value(record_a, "source_system"))}
+
+    Record B Location Evidence:
+    - location_id: {_fmt(_get_value(record_b, "location_id") or entity_id_b)}
+    - site_id: {_fmt(_get_value(record_b, "site_id"))}
+    - location_code: {_fmt(_get_value(record_b, "location_code"))}
+    - location_name: {_fmt(_get_value(record_b, "location_name"))}
+    - location_type: {_fmt(_get_value(record_b, "location_type"))}
+    - physical_address: {_fmt(_get_value(record_b, "location_address") or _get_value(record_b, "address"))}
+    - parent_location_id: {_fmt(_get_value(record_b, "parent_location_id"))}
+    - organization_entity_id: {_fmt(_get_value(record_b, "organization_entity_id"))}
+    - source_system: {_fmt(_get_value(record_b, "source_system"))}
+    """
+
+    elif domain == "ORGANIZATION":
+        record_evidence = f"""
+    Record A Organization Evidence:
+    - organization_entity_id: {_fmt(_get_value(record_a, "organization_entity_id") or entity_id_a)}
+    - organization_code: {_fmt(_get_value(record_a, "organization_code"))}
+    - organization_name: {_fmt(_get_value(record_a, "organization_name"))}
+    - organization_type: {_fmt(_get_value(record_a, "organization_type"))}
+    - parent_organization_id: {_fmt(_get_value(record_a, "parent_organization_id"))}
+    - organization_status: {_fmt(_get_value(record_a, "organization_status"))}
+    - location_id: {_fmt(_get_value(record_a, "location_id"))}
+    - source_system: {_fmt(_get_value(record_a, "source_system"))}
+
+    Record B Organization Evidence:
+    - organization_entity_id: {_fmt(_get_value(record_b, "organization_entity_id") or entity_id_b)}
+    - organization_code: {_fmt(_get_value(record_b, "organization_code"))}
+    - organization_name: {_fmt(_get_value(record_b, "organization_name"))}
+    - organization_type: {_fmt(_get_value(record_b, "organization_type"))}
+    - parent_organization_id: {_fmt(_get_value(record_b, "parent_organization_id"))}
+    - organization_status: {_fmt(_get_value(record_b, "organization_status"))}
+    - location_id: {_fmt(_get_value(record_b, "location_id"))}
     - source_system: {_fmt(_get_value(record_b, "source_system"))}
     """
 
@@ -1029,7 +2228,7 @@ Critical alignment rules:
 - Never say evidence strongly favors merge when deterministic identifiers, critical domain attributes, or weighted signals are materially conflicting.
 - If final confidence is low, automation readiness is low, or recommended_action is REVIEW_REQUIRED or BLOCK_MERGE, the explanation_summary must describe mixed, weak, or conflicting evidence.
 - If signal evidence shows low contribution from deterministic identifiers, do not describe the records as strong merge candidates even if match_score is high.
-- Do not say signal evidence is empty when supplier_id, tax_id, supplier_name,contact_email, supplier_address, or source_system values are present. 
+- Do not say signal evidence is empty when supplier_id, tax_id, supplier_name,contact_email, supplier_address, or source_system values are present.
 - If those values align, describe them as deterministic and supporting evidence.
 - If policy still requires review, say governance policy requires steward confirmation, not that evidence is empty.
 - Matching address corroborates supplier identity; governance policy still requires steward confirmation before automation.
@@ -1076,6 +2275,21 @@ Critical alignment rules:
 40. For BANKING, account_type, currency, institution_name, email, phone_number, address, and name are supporting evidence and must not override conflicting authoritative identifiers.
 41. For BANKING, missing banking identifiers are unavailable evidence, not conflicting evidence.
 42. For BANKING, prefer REVIEW_REQUIRED when authoritative banking identifiers are incomplete and identity depends primarily on non-unique attributes.
+43. For LOCATION, use location_id, site_id, location_code, location_name, location_type, physical address, parent_location_id, organization_entity_id, and source_system as evidence.
+44. For LOCATION, conflicting authoritative location_id, site_id, or location_code values are significant identity evidence and must not be minimized.
+45. For LOCATION, an exact physical-address match is supporting evidence only; multiple departments, suites, operational locations, or sites may share the same address.
+46. For LOCATION, parent_location_id is hierarchy evidence. Do not infer, invent, or require a child_location_id; child relationships are derived from records that reference the parent.
+47. For LOCATION, matching parent_location_id or organization_entity_id strengthens structural context but does not independently prove two Locations are the same entity.
+48. For LOCATION, missing location identifiers or hierarchy values are unavailable evidence, not conflicting evidence.
+49. For LOCATION, prefer REVIEW_REQUIRED when identity depends mainly on name/address similarity without an aligned authoritative location identifier.
+50. For ORGANIZATION, use organization_entity_id, organization_code, organization_name, organization_type, parent_organization_id, organization_status, related location evidence, and source_system as evidence.
+51. For ORGANIZATION, organization_entity_id is mastered entity evidence and is distinct from the internal tenant organization_id; never expose, compare, or infer the tenant identifier as business entity evidence.
+52. For ORGANIZATION, conflicting authoritative organization_entity_id or organization_code values are significant identity evidence and must not be minimized.
+53. For ORGANIZATION, organization-name similarity alone is supporting evidence and must never independently justify AUTO_MERGE.
+54. For ORGANIZATION, parent_organization_id is hierarchy evidence and must not be treated as proof that two child organizations are the same entity.
+55. For ORGANIZATION, organization_type and organization_status are supporting governance evidence; conflicts should increase caution but must not override aligned authoritative identifiers by themselves.
+56. For ORGANIZATION, missing organization identifiers or hierarchy values are unavailable evidence, not conflicting evidence.
+57. For ORGANIZATION, prefer REVIEW_REQUIRED when authoritative organization identifiers are incomplete and identity depends primarily on name, type, hierarchy, or location similarity.
 
 Decision calibration:
 - AUTO_MERGE: deterministic identifiers or highly aligned evidence with low risk and no conflicting identity attributes.
@@ -1172,3 +2386,4 @@ Output rules:
 """.strip()
 
     return prompt
+

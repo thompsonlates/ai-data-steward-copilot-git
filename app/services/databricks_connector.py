@@ -356,3 +356,136 @@ class DatabricksConnector:
             )
 
         return payload
+
+    def read_table_rows(
+        self,
+        *,
+        warehouse_id: str,
+        catalog: str,
+        schema_name: str,
+        table_name: str,
+        limit: int = 100_000,
+    ) -> list[dict[str, Any]]:
+        warehouse_id = str(warehouse_id or "").strip()
+        catalog = str(catalog or "").strip()
+        schema_name = str(schema_name or "").strip()
+        table_name = str(table_name or "").strip()
+
+        if not warehouse_id:
+            raise ValueError("warehouse_id is required.")
+
+        if not catalog or not schema_name or not table_name:
+            raise ValueError(
+                "catalog, schema_name, and table_name are required."
+            )
+
+        if limit <= 0 or limit > 100_000:
+            raise ValueError(
+                "limit must be between 1 and 100000."
+            )
+
+        # Identifiers come from the tenant-bound Enterprise Connection,
+        # not arbitrary client SQL.
+        def quote_identifier(value: str) -> str:
+            return f"`{value.replace('`', '``')}`"
+
+        qualified_table = ".".join(
+            [
+                quote_identifier(catalog),
+                quote_identifier(schema_name),
+                quote_identifier(table_name),
+            ]
+        )
+
+        statement = (
+            f"SELECT * FROM {qualified_table} "
+            f"LIMIT {int(limit)}"
+        )
+
+        response = requests.post(
+            f"{self.host}/api/2.0/sql/statements",
+            headers=self._headers(),
+            json={
+                "warehouse_id": warehouse_id,
+                "statement": statement,
+                "wait_timeout": "30s",
+                "on_wait_timeout": "CONTINUE",
+                "catalog": catalog,
+                "schema": schema_name,
+            },
+            timeout=35,
+        )
+
+        if not response.ok:
+            raise RuntimeError(
+                "Databricks Statement Execution API returned "
+                f"HTTP {response.status_code}."
+            )
+
+        body = response.json()
+
+        statement_id = str(
+            body.get("statement_id") or ""
+        ).strip()
+
+        if not statement_id:
+            raise RuntimeError(
+                "Databricks query response did not include statement_id."
+            )
+
+        while True:
+            state = str(
+                (body.get("status") or {}).get("state") or ""
+            ).upper()
+
+            if state in {
+                "SUCCEEDED",
+                "FAILED",
+                "CANCELED",
+                "CLOSED",
+            }:
+                break
+
+            time.sleep(1)
+
+            poll_response = requests.get(
+                f"{self.host}/api/2.0/sql/statements/{statement_id}",
+                headers=self._headers(),
+                timeout=self.timeout_seconds,
+            )
+
+            if not poll_response.ok:
+                raise RuntimeError(
+                    "Databricks statement polling returned "
+                    f"HTTP {poll_response.status_code}."
+                )
+
+            body = poll_response.json()
+
+        if state != "SUCCEEDED":
+            error = (
+                (body.get("status") or {}).get("error")
+                or {}
+            )
+
+            raise RuntimeError(
+                "Databricks profile query failed: "
+                f"{error.get('message') or state}"
+            )
+
+        manifest = body.get("manifest") or {}
+        schema = manifest.get("schema") or {}
+        columns = schema.get("columns") or []
+
+        column_names = [
+            str(column.get("name") or "")
+            for column in columns
+        ]
+
+        result = body.get("result") or {}
+        data_array = result.get("data_array") or []
+
+        return [
+            dict(zip(column_names, row))
+            for row in data_array
+        ]

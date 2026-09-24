@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
 import uuid
 from dataclasses import dataclass, field
@@ -9,6 +10,11 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
 
 from google.cloud import bigquery
+
+from app.services.universal_profile_rules_engine import (
+    UniversalProfileRuleResult,
+    UniversalProfileRulesEngine,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -44,6 +50,7 @@ class QualityFinding:
     severity: str
     finding_message: str
     observed_value: Optional[str] = None
+    proposed_value: Optional[str] = None
 
 @dataclass(frozen=True)
 class QualityFieldConfig:
@@ -56,6 +63,10 @@ class QualityFieldConfig:
     regex_pattern: Optional[str] = None
 
     allowed_values: Sequence[str] = field(
+        default_factory=tuple
+    )
+
+    allowed_uom_values: Sequence[str] = field(
         default_factory=tuple
     )
 
@@ -78,6 +89,40 @@ class CrossFieldRule:
 
 
 @dataclass(frozen=True)
+class CompositeUniquenessRule:
+    """
+    A generic dataset-level uniqueness rule spanning two or more fields.
+
+    Example:
+        (product_id, gtin) must be unique when both values are present.
+    """
+
+    rule_id: str
+    fields: Sequence[str]
+    description: str
+    severity: str = "HIGH"
+    weight: float = 1.5
+
+
+@dataclass(frozen=True)
+class MappingCollisionRule:
+    """
+    A generic relationship rule that detects one identifier mapping to
+    multiple identifiers in another field.
+
+    Example:
+        one GTIN should not map to multiple product_id values.
+    """
+
+    rule_id: str
+    key_field: str
+    mapped_field: str
+    description: str
+    severity: str = "CRITICAL"
+    weight: float = 2.0
+
+
+@dataclass(frozen=True)
 class QualityProfileConfig:
     domain: str
 
@@ -90,6 +135,14 @@ class QualityProfileConfig:
     cross_field_rules: Sequence[CrossFieldRule] = field(
         default_factory=tuple
     )
+
+    composite_uniqueness_rules: Sequence[
+        CompositeUniquenessRule
+    ] = field(default_factory=tuple)
+
+    mapping_collision_rules: Sequence[
+        MappingCollisionRule
+    ] = field(default_factory=tuple)
 
     minimum_record_score: float = 80.0
 
@@ -117,6 +170,26 @@ class RecordQualityScore:
     high_issue_count: int
     medium_issue_count: int
     low_issue_count: int
+
+
+@dataclass
+class QualityRuleExecution:
+    organization_id: str
+    profile_run_id: str
+    domain: str
+    source_table: str
+
+    rule_id: str
+    dimension: str
+    severity: str
+
+    evaluated_record_count: int
+    passed_record_count: int
+    failed_record_count: int
+    skipped_record_count: int
+
+    execution_status: str
+    compliance_rate: Optional[float]
 
 
 @dataclass
@@ -165,8 +238,15 @@ class QualityProfileResult:
 
     record_scores: List[RecordQualityScore]
 
+    rule_executions: List[QualityRuleExecution]
 
     generated_at: datetime
+
+    # Phase 1 Universal Rules integration is intentionally shadow-only.
+    # Existing findings, scores, duplicate counts, and rule executions remain
+    # authoritative until regression testing is complete.
+    universal_rules_shadow_enabled: bool = False
+    universal_rules_shadow: Optional[Dict[str, Any]] = None
 
 
 
@@ -193,9 +273,33 @@ class QualityProfilerService:
         *,
         client: bigquery.Client | None = None,
         project_id: Optional[str] = None,
+        universal_rules_engine: UniversalProfileRulesEngine | None = None,
+        enable_universal_rules_shadow: Optional[bool] = None,
     ) -> None:
         self.client = client or bigquery.Client(
             project=project_id
+        )
+
+        self.universal_rules_engine = (
+            universal_rules_engine
+            or UniversalProfileRulesEngine()
+        )
+
+        if enable_universal_rules_shadow is None:
+            enable_universal_rules_shadow = str(
+                os.getenv(
+                    "ADMS_UNIVERSAL_PROFILE_RULES_SHADOW",
+                    "false",
+                )
+            ).strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+
+        self.enable_universal_rules_shadow = bool(
+            enable_universal_rules_shadow
         )
 
     # ---------------------------------------------------------
@@ -490,6 +594,378 @@ class QualityProfilerService:
 
         return checksum % 10 == 0
 
+    @staticmethod
+    def _parse_composite_unique_fields(
+        condition: str,
+    ) -> tuple[str, ...]:
+        prefix = "COMPOSITE_UNIQUE:"
+        normalized = str(condition or "").strip()
+
+        if not normalized.upper().startswith(prefix):
+            return tuple()
+
+        raw_fields = normalized[len(prefix):]
+        fields = tuple(
+            str(item or "").strip().lower()
+            for item in raw_fields.split(",")
+            if str(item or "").strip()
+        )
+
+        return fields if len(fields) >= 2 else tuple()
+
+    @classmethod
+    def _find_cross_field_composite_duplicate_keys(
+        cls,
+        *,
+        rows: Sequence[Dict[str, Any]],
+        rules: Sequence[CrossFieldRule],
+    ) -> Dict[str, set[tuple[str, ...]]]:
+        results: Dict[str, set[tuple[str, ...]]] = {}
+
+        for rule in rules:
+            fields = cls._parse_composite_unique_fields(
+                rule.sql_condition
+            )
+
+            if not fields:
+                continue
+
+            counts: Dict[tuple[str, ...], int] = {}
+
+            for row in rows:
+                key = tuple(
+                    cls._normalize_identifier(
+                        row.get(field_name)
+                    )
+                    for field_name in fields
+                )
+
+                if not key or any(not value for value in key):
+                    continue
+
+                counts[key] = counts.get(key, 0) + 1
+
+            results[rule.rule_id] = {
+                key
+                for key, count in counts.items()
+                if count > 1
+            }
+
+        return results
+
+    @staticmethod
+    def _register_rule_execution(
+        state: Dict[str, Dict[str, Any]],
+        *,
+        rule_id: str,
+        dimension: str,
+        severity: str,
+        not_implemented: bool = False,
+    ) -> None:
+        normalized_rule_id = str(rule_id or "").strip().upper()
+
+        if not normalized_rule_id:
+            return
+
+        safe_dimension = str(dimension or "VALIDITY").strip().upper()
+        safe_severity = str(severity or "MEDIUM").strip().upper()
+
+        if safe_dimension not in VALID_DIMENSIONS:
+            safe_dimension = "VALIDITY"
+
+        if safe_severity not in VALID_SEVERITIES:
+            safe_severity = "MEDIUM"
+
+        existing = state.setdefault(
+            normalized_rule_id,
+            {
+                "rule_id": normalized_rule_id,
+                "dimension": safe_dimension,
+                "severity": safe_severity,
+                "evaluated": 0,
+                "passed": 0,
+                "failed": 0,
+                "skipped": 0,
+                "not_implemented": False,
+            },
+        )
+
+        if not_implemented:
+            existing["not_implemented"] = True
+
+    @classmethod
+    def _initialize_rule_execution_state(
+        cls,
+        *,
+        config: QualityProfileConfig,
+        domain: str,
+    ) -> Dict[str, Dict[str, Any]]:
+        state: Dict[str, Dict[str, Any]] = {}
+        normalized_domain = str(domain or "").strip().upper()
+        junk_text_fields = {
+            "full_name",
+            "first_name",
+            "last_name",
+            "supplier_name",
+            "product_name",
+            "institution_name",
+            "specialty",
+            "address",
+        }
+
+        for field_config in config.fields:
+            field_name = str(field_config.field_name).strip().lower()
+            prefix = field_name.upper()
+            severity = field_config.severity
+
+            if field_config.required:
+                cls._register_rule_execution(
+                    state,
+                    rule_id=f"{prefix}_REQUIRED",
+                    dimension="COMPLETENESS",
+                    severity=severity,
+                )
+
+            if field_config.regex_pattern:
+                cls._register_rule_execution(
+                    state,
+                    rule_id=f"{prefix}_FORMAT_VALIDITY",
+                    dimension="VALIDITY",
+                    severity=severity,
+                )
+
+            if field_config.allowed_values:
+                cls._register_rule_execution(
+                    state,
+                    rule_id=f"{prefix}_ALLOWED_VALUE",
+                    dimension="VALIDITY",
+                    severity=severity,
+                )
+
+            if field_config.standardization_required:
+                cls._register_rule_execution(
+                    state,
+                    rule_id=f"{prefix}_STANDARDIZATION",
+                    dimension="STANDARDIZATION",
+                    severity="LOW",
+                )
+
+            if (
+                field_config.uniqueness_key
+                and field_name == config.business_key_field
+            ):
+                cls._register_rule_execution(
+                    state,
+                    rule_id=f"{prefix}_UNIQUENESS",
+                    dimension="UNIQUENESS",
+                    severity="HIGH",
+                )
+
+            if field_name == "phone_number" or field_name in junk_text_fields:
+                cls._register_rule_execution(
+                    state,
+                    rule_id=f"{prefix}_JUNK_VALUE",
+                    dimension="VALIDITY",
+                    severity=severity,
+                )
+
+            if normalized_domain == "BANKING" and field_name == "routing_number":
+                cls._register_rule_execution(
+                    state,
+                    rule_id="ROUTING_NUMBER_CHECKSUM_VALIDITY",
+                    dimension="VALIDITY",
+                    severity="CRITICAL",
+                )
+
+            if normalized_domain == "PRODUCT" and field_name == "effective_lot_date":
+                cls._register_rule_execution(
+                    state,
+                    rule_id="EFFECTIVE_LOT_DATE_DATE_VALIDITY",
+                    dimension="VALIDITY",
+                    severity=severity,
+                )
+
+            if normalized_domain in {"CUSTOMER", "PATIENT"} and field_name == "dob":
+                cls._register_rule_execution(
+                    state,
+                    rule_id="DOB_DATE_VALIDITY",
+                    dimension="VALIDITY",
+                    severity=severity,
+                )
+
+            if normalized_domain == "PROVIDER" and field_name == "npi":
+                cls._register_rule_execution(
+                    state,
+                    rule_id="NPI_CHECKSUM_VALIDITY",
+                    dimension="VALIDITY",
+                    severity="CRITICAL",
+                )
+
+            if field_name == "phone_number":
+                cls._register_rule_execution(
+                    state,
+                    rule_id="PHONE_NUMBER_SEMANTIC_VALIDITY",
+                    dimension="VALIDITY",
+                    severity=severity,
+                )
+
+            if normalized_domain == "PRODUCT" and field_name == "gtin":
+                cls._register_rule_execution(
+                    state,
+                    rule_id="GTIN_CHECKSUM_VALIDITY",
+                    dimension="VALIDITY",
+                    severity="HIGH",
+                )
+
+            if (
+                normalized_domain == "PRODUCT"
+                and field_name == "product_variant"
+                and field_config.allowed_uom_values
+            ):
+                cls._register_rule_execution(
+                    state,
+                    rule_id="PRODUCT_VARIANT_UOM_VALIDITY",
+                    dimension="VALIDITY",
+                    severity=severity,
+                )
+
+                # Authoritative governance rule.
+                #
+                # This is the single policy-facing Product Variant control.
+                # A populated Product Variant passes only when it has:
+                #   quantity + exactly one space + approved UOM
+                #
+                # Diagnostic rules such as FORMAT_VALIDITY,
+                # UOM_VALIDITY, and STANDARDIZATION remain available
+                # to explain why the authoritative control failed.
+                cls._register_rule_execution(
+                    state,
+                    rule_id="PRODUCT_VARIANT_VALIDITY",
+                    dimension="VALIDITY",
+                    severity=severity,
+                )
+
+        for rule in config.composite_uniqueness_rules:
+            cls._register_rule_execution(
+                state,
+                rule_id=rule.rule_id,
+                dimension="UNIQUENESS",
+                severity=rule.severity,
+            )
+
+        for rule in config.mapping_collision_rules:
+            cls._register_rule_execution(
+                state,
+                rule_id=rule.rule_id,
+                dimension="CONSISTENCY",
+                severity=rule.severity,
+            )
+
+        for rule in config.cross_field_rules:
+            supported = bool(
+                cls._parse_composite_unique_fields(
+                    rule.sql_condition
+                )
+            )
+            cls._register_rule_execution(
+                state,
+                rule_id=rule.rule_id,
+                dimension="CONSISTENCY",
+                severity=rule.severity,
+                not_implemented=not supported,
+            )
+
+        return state
+
+    @classmethod
+    def _observe_rule_execution(
+        cls,
+        state: Dict[str, Dict[str, Any]],
+        *,
+        rule_id: str,
+        dimension: str,
+        severity: str,
+        outcome: str,
+    ) -> None:
+        cls._register_rule_execution(
+            state,
+            rule_id=rule_id,
+            dimension=dimension,
+            severity=severity,
+        )
+
+        item = state[str(rule_id).strip().upper()]
+        normalized_outcome = str(outcome or "").strip().upper()
+
+        if normalized_outcome == "PASS":
+            item["evaluated"] += 1
+            item["passed"] += 1
+        elif normalized_outcome == "FAIL":
+            item["evaluated"] += 1
+            item["failed"] += 1
+        elif normalized_outcome == "SKIP":
+            item["skipped"] += 1
+        else:
+            raise ValueError(
+                f"Unsupported rule execution outcome: {outcome}"
+            )
+
+    @staticmethod
+    def _finalize_rule_executions(
+        *,
+        organization_id: str,
+        profile_run_id: str,
+        domain: str,
+        source_table: str,
+        state: Dict[str, Dict[str, Any]],
+    ) -> List[QualityRuleExecution]:
+        results: List[QualityRuleExecution] = []
+
+        for rule_id in sorted(state):
+            item = state[rule_id]
+            evaluated = int(item.get("evaluated") or 0)
+            passed = int(item.get("passed") or 0)
+            failed = int(item.get("failed") or 0)
+            skipped = int(item.get("skipped") or 0)
+            not_implemented = bool(item.get("not_implemented"))
+
+            if not_implemented:
+                execution_status = "NOT_IMPLEMENTED"
+                compliance_rate = None
+            elif evaluated > 0:
+                execution_status = "EXECUTED"
+                compliance_rate = passed / evaluated
+            elif skipped > 0:
+                execution_status = "NOT_APPLICABLE"
+                compliance_rate = None
+            else:
+                execution_status = "NOT_EVALUATED"
+                compliance_rate = None
+
+            results.append(
+                QualityRuleExecution(
+                    organization_id=organization_id,
+                    profile_run_id=profile_run_id,
+                    domain=domain,
+                    source_table=source_table,
+                    rule_id=rule_id,
+                    dimension=str(item["dimension"]),
+                    severity=str(item["severity"]),
+                    evaluated_record_count=evaluated,
+                    passed_record_count=passed,
+                    failed_record_count=failed,
+                    skipped_record_count=skipped,
+                    execution_status=execution_status,
+                    compliance_rate=(
+                        round(compliance_rate, 6)
+                        if compliance_rate is not None
+                        else None
+                    ),
+                )
+            )
+
+        return results
+
     def profile_rows(
         self,
         *,
@@ -575,10 +1051,46 @@ class QualityProfilerService:
             len(normalized_rows),
         )
 
+        business_key_is_unique = any(
+            field_config.field_name == business_key_field
+            and field_config.uniqueness_key
+            for field_config in config.fields
+        )
+
         duplicate_keys = (
             self._find_duplicate_business_keys(
                 rows=normalized_rows,
                 business_key_field=business_key_field,
+            )
+            if business_key_is_unique
+            else set()
+        )
+
+        composite_duplicate_keys = (
+            self._find_composite_duplicate_keys(
+                rows=normalized_rows,
+                rules=config.composite_uniqueness_rules,
+            )
+        )
+
+        mapping_collision_keys = (
+            self._find_mapping_collisions(
+                rows=normalized_rows,
+                rules=config.mapping_collision_rules,
+            )
+        )
+
+        cross_field_composite_duplicate_keys = (
+            self._find_cross_field_composite_duplicate_keys(
+                rows=normalized_rows,
+                rules=config.cross_field_rules,
+            )
+        )
+
+        rule_execution_state = (
+            self._initialize_rule_execution_state(
+                config=config,
+                domain=normalized_domain,
             )
         )
 
@@ -622,6 +1134,18 @@ class QualityProfilerService:
                 row=row,
                 config=config,
                 duplicate_keys=duplicate_keys,
+                composite_duplicate_keys=(
+                    composite_duplicate_keys
+                ),
+                mapping_collision_keys=(
+                    mapping_collision_keys
+                ),
+                cross_field_composite_duplicate_keys=(
+                    cross_field_composite_duplicate_keys
+                ),
+                rule_execution_state=(
+                    rule_execution_state
+                ),
             )
 
             findings.extend(
@@ -631,6 +1155,16 @@ class QualityProfilerService:
             scores.append(
                 row_score
             )
+
+        rule_executions = (
+            self._finalize_rule_executions(
+                organization_id=effective_organization_id,
+                profile_run_id=profile_run_id,
+                domain=normalized_domain,
+                source_table=normalized_source_name,
+                state=rule_execution_state,
+            )
+        )
 
         result = self._build_result(
             organization_id=effective_organization_id,
@@ -642,23 +1176,230 @@ class QualityProfilerService:
             ),
             findings=findings,
             scores=scores,
+            rule_executions=rule_executions,
             total_records=len(
                 normalized_rows
             ),
             duplicate_record_count=(
-                self._count_duplicate_records(
+                self._count_duplicate_identity_records(
                     rows=normalized_rows,
                     business_key_field=(
                         business_key_field
                     ),
-                    duplicate_keys=(
-                        duplicate_keys
+                    duplicate_keys=duplicate_keys,
+                    composite_rules=(
+                        config.composite_uniqueness_rules
+                    ),
+                    composite_duplicate_keys=(
+                        composite_duplicate_keys
                     ),
                 )
             ),
         )
 
+        # -----------------------------------------------------
+        # Universal Profile Rules - Phase 1 shadow integration
+        # -----------------------------------------------------
+        #
+        # Shadow mode is deliberately non-authoritative:
+        # - it does not change existing QualityFinding rows
+        # - it does not change RecordQualityScore calculations
+        # - it does not change duplicate counts
+        # - it does not change existing QualityRuleExecution rows
+        # - it does not persist or activate rules
+        #
+        # This lets us compare the new governed rule architecture against
+        # the mature profiler before promoting any universal rule into the
+        # production DQ scoring path.
+        result.universal_rules_shadow_enabled = (
+            self.enable_universal_rules_shadow
+        )
+
+        if self.enable_universal_rules_shadow:
+            universal_result = (
+                self._evaluate_universal_rules_shadow(
+                    organization_id=effective_organization_id,
+                    profile_run_id=profile_run_id,
+                    domain=normalized_domain,
+                    source_name=normalized_source_name,
+                    business_key_field=business_key_field,
+                    rows=normalized_rows,
+                    config=config,
+                )
+            )
+
+            result.universal_rules_shadow = (
+                self._serialize_universal_rules_shadow(
+                    universal_result
+                )
+            )
+
+            logger.info(
+                "Universal Profile Rules shadow evaluation complete. "
+                "organization_id=%s profile_run_id=%s domain=%s "
+                "resolved_rules=%s executed_rules=%s findings=%s",
+                effective_organization_id,
+                profile_run_id,
+                normalized_domain,
+                universal_result.resolved_rule_count,
+                universal_result.executed_rule_count,
+                universal_result.total_findings,
+            )
+
         return result
+
+    def _evaluate_universal_rules_shadow(
+        self,
+        *,
+        organization_id: str,
+        profile_run_id: str,
+        domain: str,
+        source_name: str,
+        business_key_field: str,
+        rows: Sequence[Dict[str, Any]],
+        config: QualityProfileConfig,
+    ) -> UniversalProfileRuleResult:
+        """
+        Run ACTIVE governed universal/semantic rules without affecting the
+        existing profiler's authoritative findings or scoring.
+
+        Mapped fields come from the existing QualityProfileConfig plus the
+        business key so the new engine evaluates the same logical dataset.
+        """
+
+        mapped_fields = {
+            str(field_config.field_name).strip().lower()
+            for field_config in config.fields
+            if str(field_config.field_name or "").strip()
+        }
+        mapped_fields.add(
+            str(business_key_field).strip().lower()
+        )
+
+        return self.universal_rules_engine.evaluate_profile(
+            organization_id=organization_id,
+            domain=domain,
+            profile_run_id=profile_run_id,
+            rows=rows,
+            source_name=source_name,
+            business_key_field=business_key_field,
+            mapped_fields=tuple(
+                sorted(mapped_fields)
+            ),
+        )
+
+    @staticmethod
+    def _serialize_universal_rules_shadow(
+        universal_result: UniversalProfileRuleResult,
+    ) -> Dict[str, Any]:
+        """
+        Return a JSON-safe diagnostic payload for backend regression testing.
+
+        We intentionally expose evidence, not governance mutations. The
+        existing API can decide later whether/how to surface this in the UI.
+        """
+
+        semantic_types: Dict[str, Dict[str, Any]] = {}
+
+        for field_name, inference in (
+            universal_result.semantic_inferences.items()
+        ):
+            semantic_type = getattr(
+                inference,
+                "semantic_type",
+                None,
+            )
+            semantic_types[field_name] = {
+                "semantic_type": (
+                    getattr(semantic_type, "value", semantic_type)
+                ),
+                "confidence": getattr(
+                    inference,
+                    "confidence",
+                    None,
+                ),
+                "source": (
+                    getattr(
+                        getattr(inference, "source", None),
+                        "value",
+                        getattr(inference, "source", None),
+                    )
+                ),
+                "requires_review": getattr(
+                    inference,
+                    "requires_review",
+                    None,
+                ),
+            }
+
+        return {
+            "mode": "SHADOW",
+            "authoritative": False,
+            "profile_run_id": universal_result.profile_run_id,
+            "domain": universal_result.domain,
+            "source_name": universal_result.source_name,
+            "total_records": universal_result.total_records,
+            "resolved_rule_count": (
+                universal_result.resolved_rule_count
+            ),
+            "executed_rule_count": (
+                universal_result.executed_rule_count
+            ),
+            "total_findings": universal_result.total_findings,
+            "semantic_types": semantic_types,
+            "findings": [
+                {
+                    "rule_id": item.rule_id,
+                    "rule_version": item.rule_version,
+                    "logical_key": item.logical_key,
+                    "rule_family": item.rule_family,
+                    "evaluator": item.evaluator,
+                    "severity": item.severity,
+                    "field_name": item.field_name,
+                    "semantic_type": item.semantic_type,
+                    "source_row_id": item.source_row_id,
+                    "record_id": item.record_id,
+                    "finding_message": item.finding_message,
+                    "observed_value": item.observed_value,
+                    "proposed_value": item.proposed_value,
+                    "deterministic": item.deterministic,
+                    "remediation_available": (
+                        item.remediation_available
+                    ),
+                    "remediation_type": item.remediation_type,
+                }
+                for item in universal_result.findings
+            ],
+            "rule_executions": [
+                {
+                    "rule_id": item.rule_id,
+                    "rule_version": item.rule_version,
+                    "logical_key": item.logical_key,
+                    "rule_family": item.rule_family,
+                    "evaluator": item.evaluator,
+                    "severity": item.severity,
+                    "field_name": item.field_name,
+                    "semantic_type": item.semantic_type,
+                    "evaluated_record_count": (
+                        item.evaluated_record_count
+                    ),
+                    "passed_record_count": (
+                        item.passed_record_count
+                    ),
+                    "failed_record_count": (
+                        item.failed_record_count
+                    ),
+                    "skipped_record_count": (
+                        item.skipped_record_count
+                    ),
+                    "execution_status": item.execution_status,
+                    "compliance_rate": item.compliance_rate,
+                    "deterministic": item.deterministic,
+                }
+                for item in universal_result.rule_executions
+            ],
+        }
+
     # ---------------------------------------------------------
     # Configuration validation
     # ---------------------------------------------------------
@@ -695,6 +1436,57 @@ class QualityProfilerService:
                     f"{severity}"
                 )
 
+        for rule in config.composite_uniqueness_rules:
+            if not rule.rule_id:
+                raise ValueError(
+                    "Composite uniqueness rule_id is required."
+                )
+
+            if len(tuple(rule.fields)) < 2:
+                raise ValueError(
+                    "Composite uniqueness rules require "
+                    "at least two fields."
+                )
+
+            for field_name in rule.fields:
+                self._validate_field_name(field_name)
+
+            if str(rule.severity).upper() not in VALID_SEVERITIES:
+                raise ValueError(
+                    f"Invalid severity: {rule.severity}"
+                )
+
+            if rule.weight <= 0:
+                raise ValueError(
+                    "Composite uniqueness rule weight must "
+                    "be greater than zero."
+                )
+
+        for rule in config.mapping_collision_rules:
+            if not rule.rule_id:
+                raise ValueError(
+                    "Mapping collision rule_id is required."
+                )
+
+            self._validate_field_name(rule.key_field)
+            self._validate_field_name(rule.mapped_field)
+
+            if rule.key_field == rule.mapped_field:
+                raise ValueError(
+                    "Mapping collision rule fields must differ."
+                )
+
+            if str(rule.severity).upper() not in VALID_SEVERITIES:
+                raise ValueError(
+                    f"Invalid severity: {rule.severity}"
+                )
+
+            if rule.weight <= 0:
+                raise ValueError(
+                    "Mapping collision rule weight must "
+                    "be greater than zero."
+                )
+
         if not (
             0
             <= config.minimum_record_score
@@ -727,6 +1519,20 @@ class QualityProfilerService:
             )
             for field in config.fields
         )
+
+        for rule in config.composite_uniqueness_rules:
+            selected_fields.update(
+                self._validate_field_name(field_name)
+                for field_name in rule.fields
+            )
+
+        for rule in config.mapping_collision_rules:
+            selected_fields.add(
+                self._validate_field_name(rule.key_field)
+            )
+            selected_fields.add(
+                self._validate_field_name(rule.mapped_field)
+            )
 
         field_list = ",\n".join(
             f"`{field_name}`"
@@ -1082,6 +1888,139 @@ class QualityProfilerService:
             if count > 1
         }
 
+    @staticmethod
+    def _find_composite_duplicate_keys(
+        *,
+        rows: Sequence[Dict[str, Any]],
+        rules: Sequence[CompositeUniquenessRule],
+    ) -> Dict[str, set[tuple[str, ...]]]:
+        """
+        Precompute duplicate composite identities once per profile.
+
+        A rule is evaluated only when every component value is present.
+        This is important for optional identifiers such as GTIN.
+        """
+        duplicate_keys: Dict[
+            str,
+            set[tuple[str, ...]],
+        ] = {}
+
+        for rule in rules:
+            counts: Dict[tuple[str, ...], int] = {}
+
+            for row in rows:
+                key = tuple(
+                    QualityProfilerService._normalize_identifier(
+                        row.get(field_name)
+                    )
+                    for field_name in rule.fields
+                )
+
+                if not key or any(not value for value in key):
+                    continue
+
+                counts[key] = counts.get(key, 0) + 1
+
+            duplicate_keys[rule.rule_id] = {
+                key
+                for key, count in counts.items()
+                if count > 1
+            }
+
+        return duplicate_keys
+
+    @staticmethod
+    def _find_mapping_collisions(
+        *,
+        rows: Sequence[Dict[str, Any]],
+        rules: Sequence[MappingCollisionRule],
+    ) -> Dict[str, set[str]]:
+        """
+        Precompute identifier collisions once per profile.
+
+        Example: if one GTIN maps to more than one product_id, the GTIN
+        is returned as a collision key for that rule.
+        """
+        collisions: Dict[str, set[str]] = {}
+
+        for rule in rules:
+            mappings: Dict[str, set[str]] = {}
+
+            for row in rows:
+                key_value = (
+                    QualityProfilerService._normalize_identifier(
+                        row.get(rule.key_field)
+                    )
+                )
+                mapped_value = (
+                    QualityProfilerService._normalize_identifier(
+                        row.get(rule.mapped_field)
+                    )
+                )
+
+                if not key_value or not mapped_value:
+                    continue
+
+                mappings.setdefault(key_value, set()).add(
+                    mapped_value
+                )
+
+            collisions[rule.rule_id] = {
+                key_value
+                for key_value, mapped_values in mappings.items()
+                if len(mapped_values) > 1
+            }
+
+        return collisions
+
+    @staticmethod
+    def _count_duplicate_identity_records(
+        *,
+        rows: Sequence[Dict[str, Any]],
+        business_key_field: str,
+        duplicate_keys: set[str],
+        composite_rules: Sequence[CompositeUniquenessRule],
+        composite_duplicate_keys: Dict[
+            str,
+            set[tuple[str, ...]],
+        ],
+    ) -> int:
+        """
+        Count records participating in an actual configured uniqueness
+        failure. Repeated non-unique business keys are intentionally not
+        counted as duplicate records.
+        """
+        duplicate_row_indexes: set[int] = set()
+
+        for row_index, row in enumerate(rows):
+            business_key = (
+                QualityProfilerService._normalize_identifier(
+                    row.get(business_key_field)
+                )
+            )
+
+            if business_key and business_key in duplicate_keys:
+                duplicate_row_indexes.add(row_index)
+
+            for rule in composite_rules:
+                key = tuple(
+                    QualityProfilerService._normalize_identifier(
+                        row.get(field_name)
+                    )
+                    for field_name in rule.fields
+                )
+
+                if not key or any(not value for value in key):
+                    continue
+
+                if key in composite_duplicate_keys.get(
+                    rule.rule_id,
+                    set(),
+                ):
+                    duplicate_row_indexes.add(row_index)
+
+        return len(duplicate_row_indexes)
+
     # ---------------------------------------------------------
     # Record profiling
     # ---------------------------------------------------------
@@ -1098,6 +2037,16 @@ class QualityProfilerService:
         row: Dict[str, Any],
         config: QualityProfileConfig,
         duplicate_keys: set[str],
+        composite_duplicate_keys: Dict[
+            str,
+            set[tuple[str, ...]],
+        ],
+        mapping_collision_keys: Dict[str, set[str]],
+        cross_field_composite_duplicate_keys: Dict[
+            str,
+            set[tuple[str, ...]],
+        ],
+        rule_execution_state: Dict[str, Dict[str, Any]],
     ) -> tuple[
         List[QualityFinding],
         RecordQualityScore,
@@ -1146,6 +2095,14 @@ class QualityProfilerService:
                     normalized_value
                 )
 
+                self._observe_rule_execution(
+                    rule_execution_state,
+                    rule_id=f"{field_name.upper()}_REQUIRED",
+                    dimension="COMPLETENESS",
+                    severity=field_config.severity,
+                    outcome="PASS" if passed else "FAIL",
+                )
+
                 dimension_results[
                     "COMPLETENESS"
                 ].append(
@@ -1189,6 +2146,18 @@ class QualityProfilerService:
             # ------------------------------------------
 
             if (
+                not normalized_value
+                and field_config.regex_pattern
+            ):
+                self._observe_rule_execution(
+                    rule_execution_state,
+                    rule_id=f"{field_name.upper()}_FORMAT_VALIDITY",
+                    dimension="VALIDITY",
+                    severity=field_config.severity,
+                    outcome="SKIP",
+                )
+
+            if (
                 normalized_value
                 and field_config.regex_pattern
             ):
@@ -1197,6 +2166,14 @@ class QualityProfilerService:
                         field_config.regex_pattern,
                         normalized_value,
                     )
+                )
+
+                self._observe_rule_execution(
+                    rule_execution_state,
+                    rule_id=f"{field_name.upper()}_FORMAT_VALIDITY",
+                    dimension="VALIDITY",
+                    severity=field_config.severity,
+                    outcome="PASS" if passed else "FAIL",
                 )
 
                 dimension_results[
@@ -1232,6 +2209,15 @@ class QualityProfilerService:
                         )
                     )
 
+            if domain.upper() == "BANKING" and field_name == "routing_number" and (
+                not normalized_value
+                or not re.fullmatch(r"\d{9}", normalized_value)
+            ):
+                self._observe_rule_execution(
+                    rule_execution_state, rule_id="ROUTING_NUMBER_CHECKSUM_VALIDITY",
+                    dimension="VALIDITY", severity="CRITICAL", outcome="SKIP"
+                )
+
             # ------------------------------------------
             # Banking - ABA routing checksum
             # ------------------------------------------
@@ -1247,6 +2233,14 @@ class QualityProfilerService:
             ):
                 passed = self._is_valid_aba_routing_number(
                     normalized_value
+                )
+
+                self._observe_rule_execution(
+                    rule_execution_state,
+                    rule_id="ROUTING_NUMBER_CHECKSUM_VALIDITY",
+                    dimension="VALIDITY",
+                    severity="CRITICAL",
+                    outcome="PASS" if passed else "FAIL",
                 )
 
                 dimension_results[
@@ -1283,6 +2277,18 @@ class QualityProfilerService:
                         )
                     )
 
+            if domain.upper() == "PRODUCT" and field_name == "effective_lot_date" and (
+                not normalized_value
+                or not re.fullmatch(
+                    r"(?:\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4}|\d{4}/\d{2}/\d{2})",
+                    normalized_value,
+                )
+            ):
+                self._observe_rule_execution(
+                    rule_execution_state, rule_id="EFFECTIVE_LOT_DATE_DATE_VALIDITY",
+                    dimension="VALIDITY", severity=field_config.severity, outcome="SKIP"
+                )
+
             # ------------------------------------------
             # Product - effective / lot date validity
             # ------------------------------------------
@@ -1303,6 +2309,14 @@ class QualityProfilerService:
                 passed = self._is_valid_date_value(
                     normalized_value,
                     allow_future=True,
+                )
+
+                self._observe_rule_execution(
+                    rule_execution_state,
+                    rule_id="EFFECTIVE_LOT_DATE_DATE_VALIDITY",
+                    dimension="VALIDITY",
+                    severity=field_config.severity,
+                    outcome="PASS" if passed else "FAIL",
                 )
 
                 dimension_results[
@@ -1338,6 +2352,18 @@ class QualityProfilerService:
                         )
                     )
 
+            if domain.upper() in {"CUSTOMER", "PATIENT"} and field_name == "dob" and (
+                not normalized_value
+                or not re.fullmatch(
+                    r"(?:\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4}|\d{4}/\d{2}/\d{2})",
+                    normalized_value,
+                )
+            ):
+                self._observe_rule_execution(
+                    rule_execution_state, rule_id="DOB_DATE_VALIDITY",
+                    dimension="VALIDITY", severity=field_config.severity, outcome="SKIP"
+                )
+
             # ------------------------------------------
             # Customer / Patient - DOB validity
             # ------------------------------------------
@@ -1358,6 +2384,14 @@ class QualityProfilerService:
                 passed = self._is_valid_date_value(
                     normalized_value,
                     allow_future=False,
+                )
+
+                self._observe_rule_execution(
+                    rule_execution_state,
+                    rule_id="DOB_DATE_VALIDITY",
+                    dimension="VALIDITY",
+                    severity=field_config.severity,
+                    outcome="PASS" if passed else "FAIL",
                 )
 
                 dimension_results[
@@ -1390,6 +2424,15 @@ class QualityProfilerService:
                         )
                     )
 
+            if domain.upper() == "PROVIDER" and field_name == "npi" and (
+                not normalized_value
+                or not re.fullmatch(r"\d{10}", normalized_value)
+            ):
+                self._observe_rule_execution(
+                    rule_execution_state, rule_id="NPI_CHECKSUM_VALIDITY",
+                    dimension="VALIDITY", severity="CRITICAL", outcome="SKIP"
+                )
+
             # ------------------------------------------
             # Provider - NPI checksum
             # ------------------------------------------
@@ -1405,6 +2448,14 @@ class QualityProfilerService:
             ):
                 passed = self._is_valid_npi(
                     normalized_value
+                )
+
+                self._observe_rule_execution(
+                    rule_execution_state,
+                    rule_id="NPI_CHECKSUM_VALIDITY",
+                    dimension="VALIDITY",
+                    severity="CRITICAL",
+                    outcome="PASS" if passed else "FAIL",
                 )
 
                 dimension_results[
@@ -1437,6 +2488,15 @@ class QualityProfilerService:
                         )
                     )
 
+            if field_name == "phone_number" and (
+                not normalized_value
+                or self._is_junk_phone(normalized_value)
+            ):
+                self._observe_rule_execution(
+                    rule_execution_state, rule_id="PHONE_NUMBER_SEMANTIC_VALIDITY",
+                    dimension="VALIDITY", severity=field_config.severity, outcome="SKIP"
+                )
+
             # ------------------------------------------
             # Phone semantic validity
             # ------------------------------------------
@@ -1452,6 +2512,14 @@ class QualityProfilerService:
                     self._is_valid_phone_number(
                         normalized_value
                     )
+                )
+
+                self._observe_rule_execution(
+                    rule_execution_state,
+                    rule_id="PHONE_NUMBER_SEMANTIC_VALIDITY",
+                    dimension="VALIDITY",
+                    severity=field_config.severity,
+                    outcome="PASS" if passed else "FAIL",
                 )
 
                 dimension_results[
@@ -1492,6 +2560,15 @@ class QualityProfilerService:
                         )
                     )
 
+            if domain.upper() == "PRODUCT" and field_name == "gtin" and (
+                not normalized_value
+                or not re.fullmatch(r"(?:\d{8}|\d{12}|\d{13}|\d{14})", normalized_value)
+            ):
+                self._observe_rule_execution(
+                    rule_execution_state, rule_id="GTIN_CHECKSUM_VALIDITY",
+                    dimension="VALIDITY", severity="HIGH", outcome="SKIP"
+                )
+
             # ------------------------------------------
             # Product - GTIN checksum
             # ------------------------------------------
@@ -1507,6 +2584,14 @@ class QualityProfilerService:
             ):
                 passed = self._is_valid_gtin(
                     normalized_value
+                )
+
+                self._observe_rule_execution(
+                    rule_execution_state,
+                    rule_id="GTIN_CHECKSUM_VALIDITY",
+                    dimension="VALIDITY",
+                    severity="HIGH",
+                    outcome="PASS" if passed else "FAIL",
                 )
 
                 dimension_results[
@@ -1540,8 +2625,148 @@ class QualityProfilerService:
                     )
 
             # ------------------------------------------
+            # Product Variant - governed UOM vocabulary
+            # ------------------------------------------
+
+            if (
+                domain.upper() == "PRODUCT"
+                and field_name == "product_variant"
+                and field_config.allowed_uom_values
+            ):
+                variant_match = re.fullmatch(
+                    r"([0-9]+(?:\.[0-9]+)?) ([A-Z]+)",
+                    normalized_value,
+                ) if normalized_value else None
+
+                if not variant_match:
+                    self._observe_rule_execution(
+                        rule_execution_state,
+                        rule_id="PRODUCT_VARIANT_UOM_VALIDITY",
+                        dimension="VALIDITY",
+                        severity=field_config.severity,
+                        outcome="SKIP",
+                    )
+                else:
+                    uom_value = variant_match.group(2).upper()
+                    allowed_uoms = {
+                        str(item).strip().upper()
+                        for item in field_config.allowed_uom_values
+                        if str(item).strip()
+                    }
+                    passed = uom_value in allowed_uoms
+
+                    self._observe_rule_execution(
+                        rule_execution_state,
+                        rule_id="PRODUCT_VARIANT_UOM_VALIDITY",
+                        dimension="VALIDITY",
+                        severity=field_config.severity,
+                        outcome="PASS" if passed else "FAIL",
+                    )
+
+                    dimension_results["VALIDITY"].append(
+                        (100.0 if passed else 0.0, weight)
+                    )
+
+                    if not passed:
+                        findings.append(
+                            self._finding(
+                                organization_id=organization_id,
+                                profile_run_id=profile_run_id,
+                                domain=domain,
+                                source_table=source_table,
+                                source_row_id=source_row_id,
+                                record_id=record_id,
+                                field_name=field_name,
+                                rule_id="PRODUCT_VARIANT_UOM_VALIDITY",
+                                dimension="VALIDITY",
+                                severity=field_config.severity,
+                                message=(
+                                    "product_variant uses a UOM outside "
+                                    "the approved governed vocabulary."
+                                ),
+                                observed_value=normalized_value,
+                            )
+                        )
+
+            # ------------------------------------------
+            # Product Variant - authoritative governance validity
+            # ------------------------------------------
+            #
+            # Policy-facing rule:
+            #   PRODUCT_VARIANT_VALIDITY
+            #
+            # PASS only when a populated Product Variant contains:
+            #   1) a numeric quantity,
+            #   2) exactly one separator space,
+            #   3) a UOM token,
+            #   4) a UOM contained in the approved governed vocabulary.
+            #
+            # Examples:
+            #   "3 OZ"   -> PASS when OZ is approved
+            #   "3"      -> FAIL (missing UOM)
+            #   "4  OZ"  -> FAIL (invalid spacing)
+            #   "3 oz"   -> FAIL (not canonical uppercase format)
+            #   "3 XX"   -> FAIL when XX is not approved
+            #
+            # Blank/null optional values are SKIP rather than FAIL.
+            # This rule is evidence-only and intentionally does not add
+            # another finding or another record-score penalty; the
+            # diagnostic rules already explain the underlying defect.
+            if (
+                domain.upper() == "PRODUCT"
+                and field_name == "product_variant"
+                and field_config.allowed_uom_values
+            ):
+                if not normalized_value:
+                    self._observe_rule_execution(
+                        rule_execution_state,
+                        rule_id="PRODUCT_VARIANT_VALIDITY",
+                        dimension="VALIDITY",
+                        severity=field_config.severity,
+                        outcome="SKIP",
+                    )
+                else:
+                    governance_match = re.fullmatch(
+                        r"([0-9]+(?:\.[0-9]+)?) ([A-Z]+)",
+                        normalized_value,
+                    )
+
+                    allowed_uoms = {
+                        str(item).strip().upper()
+                        for item in field_config.allowed_uom_values
+                        if str(item).strip()
+                    }
+
+                    governance_passed = bool(
+                        governance_match
+                        and governance_match.group(2).upper()
+                        in allowed_uoms
+                    )
+
+                    self._observe_rule_execution(
+                        rule_execution_state,
+                        rule_id="PRODUCT_VARIANT_VALIDITY",
+                        dimension="VALIDITY",
+                        severity=field_config.severity,
+                        outcome=(
+                            "PASS"
+                            if governance_passed
+                            else "FAIL"
+                        ),
+                    )
+
+            # ------------------------------------------
             # Validity - allowed values
             # ------------------------------------------
+
+            if not normalized_value and field_config.allowed_values:
+                self._observe_rule_execution(
+                    rule_execution_state,
+                    rule_id=f"{field_name.upper()}_ALLOWED_VALUE",
+                    dimension="VALIDITY",
+                    severity=field_config.severity,
+                    outcome="SKIP",
+                )
 
             if (
                 normalized_value
@@ -1553,6 +2778,14 @@ class QualityProfilerService:
                 }
 
                 passed = normalized_value.upper() in allowed
+
+                self._observe_rule_execution(
+                    rule_execution_state,
+                    rule_id=f"{field_name.upper()}_ALLOWED_VALUE",
+                    dimension="VALIDITY",
+                    severity=field_config.severity,
+                    outcome="PASS" if passed else "FAIL",
+                )
 
                 dimension_results[
                     "VALIDITY"
@@ -1591,7 +2824,30 @@ class QualityProfilerService:
             # Validity - junk / placeholder values
             # ------------------------------------------
 
-            if normalized_value:
+            # Every configured field receives explicit junk-value
+            # execution evidence:
+            #
+            #   blank / null value -> SKIP
+            #   populated value    -> PASS or FAIL
+            #
+            # This keeps rule execution accounting complete for
+            # optional fields such as GTIN and product_variant.
+            #
+            # A blank optional field is not a junk-value failure;
+            # it is simply not applicable to this rule.
+
+            junk_rule_id = f"{field_name.upper()}_JUNK_VALUE"
+
+            if not normalized_value:
+                self._observe_rule_execution(
+                    rule_execution_state,
+                    rule_id=junk_rule_id,
+                    dimension="VALIDITY",
+                    severity=field_config.severity,
+                    outcome="SKIP",
+                )
+
+            else:
                 is_junk = False
 
                 if field_name == "phone_number":
@@ -1613,6 +2869,14 @@ class QualityProfilerService:
                         normalized_value
                     )
 
+                self._observe_rule_execution(
+                    rule_execution_state,
+                    rule_id=junk_rule_id,
+                    dimension="VALIDITY",
+                    severity=field_config.severity,
+                    outcome="FAIL" if is_junk else "PASS",
+                )
+
                 if is_junk:
                     dimension_results[
                         "VALIDITY"
@@ -1632,10 +2896,7 @@ class QualityProfilerService:
                             source_row_id=source_row_id,
                             record_id=record_id,
                             field_name=field_name,
-                            rule_id=(
-                                f"{field_name.upper()}"
-                                "_JUNK_VALUE"
-                            ),
+                            rule_id=junk_rule_id,
                             dimension="VALIDITY",
                             severity=field_config.severity,
                             message=(
@@ -1649,6 +2910,18 @@ class QualityProfilerService:
             # ------------------------------------------
             # Standardization
             # ------------------------------------------
+
+            if (
+                not normalized_value
+                and field_config.standardization_required
+            ):
+                self._observe_rule_execution(
+                    rule_execution_state,
+                    rule_id=f"{field_name.upper()}_STANDARDIZATION",
+                    dimension="STANDARDIZATION",
+                    severity="LOW",
+                    outcome="SKIP",
+                )
 
             if (
                 normalized_value
@@ -1665,6 +2938,14 @@ class QualityProfilerService:
                 passed = (
                     normalized_value
                     == standardized
+                )
+
+                self._observe_rule_execution(
+                    rule_execution_state,
+                    rule_id=f"{field_name.upper()}_STANDARDIZATION",
+                    dimension="STANDARDIZATION",
+                    severity="LOW",
+                    outcome="PASS" if passed else "FAIL",
                 )
 
                 dimension_results[
@@ -1704,6 +2985,9 @@ class QualityProfilerService:
                             observed_value=(
                                 normalized_value
                             ),
+                            proposed_value=(
+                                standardized
+                            ),
                         )
                     )
 
@@ -1719,10 +3003,27 @@ class QualityProfilerService:
                     value
                 )
 
+                if not uniqueness_value:
+                    self._observe_rule_execution(
+                        rule_execution_state,
+                        rule_id=f"{field_name.upper()}_UNIQUENESS",
+                        dimension="UNIQUENESS",
+                        severity="HIGH",
+                        outcome="SKIP",
+                    )
+
                 if uniqueness_value:
                     passed = (
                         uniqueness_value
                         not in duplicate_keys
+                    )
+
+                    self._observe_rule_execution(
+                        rule_execution_state,
+                        rule_id=f"{field_name.upper()}_UNIQUENESS",
+                        dimension="UNIQUENESS",
+                        severity="HIGH",
+                        outcome="PASS" if passed else "FAIL",
                     )
 
                     dimension_results[
@@ -1764,42 +3065,211 @@ class QualityProfilerService:
             )
 
         # ----------------------------------------------
+        # Composite identity uniqueness
+        # ----------------------------------------------
+
+        for rule in config.composite_uniqueness_rules:
+            key = tuple(
+                self._normalize_identifier(
+                    row.get(field_name)
+                )
+                for field_name in rule.fields
+            )
+
+            # Optional identity fields are evaluated only when the entire
+            # composite key is populated. Completeness is handled separately.
+            if not key or any(not value for value in key):
+                self._observe_rule_execution(
+                    rule_execution_state,
+                    rule_id=rule.rule_id,
+                    dimension="UNIQUENESS",
+                    severity=rule.severity,
+                    outcome="SKIP",
+                )
+                continue
+
+            passed = key not in composite_duplicate_keys.get(
+                rule.rule_id,
+                set(),
+            )
+
+            self._observe_rule_execution(
+                rule_execution_state,
+                rule_id=rule.rule_id,
+                dimension="UNIQUENESS",
+                severity=rule.severity,
+                outcome="PASS" if passed else "FAIL",
+            )
+
+            dimension_results[
+                "UNIQUENESS"
+            ].append(
+                (
+                    100.0 if passed else 0.0,
+                    float(rule.weight),
+                )
+            )
+
+            if not passed:
+                field_label = "+".join(rule.fields)
+                observed_value = " | ".join(key)
+
+                findings.append(
+                    self._finding(
+                        organization_id=organization_id,
+                        profile_run_id=profile_run_id,
+                        domain=domain,
+                        source_table=source_table,
+                        source_row_id=source_row_id,
+                        record_id=record_id,
+                        field_name=field_label,
+                        rule_id=rule.rule_id,
+                        dimension="UNIQUENESS",
+                        severity=rule.severity,
+                        message=(
+                            f"Composite identity {field_label} "
+                            "is duplicated across multiple records."
+                        ),
+                        observed_value=observed_value,
+                    )
+                )
+
+        # ----------------------------------------------
+        # Identifier mapping collisions
+        # ----------------------------------------------
+
+        for rule in config.mapping_collision_rules:
+            key_value = self._normalize_identifier(
+                row.get(rule.key_field)
+            )
+            mapped_value = self._normalize_identifier(
+                row.get(rule.mapped_field)
+            )
+
+            if not key_value or not mapped_value:
+                self._observe_rule_execution(
+                    rule_execution_state,
+                    rule_id=rule.rule_id,
+                    dimension="CONSISTENCY",
+                    severity=rule.severity,
+                    outcome="SKIP",
+                )
+                continue
+
+            passed = key_value not in mapping_collision_keys.get(
+                rule.rule_id,
+                set(),
+            )
+
+            self._observe_rule_execution(
+                rule_execution_state,
+                rule_id=rule.rule_id,
+                dimension="CONSISTENCY",
+                severity=rule.severity,
+                outcome="PASS" if passed else "FAIL",
+            )
+
+            dimension_results[
+                "CONSISTENCY"
+            ].append(
+                (
+                    100.0 if passed else 0.0,
+                    float(rule.weight),
+                )
+            )
+
+            if not passed:
+                findings.append(
+                    self._finding(
+                        organization_id=organization_id,
+                        profile_run_id=profile_run_id,
+                        domain=domain,
+                        source_table=source_table,
+                        source_row_id=source_row_id,
+                        record_id=record_id,
+                        field_name=rule.key_field,
+                        rule_id=rule.rule_id,
+                        dimension="CONSISTENCY",
+                        severity=rule.severity,
+                        message=(
+                            f"{rule.key_field} maps to multiple "
+                            f"{rule.mapped_field} values across "
+                            "the profiled dataset."
+                        ),
+                        observed_value=key_value,
+                    )
+                )
+
+        # ----------------------------------------------
         # Cross-field consistency
         # ----------------------------------------------
 
-        consistency_findings = (
-            self._evaluate_cross_field_rules(
-                organization_id=organization_id,
-                profile_run_id=profile_run_id,
-                domain=domain,
-                source_table=source_table,
-                record_id=record_id,
-                row=row,
-                rules=config.cross_field_rules,
+        for rule in config.cross_field_rules:
+            fields = self._parse_composite_unique_fields(
+                rule.sql_condition
             )
-        )
 
-        findings.extend(
-            consistency_findings
-        )
+            # Unsupported declarative conditions are intentionally
+            # NOT scored. They remain NOT_IMPLEMENTED in the
+            # rule-execution evidence initialized for this profile.
+            if not fields:
+                continue
 
-        if config.cross_field_rules:
-            failed_rule_ids = {
-                item.rule_id
-                for item
-                in consistency_findings
-            }
+            key = tuple(
+                self._normalize_identifier(
+                    row.get(field_name)
+                )
+                for field_name in fields
+            )
 
-            for rule in config.cross_field_rules:
-                dimension_results[
-                    "CONSISTENCY"
-                ].append(
-                    (
-                        0.0
-                        if rule.rule_id
-                        in failed_rule_ids
-                        else 100.0,
-                        1.0,
+            if not key or any(not value for value in key):
+                self._observe_rule_execution(
+                    rule_execution_state,
+                    rule_id=rule.rule_id,
+                    dimension="CONSISTENCY",
+                    severity=rule.severity,
+                    outcome="SKIP",
+                )
+                continue
+
+            passed = key not in (
+                cross_field_composite_duplicate_keys.get(
+                    rule.rule_id,
+                    set(),
+                )
+            )
+
+            self._observe_rule_execution(
+                rule_execution_state,
+                rule_id=rule.rule_id,
+                dimension="CONSISTENCY",
+                severity=rule.severity,
+                outcome="PASS" if passed else "FAIL",
+            )
+
+            dimension_results["CONSISTENCY"].append(
+                (100.0 if passed else 0.0, 1.0)
+            )
+
+            if not passed:
+                field_label = "+".join(fields)
+                findings.append(
+                    self._finding(
+                        organization_id=organization_id,
+                        profile_run_id=profile_run_id,
+                        domain=domain,
+                        source_table=source_table,
+                        source_row_id=source_row_id,
+                        record_id=record_id,
+                        field_name=field_label,
+                        rule_id=rule.rule_id,
+                        dimension="CONSISTENCY",
+                        severity=rule.severity,
+                        message=(
+                            f"Composite identity {field_label} is "
+                            "duplicated across multiple records."
+                        ),
+                        observed_value=" | ".join(key),
                     )
                 )
 
@@ -1953,6 +3423,9 @@ class QualityProfilerService:
         scores: List[
             RecordQualityScore
         ],
+        rule_executions: List[
+            QualityRuleExecution
+        ],
         total_records: int,
         duplicate_record_count: int,
     ) -> QualityProfileResult:
@@ -2061,6 +3534,7 @@ class QualityProfilerService:
             ),
             findings=findings,
             record_scores=scores,
+            rule_executions=rule_executions,
             generated_at=datetime.now(
                 timezone.utc
             ),
@@ -2258,6 +3732,7 @@ class QualityProfilerService:
         severity: str,
         message: str,
         observed_value: Optional[str],
+        proposed_value: Optional[str] = None,
     ) -> QualityFinding:
 
         safe_dimension = str(
@@ -2315,4 +3790,5 @@ class QualityProfilerService:
             severity=safe_severity,
             finding_message=message,
             observed_value=observed_value,
-    )
+            proposed_value=proposed_value,
+        )

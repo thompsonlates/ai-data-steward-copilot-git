@@ -162,6 +162,29 @@ class EntityResolutionEngine:
             "steward_learning": 0.03,
         },
 
+        "LOCATION": {
+            "location_id_match": 0.25,
+            "site_id_match": 0.20,
+            "location_code_match": 0.10,
+            "location_name_similarity": 0.10,
+            "address_similarity": 0.20,
+            "parent_location_id_match": 0.05,
+            "organization_entity_id_match": 0.05,
+            "source_trust": 0.03,
+            "steward_learning": 0.02,
+        },
+
+        "ORGANIZATION": {
+            "organization_entity_id_match": 0.30,
+            "organization_code_match": 0.20,
+            "organization_name_similarity": 0.20,
+            "organization_type_match": 0.10,
+            "parent_organization_id_match": 0.05,
+            "organization_status_match": 0.05,
+            "source_trust": 0.05,
+            "steward_learning": 0.05,
+        },
+
     }
 
     def _gtin_detail(
@@ -571,6 +594,15 @@ class EntityResolutionEngine:
 
             return round(sum(valid_scores) / len(valid_scores), 4)
     
+    def _exact_match_score(self, value_a: Any, value_b: Any) -> float:
+        normalized_a = self._normalize_text(value_a)
+        normalized_b = self._normalize_text(value_b)
+        return (
+            1.0
+            if normalized_a and normalized_a == normalized_b
+            else 0.0
+        )
+
     def _resolve_entity_id(self, record, domain: str) -> str:
         domain = (domain or "CUSTOMER").upper()
 
@@ -580,7 +612,9 @@ class EntityResolutionEngine:
             "PROVIDER": ["human_id", "provider_id", "npi", "member_id", "phone_number"],
             "SUPPLIER": ["supplier_id", "vendor_id", "tax_id", "member_id"],
             "PRODUCT":  ["product_id", "gtin", "sku", "item_category", "member_id"],
-            "BANKING": ["account_id","sap_business_partner_id","banking_customer_id",],
+            "BANKING":  ["account_id","sap_business_partner_id","banking_customer_id",],
+            "LOCATION": ["location_id", "site_id", "location_code", "member_id"],
+            "ORGANIZATION": ["organization_entity_id", "organization_code", "member_id"],
         }
 
         for field in fields_by_domain.get(domain, ["member_id"]):
@@ -872,7 +906,37 @@ class EntityResolutionEngine:
         risk_multiplier = self._risk_multiplier(composite_risk_score)
         
         signals = []
-        
+
+        # ---------------------------------------------------------
+        # Banking score defaults
+        # These must exist for every domain because
+        # _domain_signal_scores() receives them after scoring.
+        # BANKING will overwrite them with actual values.
+        # ---------------------------------------------------------
+        account_id_score = 0.0
+        customer_id_score = 0.0
+        sap_business_partner_id_score = 0.0
+        routing_number_score = 0.0
+        account_number_last4_score = 0.0
+        institution_name_score = 0.0
+        account_type_score = 0.0
+        currency_score = 0.0
+
+        # Location score defaults
+        location_id_score = 0.0
+        site_id_score = 0.0
+        location_code_score = 0.0
+        location_name_score = 0.0
+        parent_location_id_score = 0.0
+        organization_entity_id_score = 0.0
+
+        # Organization score defaults
+        organization_code_score = 0.0
+        organization_name_score = 0.0
+        organization_type_score = 0.0
+        parent_organization_id_score = 0.0
+        organization_status_score = 0.0
+                
         if normalized_domain == "CUSTOMER":
 
             customer_full_name_a = (
@@ -2690,6 +2754,176 @@ class EntityResolutionEngine:
                 * risk_multiplier,
                 4,
             )
+
+        elif normalized_domain == "LOCATION":
+
+            signals = []
+
+            location_id_a = getattr(record_a, "location_id", None)
+            location_id_b = getattr(record_b, "location_id", None)
+            site_id_a = getattr(record_a, "site_id", None)
+            site_id_b = getattr(record_b, "site_id", None)
+            location_code_a = getattr(record_a, "location_code", None)
+            location_code_b = getattr(record_b, "location_code", None)
+            location_name_a = getattr(record_a, "location_name", None)
+            location_name_b = getattr(record_b, "location_name", None)
+            location_address_a = (
+                getattr(record_a, "location_address", None)
+                or getattr(record_a, "address", None)
+            )
+            location_address_b = (
+                getattr(record_b, "location_address", None)
+                or getattr(record_b, "address", None)
+            )
+            parent_location_id_a = getattr(record_a, "parent_location_id", None)
+            parent_location_id_b = getattr(record_b, "parent_location_id", None)
+            location_org_id_a = getattr(record_a, "organization_entity_id", None)
+            location_org_id_b = getattr(record_b, "organization_entity_id", None)
+
+            location_id_score = self._exact_match_score(location_id_a, location_id_b)
+            site_id_score = self._exact_match_score(site_id_a, site_id_b)
+            location_code_score = self._exact_match_score(location_code_a, location_code_b)
+            location_name_score = self._similarity(location_name_a, location_name_b)
+            address_score = SimilarityEngine.address_similarity(
+                location_address_a,
+                location_address_b,
+            )
+            parent_location_id_score = self._exact_match_score(
+                parent_location_id_a,
+                parent_location_id_b,
+            )
+            organization_entity_id_score = self._exact_match_score(
+                location_org_id_a,
+                location_org_id_b,
+            )
+
+            match_score = (
+                location_id_score * domain_weights.get("location_id_match", 0.0)
+                + site_id_score * domain_weights.get("site_id_match", 0.0)
+                + location_code_score * domain_weights.get("location_code_match", 0.0)
+                + location_name_score * domain_weights.get("location_name_similarity", 0.0)
+                + address_score * domain_weights.get("address_similarity", 0.0)
+                + parent_location_id_score * domain_weights.get("parent_location_id_match", 0.0)
+                + organization_entity_id_score * domain_weights.get("organization_entity_id_match", 0.0)
+                + source_score * domain_weights.get("source_trust", 0.0)
+                + learning_score * domain_weights.get("steward_learning", 0.0)
+            )
+
+            if location_id_score == 1.0 and site_id_score == 1.0:
+                match_score = max(match_score, 0.97)
+            elif site_id_score == 1.0 and address_score >= 0.95:
+                match_score = max(match_score, 0.92)
+            elif location_code_score == 1.0 and address_score >= 0.95:
+                match_score = max(match_score, 0.88)
+
+            match_score = min(match_score, 1.0)
+            name_score = location_name_score
+
+            for signal_name, score_value, weight_key, detail, signal_type in [
+                ("location_id_match", location_id_score, "location_id_match", f"Compared Location IDs '{location_id_a or 'UNKNOWN'}' and '{location_id_b or 'UNKNOWN'}'.", "deterministic"),
+                ("site_id_match", site_id_score, "site_id_match", f"Compared governed Site IDs '{site_id_a or 'UNKNOWN'}' and '{site_id_b or 'UNKNOWN'}'.", "deterministic"),
+                ("location_code_match", location_code_score, "location_code_match", f"Compared location codes '{location_code_a or 'UNKNOWN'}' and '{location_code_b or 'UNKNOWN'}'.", "deterministic"),
+                ("location_name_similarity", location_name_score, "location_name_similarity", f"Compared location names '{location_name_a or 'UNKNOWN'}' and '{location_name_b or 'UNKNOWN'}'.", "probabilistic"),
+                ("address_similarity", address_score, "address_similarity", self._address_detail(location_address_a, location_address_b, address_score, domain, address_match_insight), "probabilistic"),
+                ("parent_location_id_match", parent_location_id_score, "parent_location_id_match", f"Compared parent Location IDs '{parent_location_id_a or 'UNKNOWN'}' and '{parent_location_id_b or 'UNKNOWN'}'.", "deterministic"),
+                ("organization_entity_id_match", organization_entity_id_score, "organization_entity_id_match", f"Compared governing Organization entity IDs '{location_org_id_a or 'UNKNOWN'}' and '{location_org_id_b or 'UNKNOWN'}'.", "deterministic"),
+                ("source_trust", source_score, "source_trust", self._source_detail(record_a.source_system, record_b.source_system), "probabilistic"),
+            ]:
+                signals.append(
+                    self._build_signal(
+                        signal_name,
+                        score_value,
+                        domain_weights.get(weight_key, 0.0),
+                        detail,
+                        signal_type=signal_type,
+                    )
+                )
+
+            raw_entity_score = round(match_score * risk_multiplier, 4)
+
+        elif normalized_domain == "ORGANIZATION":
+
+            signals = []
+
+            organization_entity_id_a = getattr(record_a, "organization_entity_id", None)
+            organization_entity_id_b = getattr(record_b, "organization_entity_id", None)
+            organization_code_a = getattr(record_a, "organization_code", None)
+            organization_code_b = getattr(record_b, "organization_code", None)
+            organization_name_a = getattr(record_a, "organization_name", None)
+            organization_name_b = getattr(record_b, "organization_name", None)
+            organization_type_a = getattr(record_a, "organization_type", None)
+            organization_type_b = getattr(record_b, "organization_type", None)
+            parent_organization_id_a = getattr(record_a, "parent_organization_id", None)
+            parent_organization_id_b = getattr(record_b, "parent_organization_id", None)
+            organization_status_a = getattr(record_a, "organization_status", None)
+            organization_status_b = getattr(record_b, "organization_status", None)
+
+            organization_entity_id_score = self._exact_match_score(
+                organization_entity_id_a,
+                organization_entity_id_b,
+            )
+            organization_code_score = self._exact_match_score(
+                organization_code_a,
+                organization_code_b,
+            )
+            organization_name_score = self._similarity(
+                organization_name_a,
+                organization_name_b,
+            )
+            organization_type_score = self._exact_match_score(
+                organization_type_a,
+                organization_type_b,
+            )
+            parent_organization_id_score = self._exact_match_score(
+                parent_organization_id_a,
+                parent_organization_id_b,
+            )
+            organization_status_score = self._exact_match_score(
+                organization_status_a,
+                organization_status_b,
+            )
+
+            match_score = (
+                organization_entity_id_score * domain_weights.get("organization_entity_id_match", 0.0)
+                + organization_code_score * domain_weights.get("organization_code_match", 0.0)
+                + organization_name_score * domain_weights.get("organization_name_similarity", 0.0)
+                + organization_type_score * domain_weights.get("organization_type_match", 0.0)
+                + parent_organization_id_score * domain_weights.get("parent_organization_id_match", 0.0)
+                + organization_status_score * domain_weights.get("organization_status_match", 0.0)
+                + source_score * domain_weights.get("source_trust", 0.0)
+                + learning_score * domain_weights.get("steward_learning", 0.0)
+            )
+
+            if organization_entity_id_score == 1.0:
+                match_score = max(match_score, 0.96)
+            elif organization_code_score == 1.0 and organization_name_score >= 0.90:
+                match_score = max(match_score, 0.92)
+            elif organization_name_score >= 0.95 and organization_type_score == 1.0:
+                match_score = max(match_score, 0.85)
+
+            match_score = min(match_score, 1.0)
+            name_score = organization_name_score
+
+            for signal_name, score_value, weight_key, detail, signal_type in [
+                ("organization_entity_id_match", organization_entity_id_score, "organization_entity_id_match", f"Compared Organization entity IDs '{organization_entity_id_a or 'UNKNOWN'}' and '{organization_entity_id_b or 'UNKNOWN'}'.", "deterministic"),
+                ("organization_code_match", organization_code_score, "organization_code_match", f"Compared organization codes '{organization_code_a or 'UNKNOWN'}' and '{organization_code_b or 'UNKNOWN'}'.", "deterministic"),
+                ("organization_name_similarity", organization_name_score, "organization_name_similarity", f"Compared organization names '{organization_name_a or 'UNKNOWN'}' and '{organization_name_b or 'UNKNOWN'}'.", "probabilistic"),
+                ("organization_type_match", organization_type_score, "organization_type_match", f"Compared organization types '{organization_type_a or 'UNKNOWN'}' and '{organization_type_b or 'UNKNOWN'}'.", "deterministic"),
+                ("parent_organization_id_match", parent_organization_id_score, "parent_organization_id_match", f"Compared parent Organization IDs '{parent_organization_id_a or 'UNKNOWN'}' and '{parent_organization_id_b or 'UNKNOWN'}'.", "deterministic"),
+                ("organization_status_match", organization_status_score, "organization_status_match", f"Compared organization statuses '{organization_status_a or 'UNKNOWN'}' and '{organization_status_b or 'UNKNOWN'}'.", "deterministic"),
+                ("source_trust", source_score, "source_trust", self._source_detail(record_a.source_system, record_b.source_system), "probabilistic"),
+            ]:
+                signals.append(
+                    self._build_signal(
+                        signal_name,
+                        score_value,
+                        domain_weights.get(weight_key, 0.0),
+                        detail,
+                        signal_type=signal_type,
+                    )
+                )
+
+            raw_entity_score = round(match_score * risk_multiplier, 4)
             
         
         signal_scores = self._domain_signal_scores(
@@ -2726,6 +2960,17 @@ class EntityResolutionEngine:
             institution_name_score=institution_name_score,
             account_type_score=account_type_score,
             currency_score=currency_score,
+            location_id_score=location_id_score,
+            site_id_score=site_id_score,
+            location_code_score=location_code_score,
+            location_name_score=location_name_score,
+            parent_location_id_score=parent_location_id_score,
+            organization_entity_id_score=organization_entity_id_score,
+            organization_code_score=organization_code_score,
+            organization_name_score=organization_name_score,
+            organization_type_score=organization_type_score,
+            parent_organization_id_score=parent_organization_id_score,
+            organization_status_score=organization_status_score,
 
         )
         signal_contributions = self._build_signal_contributions(
@@ -2739,10 +2984,10 @@ class EntityResolutionEngine:
 
         effective_multiplier = risk_multiplier
 
-        if domain in {"SUPPLIER", "PRODUCT", "PROVIDER", "PATIENT", "BANKING"}:
-            effective_multiplier = max(risk_multiplier), 0.90
+        if domain in {"SUPPLIER", "PRODUCT", "PROVIDER", "PATIENT", "BANKING", "LOCATION", "ORGANIZATION"}:
+            effective_multiplier = max(risk_multiplier, 0.90)
 
-        if domain in {"SUPPLIER", "PRODUCT", "PROVIDER", "PATIENT", "BANKING"}:
+        if domain in {"SUPPLIER", "PRODUCT", "PROVIDER", "PATIENT", "BANKING", "LOCATION", "ORGANIZATION"}:
 
             domain_confidence_score = round(
                 match_score * effective_multiplier * 100,
@@ -3015,6 +3260,17 @@ class EntityResolutionEngine:
         institution_name_score: float = 0.0,
         account_type_score: float = 0.0,
         currency_score: float = 0.0,
+        location_id_score: float = 0.0,
+        site_id_score: float = 0.0,
+        location_code_score: float = 0.0,
+        location_name_score: float = 0.0,
+        parent_location_id_score: float = 0.0,
+        organization_entity_id_score: float = 0.0,
+        organization_code_score: float = 0.0,
+        organization_name_score: float = 0.0,
+        organization_type_score: float = 0.0,
+        parent_organization_id_score: float = 0.0,
+        organization_status_score: float = 0.0,
     ) -> dict[str, float]:
 
         normalized_domain = (domain or "CUSTOMER").upper()
@@ -3030,7 +3286,7 @@ class EntityResolutionEngine:
                 "steward_learning": learning_score,
             }
 
-        if normalized_domain == "PRODUCT":
+        elif normalized_domain == "PRODUCT":
             return {
                 "product_id_match": product_id_score,
                 "gtin_match": gtin_score,
@@ -3040,8 +3296,8 @@ class EntityResolutionEngine:
                 "source_trust": source_score,
                 "steward_learning": learning_score,
             }
-        
-        if normalized_domain == "PROVIDER":
+
+        elif normalized_domain == "PROVIDER":
             return {
                 "provider_id_match": provider_id_score,
                 "npi_match": npi_score,
@@ -3054,7 +3310,7 @@ class EntityResolutionEngine:
                 "specialty_similarity": specialty_score,
             }
 
-        if normalized_domain == "PATIENT":
+        elif normalized_domain == "PATIENT":
             return {
                 "patient_id_match": patient_id_score,
                 "phone_match": phone_score,
@@ -3065,32 +3321,15 @@ class EntityResolutionEngine:
                 "source_trust": source_score,
                 "steward_learning": learning_score,
             }
-        else:
-            return {
-                "member_id_match": member_id_score,
-                "phone_match": phone_score,
-                "name_similarity": name_score,
-                "dob_match": dob_score,
-                "email_match": email_score,
-                "address_similarity": address_score,
-                "source_trust": source_score,
-                "steward_learning": learning_score,
-            }
 
-        if normalized_domain == "BANKING":
+        elif normalized_domain == "BANKING":
             return {
                 "account_id_match": account_id_score,
                 "customer_id_match": customer_id_score,
-                "sap_business_partner_id_match": (
-                    sap_business_partner_id_score
-                ),
+                "sap_business_partner_id_match": sap_business_partner_id_score,
                 "routing_number_match": routing_number_score,
-                "account_number_last4_match": (
-                    account_number_last4_score
-                ),
-                "institution_name_similarity": (
-                    institution_name_score
-                ),
+                "account_number_last4_match": account_number_last4_score,
+                "institution_name_similarity": institution_name_score,
                 "account_type_match": account_type_score,
                 "currency_match": currency_score,
                 "email_match": email_score,
@@ -3098,6 +3337,42 @@ class EntityResolutionEngine:
                 "source_trust": source_score,
                 "steward_learning": learning_score,
             }
+
+        elif normalized_domain == "LOCATION":
+            return {
+                "location_id_match": location_id_score,
+                "site_id_match": site_id_score,
+                "location_code_match": location_code_score,
+                "location_name_similarity": location_name_score,
+                "address_similarity": address_score,
+                "parent_location_id_match": parent_location_id_score,
+                "organization_entity_id_match": organization_entity_id_score,
+                "source_trust": source_score,
+                "steward_learning": learning_score,
+            }
+
+        elif normalized_domain == "ORGANIZATION":
+            return {
+                "organization_entity_id_match": organization_entity_id_score,
+                "organization_code_match": organization_code_score,
+                "organization_name_similarity": organization_name_score,
+                "organization_type_match": organization_type_score,
+                "parent_organization_id_match": parent_organization_id_score,
+                "organization_status_match": organization_status_score,
+                "source_trust": source_score,
+                "steward_learning": learning_score,
+            }
+
+        return {
+            "member_id_match": member_id_score,
+            "phone_match": phone_score,
+            "name_similarity": name_score,
+            "dob_match": dob_score,
+            "email_match": email_score,
+            "address_similarity": address_score,
+            "source_trust": source_score,
+            "steward_learning": learning_score,
+        }
 
     def _build_signal_contributions(
         self,
@@ -3187,6 +3462,16 @@ class EntityResolutionEngine:
             "dob_match",
             "contact_email_match",
             "provider_email_match",
+            "account_id_match",
+            "banking_customer_id_match",
+            "sap_business_partner_id_match",
+            "routing_number_match",
+            "account_number_last4_match",
+            "institution_name_match",
+            "account_type_match",
+            "currency_match",
+            "account_status_match",
+            "email_match",
         }
 
         supporting_signal_names = {
@@ -3222,6 +3507,16 @@ class EntityResolutionEngine:
             "name_similarity": "Name Similarity",
             "specialty_similarity": "Specialty Similarity",
             "source_trust": "Source Trust",
+            "account_id_match": "Account ID",
+            "banking_customer_id_match": "Banking Customer ID",
+            "sap_business_partner_id_match": "SAP Business Partner ID",
+            "routing_number_match": "Routing Number",
+            "account_number_last4_match": "Account Number Last 4",
+            "institution_name_match": "Institution Name",
+            "account_type_match": "Account Type",
+            "currency_match": "Currency",
+            "account_status_match": "Account Status",
+            "email_match": "Email",
         }
 
         timeline_signals = [
@@ -3273,9 +3568,6 @@ class EntityResolutionEngine:
                     status = "warning"
                     tone = "warning"
 
-
-
-            elif signal_name in deterministic_signal_names:
                 if signal_score >= 1.0:
                     title = f"{display_name} Exact Match"
                     status = "positive"

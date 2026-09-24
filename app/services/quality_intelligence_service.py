@@ -10,7 +10,6 @@ import math
 import os
 import re
 from typing import Any, Dict, List, Optional
-
 from app.services.llm_service import LLMService
 
 logger = logging.getLogger(__name__)
@@ -128,6 +127,102 @@ def _identifier(value: str, fallback: str = "source_table") -> str:
     return cleaned or fallback
 
 
+def _triggered_rule_counts(
+    value: Any,
+) -> Dict[str, int]:
+    """
+    Normalize rule-level evidence into {RULE_ID: count}.
+
+    Supports:
+      - [{"rule_id": "...", "count": 12}]
+      - [{"rule": "...", "finding_count": 12}]
+      - {"RULE_A": 12, "RULE_B": 4}
+      - ["RULE_A", "RULE_B"]
+      - "RULE_A,RULE_B"
+
+    Match/Explain evidence rules such as GTIN_MATCH or UOM_MATCH are
+    retained as context, but they are not interpreted as DQ defects by
+    _derive_opportunities().
+    """
+
+    counts: Dict[str, int] = {}
+
+    def add_rule(
+        raw_rule_id: Any,
+        raw_count: Any = 1,
+    ) -> None:
+        rule_id = _text(
+            raw_rule_id
+        ).upper()
+
+        if not rule_id:
+            return
+
+        count = max(
+            0,
+            _int(
+                raw_count,
+                1,
+            ),
+        )
+
+        counts[rule_id] = (
+            counts.get(rule_id, 0)
+            + count
+        )
+
+    if value is None:
+        return counts
+
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(item, dict):
+                add_rule(
+                    item.get("rule_id")
+                    or item.get("rule")
+                    or item.get("name")
+                    or key,
+                    item.get("count")
+                    or item.get("finding_count")
+                    or item.get("trigger_count")
+                    or item.get("affected_records")
+                    or 1,
+                )
+            else:
+                add_rule(
+                    key,
+                    item,
+                )
+
+        return counts
+
+    if isinstance(value, str):
+        for part in value.split(","):
+            add_rule(part, 1)
+
+        return counts
+
+    for item in _items(value):
+        if isinstance(item, dict):
+            add_rule(
+                item.get("rule_id")
+                or item.get("rule")
+                or item.get("name"),
+                item.get("count")
+                or item.get("finding_count")
+                or item.get("trigger_count")
+                or item.get("affected_records")
+                or 1,
+            )
+        else:
+            add_rule(
+                item,
+                1,
+            )
+
+    return counts
+
+
 def build_quality_rule_context(
     row: Dict[str, Any],
     *,
@@ -150,6 +245,12 @@ def build_quality_rule_context(
             row.get("dataset_name") or row.get("table_name") or row.get("asset_name"),
             "Current governed dataset",
         ),
+        # Preserve canonical -> physical source mappings established during profiling.
+        "column_mappings": (
+            row.get("column_mappings")
+            if isinstance(row.get("column_mappings"), list)
+            else []
+),
         "metric_date": row.get("metric_date"),
         "dq_health_score": _score100(row.get("dq_health_score")),
         "dq_risk_score": _score100(row.get("dq_risk_score")),
@@ -195,6 +296,9 @@ def build_quality_rule_context(
         "recent_false_negatives": _int(steward.get("false_negatives")),
         "top_override_reasons": _items(steward.get("top_override_reasons")),
         "top_triggered_rules": _items(row.get("top_triggered_rules")),
+        "triggered_rule_counts": _triggered_rule_counts(
+            row.get("top_triggered_rules")
+        ),
     }
     context["deterministic_opportunities"] = _derive_opportunities(context)
     context["evidence_summary"] = _evidence(context)
@@ -204,13 +308,33 @@ def build_quality_rule_context(
 def _derive_opportunities(context: Dict[str, Any]) -> List[Dict[str, Any]]:
     opportunities: List[Dict[str, Any]] = []
 
-    def add(key: str, dimension: str, severity: str, reason: str, score: float) -> None:
+    def add(
+        key: str,
+        dimension: str,
+        severity: str,
+        reason: str,
+        score: float,
+        *,
+        domain_priority: int = 0,
+    ) -> None:
         opportunities.append({
             "key": key,
             "dimension": dimension,
             "severity": severity,
             "reason": reason,
-            "opportunity_score": round(max(0, min(100, score)), 1),
+            "opportunity_score": round(
+                max(
+                    0,
+                    min(
+                        100,
+                        score,
+                    ),
+                ),
+                1,
+            ),
+            "domain_priority": int(
+                domain_priority
+            ),
         })
 
     if context["configured_rule_count"] == 0:
@@ -228,6 +352,122 @@ def _derive_opportunities(context: Dict[str, Any]) -> List[Dict[str, Any]]:
             "MINIMUM_QUALITY_GATE", "INTEGRITY", "HIGH",
             f"{context['records_below_threshold']:,} records are below the accepted DQ threshold.", 88,
         )
+
+    # ---------------------------------------------------------
+    # PRODUCT-specific deterministic rule recognition
+    # ---------------------------------------------------------
+    #
+    # These are DQ findings, not Match Explain evidence rules.
+    # Match rules such as GTIN_MATCH, SKU_MATCH,
+    # PRODUCT_NAME_SIMILAR, DESCRIPTION_SIMILAR, and UOM_MATCH
+    # remain useful context but are not defects by themselves.
+
+    if context.get("domain") == "PRODUCT":
+        rule_counts = (
+            context.get(
+                "triggered_rule_counts"
+            )
+            or {}
+        )
+
+        product_rule_specs = (
+            (
+                "GTIN_CHECKSUM_VALIDITY",
+                "GTIN_CHECKSUM_CONTROL",
+                "VALIDITY",
+                "HIGH",
+                (
+                    "GTIN values fail GS1 check-digit "
+                    "validation and require authoritative "
+                    "source confirmation before correction."
+                ),
+                99,
+                50,
+            ),
+            (
+                "PRODUCT_VARIANT_FORMAT_VALIDITY",
+                "PRODUCT_VARIANT_FORMAT_CONTROL",
+                "VALIDITY",
+                "HIGH",
+                (
+                    "product_variant values fail the governed "
+                    "quantity + UOM structural format."
+                ),
+                97,
+                45,
+            ),
+            (
+                "PRODUCT_VARIANT_UOM_ALLOWED_VALUE",
+                "PRODUCT_VARIANT_UOM_POLICY",
+                "VALIDITY",
+                "HIGH",
+                (
+                    "product_variant values use UOM tokens "
+                    "outside the approved governed vocabulary."
+                ),
+                96,
+                44,
+            ),
+            (
+                "GTIN_FORMAT_VALIDITY",
+                "GTIN_FORMAT_CONTROL",
+                "VALIDITY",
+                "HIGH",
+                (
+                    "GTIN values fail the governed numeric "
+                    "length/format requirement."
+                ),
+                95,
+                42,
+            ),
+            (
+                "PRODUCT_VARIANT_STANDARDIZATION",
+                "PRODUCT_VARIANT_STANDARDIZATION",
+                "STANDARDIZATION",
+                "MEDIUM",
+                (
+                    "product_variant values require safe "
+                    "canonical formatting such as trimming, "
+                    "uppercasing, or separator normalization."
+                ),
+                90,
+                30,
+            ),
+        )
+
+        for (
+            rule_id,
+            opportunity_key,
+            dimension,
+            severity,
+            reason,
+            score,
+            domain_priority,
+        ) in product_rule_specs:
+            count = _int(
+                rule_counts.get(
+                    rule_id
+                ),
+                0,
+            )
+
+            if count <= 0:
+                continue
+
+            add(
+                opportunity_key,
+                dimension,
+                severity,
+                (
+                    f"{count:,} finding"
+                    f"{'' if count == 1 else 's'}: "
+                    f"{reason}"
+                ),
+                score,
+                domain_priority=(
+                    domain_priority
+                ),
+            )
 
     score_rules = [
         ("avg_completeness_score", "COMPLETENESS", "REQUIRED_FIELD_COMPLETENESS"),
@@ -271,8 +511,31 @@ def _derive_opportunities(context: Dict[str, Any]) -> List[Dict[str, Any]]:
             "Current DQ posture is healthy, but preventive rule coverage is limited.", 58,
         )
 
-    rank = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
-    return sorted(opportunities, key=lambda x: (rank[x["severity"]], x["opportunity_score"]), reverse=True)
+    rank = {
+        "CRITICAL": 4,
+        "HIGH": 3,
+        "MEDIUM": 2,
+        "LOW": 1,
+    }
+
+    return sorted(
+        opportunities,
+        key=lambda x: (
+            rank[
+                x["severity"]
+            ],
+            int(
+                x.get(
+                    "domain_priority",
+                    0,
+                )
+            ),
+            x[
+                "opportunity_score"
+            ],
+        ),
+        reverse=True,
+    )
 
 
 def _evidence(context: Dict[str, Any]) -> List[str]:
@@ -298,7 +561,40 @@ def _evidence(context: Dict[str, Any]) -> List[str]:
         ("avg_uniqueness_score", "Uniqueness"),
     ]:
         if context.get(field) is not None:
-            evidence.append(f"{label}: {context[field]:.1f}/100")
+            evidence.append(
+                f"{label}: "
+                f"{context[field]:.1f}/100"
+            )
+
+    triggered_rule_counts = (
+        context.get(
+            "triggered_rule_counts"
+        )
+        or {}
+    )
+
+    if triggered_rule_counts:
+        ranked_rules = sorted(
+            triggered_rule_counts.items(),
+            key=lambda item: (
+                item[1],
+                item[0],
+            ),
+            reverse=True,
+        )[:10]
+
+        evidence.append(
+            "Triggered rule evidence: "
+            + ", ".join(
+                (
+                    f"{rule_id}="
+                    f"{count}"
+                )
+                for rule_id, count
+                in ranked_rules
+            )
+        )
+
     return evidence
 
 
@@ -372,10 +668,6 @@ def _extract_quality_json(
 
     Does NOT invent or auto-complete genuinely truncated JSON.
     """
-
-    import json
-    import re
-    from typing import Any
 
     if isinstance(raw, dict):
         return raw
@@ -647,6 +939,8 @@ def _validate_quality_rule_suggestions(payload: Dict[str, Any]) -> Dict[str, Any
             "rule_logic": _text(raw.get("rule_logic")),
             "sql_example": _text(sql_example) if sql_example else None,
             "implementation_target": _text(raw.get("implementation_target"), "GENERIC").upper(),
+            "field_name": _text(raw.get("field_name")) or None,
+            "source_column": _text(raw.get("source_column")) or None,
             "expected_impact": _text(raw.get("expected_impact")),
             "estimated_automation_gain_points": max(0, min(25, _int(raw.get("estimated_automation_gain_points")))),
             "supporting_evidence": [_text(x) for x in _items(raw.get("supporting_evidence")) if _text(x)],
@@ -709,6 +1003,8 @@ def _rule(
     gain: int,
     evidence: str,
     confidence: float,
+    field_name: Optional[str] = None,
+    source_column: Optional[str] = None,
 ) -> Dict[str, Any]:
     return {
         "rule_id": rule_id,
@@ -722,6 +1018,8 @@ def _rule(
         "rule_logic": logic,
         "sql_example": sql,
         "implementation_target": "GENERIC",
+        "field_name": field_name,
+        "source_column": source_column,
         "expected_impact": impact,
         "estimated_automation_gain_points": gain,
         "supporting_evidence": [evidence],
@@ -782,6 +1080,32 @@ def _baseline_rules(context: Dict[str, Any]) -> List[Dict[str, Any]]:
         ),
     ]
 
+def _source_column_for_target(
+    column_mappings: Any,
+    target_field: str,
+) -> Optional[str]:
+    normalized_target = _text(
+        target_field
+    ).lower()
+
+    for mapping in _items(column_mappings):
+        if not isinstance(mapping, dict):
+            continue
+
+        mapped_target = _text(
+            mapping.get("target_field")
+        ).lower()
+
+        if mapped_target != normalized_target:
+            continue
+
+        source_column = _text(
+            mapping.get("source_column")
+        )
+
+        return source_column or None
+
+    return None
 
 def fallback_quality_rule_suggestions(
     context: Dict[str, Any],
@@ -793,6 +1117,16 @@ def fallback_quality_rule_suggestions(
         logger.warning("Using deterministic DQ-rule fallback: %s", error)
 
     table = _identifier(context["dataset_name"])
+
+    column_mappings = (
+        context.get("column_mappings")
+        if isinstance(context.get("column_mappings"), list)
+        else []
+    )
+    product_variant_source_column = _source_column_for_target(
+        column_mappings, "product_variant"
+    ) or None
+
     rules: List[Dict[str, Any]] = []
     for opportunity in context["deterministic_opportunities"][:5]:
         key, evidence = opportunity["key"], opportunity["reason"]
@@ -835,6 +1169,183 @@ def fallback_quality_rule_suggestions(
                 evidence=evidence,
                 confidence=confidence,
             ))
+        elif key == "GTIN_CHECKSUM_CONTROL":
+            rules.append(_rule(
+                rule_id="GTIN_CHECKSUM_VALIDITY",
+                name="GTIN GS1 Check-Digit Validation",
+                dimension="VALIDITY",
+                severity="HIGH",
+                rule_type="REFERENCE_LOOKUP",
+                description=(
+                    "Require structurally valid GTINs to pass "
+                    "GS1 modulo-10 check-digit validation."
+                ),
+                rationale=evidence,
+                risk=(
+                    "Invalid GTIN check digits can break barcode "
+                    "verification, product syndication, trading-partner "
+                    "integrations, and global product identification."
+                ),
+                logic=(
+                    "GTIN length/format must be valid and the GS1 "
+                    "check digit must match the deterministic modulo-10 "
+                    "calculation."
+                ),
+                sql=None,
+                impact=(
+                    "Routes corrupted GTINs to authoritative source "
+                    "verification before downstream use."
+                ),
+                gain=4,
+                evidence=evidence,
+                confidence=confidence,
+            ))
+
+        elif key == "PRODUCT_VARIANT_FORMAT_CONTROL":
+            rules.append(_rule(
+                rule_id="PRODUCT_VARIANT_FORMAT_VALIDITY",
+                name="Product Variant Quantity/UOM Format Validation",
+                dimension="VALIDITY",
+                severity="HIGH",
+                rule_type="REGEX",
+                description=(
+                    "Require product_variant to contain a numeric "
+                    "quantity, one separator space, and an uppercase "
+                    "UOM token."
+                ),
+                rationale=evidence,
+                risk=(
+                    "Malformed product variants weaken catalog "
+                    "matching, pack-size interpretation, ordering, "
+                    "inventory, and downstream product analytics."
+                ),
+                logic=(
+                    "product_variant matches the governed structural "
+                    "pattern <quantity><single-space><UOM>."
+                ),
+                sql=(
+                    f"SELECT * FROM `{table}` "
+                    "WHERE product_variant IS NOT NULL "
+                    "AND NOT REGEXP_CONTAINS("
+                    "CAST(product_variant AS STRING), "
+                    "r'^[0-9]+(?:\\.[0-9]+)? [A-Z]+$')"
+                ),
+                impact=(
+                    "Separates structurally invalid Product Variant "
+                    "values from safe standardization candidates."
+                ),
+                gain=5,
+                evidence=evidence,
+                confidence=confidence,
+            ))
+
+        elif key == "PRODUCT_VARIANT_UOM_POLICY":
+            rules.append(_rule(
+                rule_id="PRODUCT_VARIANT_UOM_ALLOWED_VALUE",
+                name="Product Variant Governed UOM Validation",
+                dimension="VALIDITY",
+                severity="HIGH",
+                rule_type="REFERENCE_LOOKUP",
+                description=(
+                    "Validate the UOM token embedded in product_variant "
+                    "against the organization-approved Product UOM "
+                    "vocabulary."
+                ),
+                rationale=evidence,
+                risk=(
+                    "Unapproved or ambiguous UOM values can change "
+                    "pack-size meaning and create unsafe ordering, "
+                    "pricing, or inventory interpretation."
+                ),
+                logic=(
+                    "parsed product_variant UOM exists in the effective "
+                    "tenant-governed Product UOM reference set."
+                ),
+                sql=None,
+                impact=(
+                    "Prevents unknown UOM semantics from entering "
+                    "trusted product workflows."
+                ),
+                gain=4,
+                evidence=evidence,
+                confidence=confidence,
+            ))
+
+        elif key == "GTIN_FORMAT_CONTROL":
+            rules.append(_rule(
+                rule_id="GTIN_FORMAT_VALIDITY",
+                name="GTIN Numeric Length Validation",
+                dimension="VALIDITY",
+                severity="HIGH",
+                rule_type="REGEX",
+                description=(
+                    "Require GTIN values to contain only digits and use "
+                    "a supported GTIN length."
+                ),
+                rationale=evidence,
+                risk=(
+                    "Malformed GTINs break product identification, "
+                    "barcode workflows, and trading-partner exchange."
+                ),
+                logic=(
+                    "GTIN contains only digits and uses an approved "
+                    "GTIN-8, GTIN-12, GTIN-13, or GTIN-14 length."
+                ),
+                sql=(
+                    f"SELECT * FROM `{table}` "
+                    "WHERE gtin IS NOT NULL "
+                    "AND NOT REGEXP_CONTAINS("
+                    "CAST(gtin AS STRING), "
+                    "r'^(?:\\d{8}|\\d{12}|\\d{13}|\\d{14})$')"
+                ),
+                impact=(
+                    "Identifies malformed GTINs before checksum "
+                    "validation and authoritative remediation."
+                ),
+                gain=4,
+                evidence=evidence,
+                confidence=confidence,
+            ))
+
+        elif key == "PRODUCT_VARIANT_STANDARDIZATION":
+            rules.append(_rule(
+                rule_id="PRODUCT_VARIANT_STANDARDIZATION",
+                name="Product Variant Canonical Standardization",
+                dimension="STANDARDIZATION",
+                severity="MEDIUM",
+                rule_type="REGEX",
+                description=(
+                    "Normalize safe Product Variant presentation issues "
+                    "without changing quantity or UOM business meaning."
+                ),
+                rationale=evidence,
+                risk=(
+                    "Whitespace and casing differences create false "
+                    "non-matches and inconsistent product reporting."
+                ),
+                logic=(
+                    "Normalize product_variant using the governed Product Variant "
+                    "pattern: preserve numeric quantity, normalize whitespace to one "
+                    "separator space, and uppercase the UOM token. Never invent or "
+                    "replace quantity or UOM business meaning."
+                ),
+                sql=(
+                    f"SELECT product_variant, "
+                    "UPPER(TRIM(CAST(product_variant AS STRING))) "
+                    f"AS product_variant_standardized FROM `{table}` "
+                    "WHERE product_variant IS NOT NULL"
+                ),
+                impact=(
+                    "Improves product matching and catalog consistency "
+                    "without fabricating business data."
+                ),
+                gain=5,
+                evidence=evidence,
+                confidence=confidence,
+                field_name="product_variant",
+                source_column=product_variant_source_column,
+            ))
+
         elif key == "FORMAT_AND_DOMAIN_VALIDATION":
             rules.append(_rule(
                 rule_id="DOMAIN_FORMAT_VALIDATION",
@@ -990,6 +1501,105 @@ def fallback_quality_rule_suggestions(
     }
 
 
+# Governed executable recommendations are deterministic controls whose observed
+# findings have already been established by Profile Intelligence. The LLM may
+# explain, prioritize, or supplement them, but it must not suppress them.
+#
+# Keep this allowlist intentionally narrow. Add a rule only after its detection,
+# remediation contract, and governed execution path are deterministic.
+GOVERNED_EXECUTABLE_RULE_IDS = {
+    "PRODUCT_VARIANT_STANDARDIZATION",
+}
+
+
+def _merge_governed_executable_suggestions(
+    *,
+    context: Dict[str, Any],
+    ai_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Preserve evidenced governed executable rules alongside AI suggestions.
+
+    Architecture boundary:
+      Profile Intelligence / Universal Intelligence -> deterministic evidence
+      -> governed executable recommendation -> AI explanation/prioritization
+      -> steward approval -> deterministic execution.
+
+    A governed executable rule is merged only when its exact rule_id has a
+    positive deterministic trigger count. This prevents the recommendation
+    layer from inventing standards or promoting merely preventive controls into
+    executable remediation.
+    """
+    rule_counts = context.get("triggered_rule_counts") or {}
+
+    evidenced_rule_ids = {
+        rule_id
+        for rule_id in GOVERNED_EXECUTABLE_RULE_IDS
+        if _int(rule_counts.get(rule_id), 0) > 0
+    }
+
+    if not evidenced_rule_ids:
+        return ai_result
+
+    deterministic_result = fallback_quality_rule_suggestions(context)
+    deterministic_rules = deterministic_result.get("suggested_rules") or []
+
+    ai_rules = [
+        rule
+        for rule in (ai_result.get("suggested_rules") or [])
+        if isinstance(rule, dict)
+    ]
+    ai_rule_ids = {
+        _text(rule.get("rule_id")).upper()
+        for rule in ai_rules
+        if _text(rule.get("rule_id"))
+    }
+
+    merged_rule_ids: List[str] = []
+
+    for rule in deterministic_rules:
+        if not isinstance(rule, dict):
+            continue
+
+        rule_id = _text(rule.get("rule_id")).upper()
+        if (
+            rule_id not in evidenced_rule_ids
+            or rule_id in ai_rule_ids
+        ):
+            continue
+
+        # Do not truncate the governed deterministic rule merely because the
+        # LLM already returned five advisory suggestions. Executable evidence
+        # has precedence over advisory recommendation count limits.
+        ai_rules.append(rule)
+        ai_rule_ids.add(rule_id)
+        merged_rule_ids.append(rule_id)
+
+    ai_result["suggested_rules"] = ai_rules
+
+    sequence = [
+        _text(rule_id)
+        for rule_id in _items(ai_result.get("recommended_sequence"))
+        if _text(rule_id)
+    ]
+    sequence_seen = {rule_id.upper() for rule_id in sequence}
+
+    for rule_id in merged_rule_ids:
+        if rule_id not in sequence_seen:
+            sequence.append(rule_id)
+            sequence_seen.add(rule_id)
+
+    ai_result["recommended_sequence"] = sequence
+
+    if merged_rule_ids:
+        logger.info(
+            "Preserved governed executable DQ recommendations from "
+            "deterministic profile evidence. rules=%s",
+            ",".join(merged_rule_ids),
+        )
+
+    return ai_result
+
+
 def build_quality_rule_suggestions(
     row: Dict[str, Any],
     *,
@@ -1008,28 +1618,51 @@ def build_quality_rule_suggestions(
         return fallback_quality_rule_suggestions(context)
     try:
         result = generate_structured_quality_rule_suggestions(
-                build_quality_rule_prompt(context),
-                organization_id=organization_id,
-                provider=provider,
-            )
+            build_quality_rule_prompt(context),
+            organization_id=organization_id,
+            provider=provider,
+        )
         if not result.get("suggested_rules"):
             return fallback_quality_rule_suggestions(context)
         if not result.get("supporting_evidence"):
             result["supporting_evidence"] = context["evidence_summary"]
 
+        # The AI recommendation set is advisory. Preserve any ACTIVE/governed
+        # executable recommendation whose exact deterministic rule fired during
+        # profiling. This is the bridge from legacy Profile Intelligence into
+        # the Universal Intelligence architecture: deterministic evidence owns
+        # whether an executable standard exists; the LLM cannot suppress it.
+        result = _merge_governed_executable_suggestions(
+            context=context,
+            ai_result=result,
+        )
+
+        column_mappings = context.get("column_mappings") or []
+
+        for rule in result.get("suggested_rules") or []:
+            if not isinstance(rule, dict):
+                continue
+
+            if rule.get("rule_id") == "PRODUCT_VARIANT_STANDARDIZATION":
+                rule["field_name"] = "product_variant"
+                rule["source_column"] = _source_column_for_target(
+                    column_mappings,
+                    "product_variant",
+                )
+
         observed_issue_count = (
-        context["duplicate_record_count"]
-        + context["records_below_threshold"]
-        + context["critical_findings"]
-        + context["high_findings"]
-        + context["open_findings_count"]
-    )
+            context["duplicate_record_count"]
+            + context["records_below_threshold"]
+            + context["critical_findings"]
+            + context["high_findings"]
+            + context["open_findings_count"]
+        )
 
         if observed_issue_count == 0:
             result["headline"] = "Establish foundational data quality controls"
             result["priority"] = "MEDIUM"
             result["rule_strategy"] = "PREVENTIVE"
-        
+
         return result
     except Exception as exc:
         logger.exception("AI DQ rule suggestion generation failed.")

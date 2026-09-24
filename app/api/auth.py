@@ -641,7 +641,6 @@ def verify_microsoft_id_token(
             detail="Invalid Microsoft credential",
         ) from exc
 
-
 def get_current_tenant_user(
     current_user: AuthUser = Depends(get_current_user),
 ) -> AuthUser:
@@ -662,6 +661,40 @@ def get_current_tenant_user(
         )
 
     return current_user
+
+def require_active_product_access(
+    current_user: AuthUser = Depends(
+        get_current_tenant_user
+    ),
+) -> AuthUser:
+    """
+    Dependency for paid/trial-gated product endpoints.
+
+    Authentication and tenant membership remain separate
+    from commercial entitlement enforcement so expired
+    users may still log in and access billing/upgrade flows.
+    """
+
+    organization_id = str(
+        current_user.organization_id
+        or ""
+    ).strip()
+
+    if not organization_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "A valid organization membership "
+                "is required."
+            ),
+        )
+
+    entitlement_service.require_active_product_access(
+        organization_id=organization_id,
+    )
+
+    return current_user
+
 
 @router.post(
     "/google",
@@ -748,7 +781,7 @@ def google_login(
     )
 
         # Existing users already have a tenant membership.
-    # Only check for an invitation when no membership exists.
+        # Only check for an invitation when no membership exists.
     if tenant_identity is None:
         invitation_started = time.perf_counter()
 
@@ -883,6 +916,8 @@ def google_login(
         ),
         user=user,
     )
+
+
 @router.post(
     "/microsoft",
     response_model=AuthResponse,

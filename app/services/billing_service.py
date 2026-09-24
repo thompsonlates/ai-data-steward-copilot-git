@@ -338,6 +338,22 @@ class BillingService:
             monthly_dq_analysis_limit=self._as_optional_int(
                 subscription.get("monthly_dq_analysis_limit")
             ),
+            steward_intelligence_enabled=self._as_bool(
+                subscription.get("steward_intelligence_enabled"),
+                default=False,
+            ),
+            governed_regex_execution_enabled=self._as_bool(
+                subscription.get("governed_regex_execution_enabled"),
+                default=False,
+            ),
+            governed_sql_execution_enabled=self._as_bool(
+                subscription.get("governed_sql_execution_enabled"),
+                default=False,
+            ),
+            policy_auto_execution_enabled=self._as_bool(
+                subscription.get("policy_auto_execution_enabled"),
+                default=False,
+            ),
             is_current=is_current,
         )
 

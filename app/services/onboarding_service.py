@@ -82,58 +82,63 @@ class OnboardingService:
         """
         Determine whether the authenticated user has completed
         organization and subscription onboarding.
+
+        Returning-user status is loaded through one consolidated
+        BigQuery repository call instead of three sequential reads.
         """
-        email = str(current_user.email).strip().lower()
+        email = str(
+            current_user.email
+        ).strip().lower()
 
         current_organization_id = (
-            str(current_user.organization_id).strip()
+            str(
+                current_user.organization_id
+            ).strip()
             if current_user.organization_id
             else None
         )
 
-        user = self.repository.get_user_by_email(
-            email=email,
-            organization_id=current_organization_id,
-        )
-
-        organization = (
-            self.repository.get_organization_by_user_email(
+        context = (
+            self.repository
+            .get_onboarding_status_context(
                 email=email,
-                organization_id=current_organization_id,
+                organization_id=(
+                    current_organization_id
+                ),
             )
         )
 
-        subscription = None
+        user_exists = bool(
+            context.get("user_exists")
+        )
+
+        organization_exists = bool(
+            context.get("organization_exists")
+        )
+
+        subscription_exists = bool(
+            context.get("subscription_exists")
+        )
+
+        resolved_organization_id = str(
+            context.get("organization_id") or ""
+        ).strip()
 
         if (
             current_organization_id
-            and organization
-            and str(organization.get("organization_id") or "").strip()
+            and resolved_organization_id
+            and resolved_organization_id
             != current_organization_id
         ):
             raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
+                status_code=(
+                    status.HTTP_403_FORBIDDEN
+                ),
                 detail=(
-                    "Onboarding organization does not match the "
-                    "authenticated tenant."
+                    "Onboarding organization does not "
+                    "match the authenticated tenant."
                 ),
             )
-
-        if organization:
-            organization_id = organization.get(
-                "organization_id"
-            )
-
-            if organization_id:
-                subscription = (
-                    self.repository.get_active_subscription(
-                        organization_id=str(organization_id),
-                    )
-                )
-
-        user_exists = user is not None
-        organization_exists = organization is not None
-        subscription_exists = subscription is not None
 
         onboarding_complete = (
             user_exists
@@ -154,41 +159,44 @@ class OnboardingService:
 
         return {
             "user_exists": user_exists,
-            "organization_exists": organization_exists,
-            "subscription_exists": subscription_exists,
-            "onboarding_complete": onboarding_complete,
+            "organization_exists": (
+                organization_exists
+            ),
+            "subscription_exists": (
+                subscription_exists
+            ),
+            "onboarding_complete": (
+                onboarding_complete
+            ),
             "current_step": current_step,
             "organization_id": (
-                organization.get("organization_id")
-                if organization
-                else None
+                resolved_organization_id
+                or None
             ),
             "organization_name": (
-                organization.get("organization_name")
-                if organization
-                else None
+                context.get(
+                    "organization_name"
+                )
             ),
-            "user_role": (
-                organization.get("user_role")
-                if organization
-                else user.get("role")
-                if user
-                else None
+            "user_role": context.get(
+                "user_role"
             ),
             "subscription_plan": (
-                subscription.get("plan_name")
-                if subscription
-                else None
+                context.get(
+                    "subscription_plan"
+                )
             ),
             "subscription_status": (
-                subscription.get("billing_status")
-                if subscription
-                else None
+                context.get(
+                    "subscription_status"
+                )
             ),
-            "trial_end_date": self._timestamp_to_iso(
-                subscription.get("trial_end_date")
-                if subscription
-                else None
+            "trial_end_date": (
+                self._timestamp_to_iso(
+                    context.get(
+                        "trial_end_date"
+                    )
+                )
             ),
         }
 

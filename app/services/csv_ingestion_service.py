@@ -67,8 +67,12 @@ class CsvIngestionService:
             )
 
         if len(file_bytes) > MAX_CSV_BYTES:
+            max_csv_mb = (
+                MAX_CSV_BYTES // (1024 * 1024)
+            )
+
             raise CsvIngestionError(
-                "CSV file exceeds the 10 MB limit"
+                f"CSV file exceeds the {max_csv_mb} MB limit"
             )
 
         encodings = (

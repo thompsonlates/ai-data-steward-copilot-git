@@ -9,6 +9,84 @@ from google.cloud import bigquery
 
 
 class BillingRepository:
+    PLAN_EXECUTION_ENTITLEMENTS: dict[str, dict[str, bool]] = {
+        "FREE_TRIAL": {
+            "steward_intelligence_enabled": False,
+            "governed_regex_execution_enabled": False,
+            "governed_sql_execution_enabled": False,
+            "policy_auto_execution_enabled": False,
+        },
+        "ENTERPRISE_TRIAL": {
+            "steward_intelligence_enabled": False,
+            "governed_regex_execution_enabled": False,
+            "governed_sql_execution_enabled": False,
+            "policy_auto_execution_enabled": False,
+        },
+        "PROFESSIONAL": {
+            "steward_intelligence_enabled": False,
+            "governed_regex_execution_enabled": False,
+            "governed_sql_execution_enabled": False,
+            "policy_auto_execution_enabled": False,
+        },
+        "STEWARD_OPERATIONS": {
+            "steward_intelligence_enabled": False,
+            "governed_regex_execution_enabled": False,
+            "governed_sql_execution_enabled": False,
+            "policy_auto_execution_enabled": False,
+        },
+        "GOVERNANCE_INTELLIGENCE": {
+            "steward_intelligence_enabled": False,
+            "governed_regex_execution_enabled": False,
+            "governed_sql_execution_enabled": False,
+            "policy_auto_execution_enabled": False,
+        },
+        "ENTERPRISE_GOVERNANCE": {
+            "steward_intelligence_enabled": True,
+            "governed_regex_execution_enabled": True,
+            "governed_sql_execution_enabled": True,
+            "policy_auto_execution_enabled": False,
+        },
+        "INTERNAL": {
+            "steward_intelligence_enabled": True,
+            "governed_regex_execution_enabled": True,
+            "governed_sql_execution_enabled": True,
+            "policy_auto_execution_enabled": False,
+        },
+        "FOUNDER": {
+            "steward_intelligence_enabled": True,
+            "governed_regex_execution_enabled": True,
+            "governed_sql_execution_enabled": True,
+            "policy_auto_execution_enabled": False,
+        },
+        "ADMIN": {
+            "steward_intelligence_enabled": True,
+            "governed_regex_execution_enabled": True,
+            "governed_sql_execution_enabled": True,
+            "policy_auto_execution_enabled": False,
+        },
+    }
+
+    @classmethod
+    def _execution_entitlements_for_plan(
+        cls,
+        plan_code: str,
+    ) -> dict[str, bool]:
+        normalized_plan_code = str(plan_code or "").strip().upper()
+
+        entitlements = cls.PLAN_EXECUTION_ENTITLEMENTS.get(
+            normalized_plan_code
+        )
+
+        if entitlements is None:
+            return {
+                "steward_intelligence_enabled": False,
+                "governed_regex_execution_enabled": False,
+                "governed_sql_execution_enabled": False,
+                "policy_auto_execution_enabled": False,
+            }
+
+        return dict(entitlements)
+
     def __init__(
         self,
         *,
@@ -197,6 +275,10 @@ class BillingRepository:
             subscription_status or ""
         ).strip().upper()
 
+        execution_entitlements = self._execution_entitlements_for_plan(
+            normalized_plan_code
+        )
+
         if not normalized_subscription_id:
             raise ValueError(
                 "stripe_subscription_id is required."
@@ -261,6 +343,18 @@ class BillingRepository:
 
             unit_amount_cents =
                 @unit_amount_cents,
+
+            steward_intelligence_enabled =
+                @steward_intelligence_enabled,
+
+            governed_regex_execution_enabled =
+                @governed_regex_execution_enabled,
+
+            governed_sql_execution_enabled =
+                @governed_sql_execution_enabled,
+
+            policy_auto_execution_enabled =
+                @policy_auto_execution_enabled,
 
             payment_status = COALESCE(
                 @payment_status,
@@ -344,6 +438,34 @@ class BillingRepository:
                     "unit_amount_cents",
                     "INT64",
                     unit_amount_cents,
+                ),
+                bigquery.ScalarQueryParameter(
+                    "steward_intelligence_enabled",
+                    "BOOL",
+                    execution_entitlements[
+                        "steward_intelligence_enabled"
+                    ],
+                ),
+                bigquery.ScalarQueryParameter(
+                    "governed_regex_execution_enabled",
+                    "BOOL",
+                    execution_entitlements[
+                        "governed_regex_execution_enabled"
+                    ],
+                ),
+                bigquery.ScalarQueryParameter(
+                    "governed_sql_execution_enabled",
+                    "BOOL",
+                    execution_entitlements[
+                        "governed_sql_execution_enabled"
+                    ],
+                ),
+                bigquery.ScalarQueryParameter(
+                    "policy_auto_execution_enabled",
+                    "BOOL",
+                    execution_entitlements[
+                        "policy_auto_execution_enabled"
+                    ],
                 ),
                 bigquery.ScalarQueryParameter(
                     "payment_status",
@@ -430,6 +552,10 @@ class BillingRepository:
             connection_limit,
             monthly_explanation_limit,
             monthly_dq_analysis_limit,
+            steward_intelligence_enabled,
+            governed_regex_execution_enabled,
+            governed_sql_execution_enabled,
+            policy_auto_execution_enabled,
 
             payment_status,
             last_payment_at,
@@ -523,6 +649,10 @@ class BillingRepository:
             connection_limit,
             monthly_explanation_limit,
             monthly_dq_analysis_limit,
+            steward_intelligence_enabled,
+            governed_regex_execution_enabled,
+            governed_sql_execution_enabled,
+            policy_auto_execution_enabled,
 
             payment_status,
             last_payment_at,
@@ -609,6 +739,10 @@ class BillingRepository:
             customer_id or ""
         ).strip()
 
+        execution_entitlements = self._execution_entitlements_for_plan(
+            normalized_plan_code
+        )
+
         if not normalized_customer_id:
             raise ValueError(
                 "customer_id is required for subscription activation."
@@ -640,6 +774,18 @@ class BillingRepository:
 
             payment_status = 'PAID',
             last_payment_at = CURRENT_TIMESTAMP(),
+
+            steward_intelligence_enabled =
+                @steward_intelligence_enabled,
+
+            governed_regex_execution_enabled =
+                @governed_regex_execution_enabled,
+
+            governed_sql_execution_enabled =
+                @governed_sql_execution_enabled,
+
+            policy_auto_execution_enabled =
+                @policy_auto_execution_enabled,
 
             updated_at = CURRENT_TIMESTAMP(),
             updated_by = @updated_by
@@ -701,6 +847,34 @@ class BillingRepository:
                     "current_period_ends_at",
                     "TIMESTAMP",
                     current_period_ends_at,
+                ),
+                bigquery.ScalarQueryParameter(
+                    "steward_intelligence_enabled",
+                    "BOOL",
+                    execution_entitlements[
+                        "steward_intelligence_enabled"
+                    ],
+                ),
+                bigquery.ScalarQueryParameter(
+                    "governed_regex_execution_enabled",
+                    "BOOL",
+                    execution_entitlements[
+                        "governed_regex_execution_enabled"
+                    ],
+                ),
+                bigquery.ScalarQueryParameter(
+                    "governed_sql_execution_enabled",
+                    "BOOL",
+                    execution_entitlements[
+                        "governed_sql_execution_enabled"
+                    ],
+                ),
+                bigquery.ScalarQueryParameter(
+                    "policy_auto_execution_enabled",
+                    "BOOL",
+                    execution_entitlements[
+                        "policy_auto_execution_enabled"
+                    ],
                 ),
                 bigquery.ScalarQueryParameter(
                     "updated_by",

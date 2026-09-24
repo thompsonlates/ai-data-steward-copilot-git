@@ -21,8 +21,12 @@ BIGQUERY_SCOPES = [
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/bigquery",
+    "https://www.googleapis.com/auth/spreadsheets",
 ]
 
+GOOGLE_SHEETS_WRITE_SCOPE = (
+    "https://www.googleapis.com/auth/spreadsheets"
+)
 
 @dataclass(frozen=True)
 class GoogleOAuthStartResult:
@@ -171,7 +175,6 @@ class GoogleOAuthService:
 
         authorization_url, _ = flow.authorization_url(
             access_type="offline",
-            include_granted_scopes="true",
             prompt="consent select_account",
             login_hint=normalized_email,
 
@@ -289,6 +292,28 @@ class GoogleOAuthService:
                 detail="Google did not return an access token.",
             )
 
+        granted_scopes = {
+            str(scope).strip()
+            for scope in (
+                oauth_credentials.scopes
+                or []
+            )
+            if str(scope).strip()
+        }
+
+        if (
+            GOOGLE_SHEETS_WRITE_SCOPE
+            not in granted_scopes
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Google authorization did not grant the required "
+                    "Google Sheets write scope. Reconnect Google and "
+                    "approve the requested Sheets access."
+                ),
+            )
+
         authorized_email = self._get_authorized_email(
             oauth_credentials.id_token
         )
@@ -301,6 +326,7 @@ class GoogleOAuthService:
             "client_id": oauth_credentials.client_id,
             "client_secret": oauth_credentials.client_secret,
             "scopes": list(oauth_credentials.scopes or []),
+            "google_sheets_write_enabled": True,
             "id_token": oauth_credentials.id_token,
             "authorized_email": authorized_email,
         }
@@ -361,6 +387,7 @@ class GoogleOAuthService:
                 oauth_credentials.scopes
                 or BIGQUERY_SCOPES
             ),
+            "google_sheets_write_enabled": True,
             "project_id": project_id,
             "authorized_email": authorized_email,
             "token_expiry": (

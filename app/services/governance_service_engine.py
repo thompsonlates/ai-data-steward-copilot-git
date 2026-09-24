@@ -7,6 +7,7 @@ import re
 from typing import Any, Dict, List
 
 from app.services.llm_service import LLMService
+from app.services.policy_intelligence import PolicyIntelligenceEngine
 
 from app.repositories.governance_ai_recommendation_repository import (
     GovernanceAiRecommendationRepository,
@@ -292,6 +293,437 @@ def generate_structured_governance_recommendation(
         raise
 
 
+def build_dq_policy_governance_context(
+    *,
+    organization_id: str,
+    profile_run_id: str,
+    domain: str,
+    policy_id: str | None = None,
+    policy_version: str | None = None,
+) -> Dict[str, Any]:
+    """
+    Build deterministic Governance Intelligence evidence for Policy -> DQ Rule
+    compliance. MET / AT_RISK / NOT_MET / NOT_EVALUATED is determined only by
+    PolicyIntelligenceEngine from persisted DQ_RULE_EXECUTION evidence.
+    """
+    effective_organization_id = _require_organization_id(organization_id)
+    effective_profile_run_id = str(profile_run_id or "").strip()
+    effective_domain = str(domain or "").strip().upper()
+
+    if not effective_profile_run_id:
+        raise ValueError("profile_run_id is required.")
+    if not effective_domain:
+        raise ValueError("domain is required.")
+
+    policy_engine = PolicyIntelligenceEngine()
+    compliance = policy_engine.evaluate_profile_against_policy(
+        organization_id=effective_organization_id,
+        profile_run_id=effective_profile_run_id,
+        domain=effective_domain,
+        policy_id=(str(policy_id).strip() if policy_id else None),
+        policy_version=(
+            str(policy_version).strip() if policy_version else None
+        ),
+    )
+
+    _validate_context_organization(
+        organization_id=effective_organization_id,
+        context=compliance,
+        context_name="DQ policy compliance evidence",
+    )
+
+    rule_results: List[Dict[str, Any]] = []
+    for raw_rule in compliance.get("rule_results") or []:
+        if not isinstance(raw_rule, dict):
+            continue
+        rule_results.append({
+            "dq_rule_id": raw_rule.get("dq_rule_id"),
+            "authoritative": bool(
+                raw_rule.get("catalog_authoritative", False)
+            ),
+            "required": bool(raw_rule.get("required_flag", False)),
+            "severity": raw_rule.get("severity"),
+            "compliance_status": raw_rule.get("compliance_status"),
+            "required_compliance_rate": raw_rule.get(
+                "required_compliance_rate"
+            ),
+            "measured_compliance_rate": raw_rule.get(
+                "measured_compliance_rate"
+            ),
+            "execution_status": raw_rule.get("execution_status"),
+            "evaluated_record_count": raw_rule.get(
+                "evaluated_record_count", 0
+            ),
+            "passed_record_count": raw_rule.get("passed_record_count", 0),
+            "failed_record_count": raw_rule.get("failed_record_count", 0),
+            "skipped_record_count": raw_rule.get("skipped_record_count", 0),
+            "governed_rule_description": raw_rule.get(
+                "governed_rule_description"
+            ),
+            "diagnostic_rule_ids": raw_rule.get("diagnostic_rule_ids") or [],
+            "compliance_evidence_id": raw_rule.get(
+                "compliance_evidence_id"
+            ),
+            "remediation_approval_status": raw_rule.get(
+                "remediation_approval_status"
+            ),
+            "remediation_recommendation_id": raw_rule.get(
+                "remediation_recommendation_id"
+            ),
+            "remediation_version_id": raw_rule.get(
+                "remediation_version_id"
+            ),
+
+            # Governed remediation rollup. These fields describe the
+            # remediation lifecycle only; they do not determine MET /
+            # AT_RISK / NOT_MET policy compliance.
+            "remediation_status": raw_rule.get(
+                "remediation_status"
+            ),
+            "authoritative_remediation_approval_status": raw_rule.get(
+                "authoritative_remediation_approval_status"
+            ),
+            "authoritative_remediation_recommendation_id": raw_rule.get(
+                "authoritative_remediation_recommendation_id"
+            ),
+            "authoritative_remediation_version_id": raw_rule.get(
+                "authoritative_remediation_version_id"
+            ),
+            "diagnostic_rule_count": int(
+                raw_rule.get("diagnostic_rule_count") or 0
+            ),
+            "diagnostic_recommendation_rule_count": int(
+                raw_rule.get(
+                    "diagnostic_recommendation_rule_count"
+                )
+                or 0
+            ),
+            "approved_diagnostic_rule_count": int(
+                raw_rule.get(
+                    "approved_diagnostic_rule_count"
+                )
+                or 0
+            ),
+            "approved_diagnostic_rule_ids": raw_rule.get(
+                "approved_diagnostic_rule_ids"
+            )
+            or [],
+            "diagnostic_remediation_states": raw_rule.get(
+                "diagnostic_remediation_states"
+            )
+            or [],
+            "reason": raw_rule.get("reason"),
+        })
+
+    status = str(
+        compliance.get("policy_compliance_status") or "NOT_EVALUATED"
+    ).strip().upper()
+
+    return {
+        "organization_id": effective_organization_id,
+        "policy_id": compliance.get("policy_id"),
+        "policy_version": compliance.get("policy_version"),
+        "domain": effective_domain,
+        "profile_run_id": effective_profile_run_id,
+        "policy_compliance_status": status,
+        "mapped_rule_count": int(compliance.get("mapped_rule_count") or 0),
+        "required_rule_count": int(compliance.get("required_rule_count") or 0),
+        "met_rule_count": int(compliance.get("met_rule_count") or 0),
+        "at_risk_rule_count": int(compliance.get("at_risk_rule_count") or 0),
+        "not_met_rule_count": int(compliance.get("not_met_rule_count") or 0),
+        "not_evaluated_rule_count": int(
+            compliance.get("not_evaluated_rule_count") or 0
+        ),
+        "evaluated_at": compliance.get("evaluated_at"),
+        "rule_results": rule_results,
+    }
+
+
+def attach_dq_policy_governance_context(
+    dataset_row: Dict[str, Any],
+    *,
+    organization_id: str,
+    profile_run_id: str,
+    domain: str,
+    policy_id: str | None = None,
+    policy_version: str | None = None,
+) -> Dict[str, Any]:
+    """Return a copy of a dataset governance row enriched with DQ policy evidence."""
+    effective_organization_id = _require_organization_id(organization_id)
+    _validate_context_organization(
+        organization_id=effective_organization_id,
+        context=dataset_row,
+        context_name="Governance dataset row",
+    )
+    enriched = dict(dataset_row)
+    enriched["organization_id"] = effective_organization_id
+    enriched["dq_policy_compliance"] = build_dq_policy_governance_context(
+        organization_id=effective_organization_id,
+        profile_run_id=profile_run_id,
+        domain=domain,
+        policy_id=policy_id,
+        policy_version=policy_version,
+    )
+    return enriched
+
+
+
+def _format_policy_rate(value: Any) -> str:
+    try:
+        if value is None:
+            return "not available"
+        return f"{float(value) * 100:.2f}%"
+    except (TypeError, ValueError):
+        return "not available"
+
+
+def _apply_dq_policy_recommendation_guardrail(
+    recommendation: Dict[str, Any],
+    context: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Enforce deterministic Policy -> DQ Rule evidence after AI generation.
+
+    The LLM may explain the evidence, but it may never downgrade, contradict,
+    or recalculate the deterministic policy compliance result.
+    """
+    normalized = _validate_governance_recommendation(recommendation)
+
+    compliance = context.get("dq_policy_compliance")
+    if not isinstance(compliance, dict):
+        return normalized
+
+    status = str(
+        compliance.get("policy_compliance_status")
+        or "NOT_EVALUATED"
+    ).strip().upper()
+
+    if status == "MET":
+        return normalized
+
+    rule_results = [
+        item
+        for item in (compliance.get("rule_results") or [])
+        if isinstance(item, dict)
+    ]
+
+    required_rules = [
+        item
+        for item in rule_results
+        if bool(item.get("required"))
+    ]
+    primary_rule = (
+        required_rules[0]
+        if required_rules
+        else (rule_results[0] if rule_results else {})
+    )
+
+    policy_id = str(
+        compliance.get("policy_id")
+        or "the active governance policy"
+    ).strip()
+    dq_rule_id = str(
+        primary_rule.get("dq_rule_id")
+        or "the required DQ control"
+    ).strip()
+
+    measured = _format_policy_rate(
+        primary_rule.get("measured_compliance_rate")
+    )
+    required = _format_policy_rate(
+        primary_rule.get("required_compliance_rate")
+    )
+
+    remediation_approval_status = str(
+        primary_rule.get("remediation_approval_status")
+        or ""
+    ).strip().upper()
+
+    remediation_status = str(
+        primary_rule.get("remediation_status")
+        or ""
+    ).strip().upper()
+
+    approved_diagnostic_rule_count = int(
+        primary_rule.get("approved_diagnostic_rule_count")
+        or 0
+    )
+    diagnostic_rule_count = int(
+        primary_rule.get("diagnostic_rule_count")
+        or 0
+    )
+    approved_diagnostic_rule_ids = [
+        str(item).strip().upper()
+        for item in (
+            primary_rule.get("approved_diagnostic_rule_ids")
+            or []
+        )
+        if str(item).strip()
+    ]
+
+    evidence = list(
+        normalized.get("supporting_evidence") or []
+    )
+
+    deterministic_evidence = (
+        f"{policy_id}: {dq_rule_id} is {status}; "
+        f"measured compliance {measured} versus "
+        f"required {required}."
+    )
+    if deterministic_evidence not in evidence:
+        evidence.insert(0, deterministic_evidence)
+
+    if status == "NOT_MET":
+        if remediation_status == "AUTHORITATIVE_APPROVED":
+            action = (
+                "Execute the approved authoritative remediation against the "
+                "source data, then re-profile before policy compliance is "
+                "considered verified."
+            )
+            remediation_summary = (
+                "The authoritative governed control has an approved "
+                "remediation artifact."
+            )
+
+        elif remediation_status == "ALL_DIAGNOSTICS_APPROVED":
+            action = (
+                "Execute the approved diagnostic remediations, then re-profile "
+                "the data to verify the authoritative policy control."
+            )
+            remediation_summary = (
+                "All supporting diagnostic remediation paths are approved, "
+                "but policy verification still requires execution and re-profile."
+            )
+
+        elif remediation_status == "PARTIALLY_APPROVED":
+            action = (
+                "Complete review of the remaining supporting diagnostic "
+                "remediation paths, execute approved changes, and re-profile "
+                "the data."
+            )
+
+            approved_text = (
+                ", ".join(approved_diagnostic_rule_ids)
+                if approved_diagnostic_rule_ids
+                else "one or more diagnostic controls"
+            )
+
+            remediation_summary = (
+                f"Remediation is partially approved: "
+                f"{approved_diagnostic_rule_count} of "
+                f"{diagnostic_rule_count} supporting diagnostic controls "
+                f"are approved ({approved_text})."
+            )
+
+        elif remediation_status == "PENDING_REVIEW":
+            action = (
+                "Review the available remediation artifacts for the failing "
+                "governed control and supporting diagnostics, approve the "
+                "appropriate changes, then execute and re-profile."
+            )
+            remediation_summary = (
+                "Remediation artifacts exist but have not completed "
+                "steward approval."
+            )
+
+        elif remediation_approval_status:
+            # Backward-compatible fallback for older policy evidence rows.
+            action = (
+                "Execute the approved remediation against the source data, "
+                "then re-profile before policy compliance is considered verified."
+            )
+            remediation_summary = (
+                "An approved remediation artifact exists for this control."
+            )
+
+        else:
+            action = (
+                "Review and approve remediation for the failing required DQ "
+                "control, execute the approved change, and re-profile the data."
+            )
+            remediation_summary = (
+                "No approved remediation path is currently recorded for the "
+                "governed control."
+            )
+
+        normalized["headline"] = "DQ policy remediation required"
+        normalized["summary"] = (
+            f"{policy_id} is NOT MET because {dq_rule_id} measured "
+            f"{measured} compliance against a required threshold of "
+            f"{required}. {remediation_summary} Certification readiness must "
+            "remain blocked until deterministic profile evidence verifies "
+            "compliance."
+        )
+        normalized["priority"] = "HIGH"
+        normalized["recommended_actions"] = [
+            action,
+            (
+                "Use the next profile run as the verification event for "
+                "the governed policy threshold."
+            ),
+        ]
+        normalized["supporting_evidence"] = evidence[:5]
+        normalized["confidence"] = max(
+            float(normalized.get("confidence") or 0.0),
+            0.95,
+        )
+        return normalized
+
+    if status == "AT_RISK":
+        normalized["headline"] = "DQ policy threshold at risk"
+        normalized["summary"] = (
+            f"{policy_id} is AT RISK based on deterministic DQ policy "
+            f"evidence for {dq_rule_id}. Measured compliance is {measured} "
+            f"against a required threshold of {required}."
+        )
+        if normalized.get("priority") == "LOW":
+            normalized["priority"] = "MEDIUM"
+        normalized["recommended_actions"] = [
+            (
+                "Review the governed DQ control and current profile evidence "
+                "before the next certification decision."
+            ),
+            (
+                "Re-profile after remediation or source-data changes to "
+                "confirm the policy posture."
+            ),
+        ]
+        normalized["supporting_evidence"] = evidence[:5]
+        normalized["confidence"] = max(
+            float(normalized.get("confidence") or 0.0),
+            0.90,
+        )
+        return normalized
+
+    if status == "NOT_EVALUATED":
+        normalized["headline"] = "DQ policy verification required"
+        normalized["summary"] = (
+            f"{policy_id} has not been deterministically evaluated for "
+            f"{dq_rule_id}. Required policy controls must be executed and "
+            "profile evidence captured before certification readiness can "
+            "be confirmed."
+        )
+        if normalized.get("priority") == "LOW":
+            normalized["priority"] = "MEDIUM"
+        normalized["recommended_actions"] = [
+            (
+                "Run or verify the required DQ control and capture "
+                "DQ_RULE_EXECUTION evidence."
+            ),
+            (
+                "Re-evaluate the policy after deterministic profile "
+                "evidence is available."
+            ),
+        ]
+        normalized["supporting_evidence"] = evidence[:5]
+        normalized["confidence"] = max(
+            float(normalized.get("confidence") or 0.0),
+            0.90,
+        )
+        return normalized
+
+    return normalized
+
 def build_governance_recommendation_context(
     row: Dict[str, Any],
     *,
@@ -420,6 +852,38 @@ def build_governance_recommendation_context(
             "NOT_READY_FOR_CERTIFICATION"
         )
 
+    dq_policy_compliance = row.get("dq_policy_compliance")
+    if isinstance(dq_policy_compliance, dict):
+        _validate_context_organization(
+            organization_id=effective_organization_id,
+            context=dq_policy_compliance,
+            context_name="DQ policy compliance evidence",
+        )
+        dq_policy_status = str(
+            dq_policy_compliance.get("policy_compliance_status")
+            or "NOT_EVALUATED"
+        ).strip().upper()
+        dq_policy_blocker = {
+            "NOT_MET": "DQ_POLICY_NOT_MET",
+            "AT_RISK": "DQ_POLICY_AT_RISK",
+            "NOT_EVALUATED": "DQ_POLICY_NOT_EVALUATED",
+        }.get(dq_policy_status)
+        if dq_policy_blocker and dq_policy_blocker not in blockers:
+            blockers.append(dq_policy_blocker)
+
+        # A required DQ policy failure or missing required policy evidence
+        # blocks readiness even when legacy certification checks still pass.
+        if dq_policy_status in {"NOT_MET", "NOT_EVALUATED"}:
+            ready = False
+
+            if (
+                certification_status == "CERTIFIED"
+                and "CERTIFICATION_POLICY_CONFLICT" not in blockers
+            ):
+                blockers.append(
+                    "CERTIFICATION_POLICY_CONFLICT"
+                )
+
     return {
         **row,
         "organization_id": (
@@ -436,6 +900,9 @@ def build_governance_recommendation_context(
         ),
         "certification_status": (
             certification_status
+        ),
+        "certification_policy_conflict": (
+            "CERTIFICATION_POLICY_CONFLICT" in blockers
         ),
     }
 
@@ -476,7 +943,14 @@ Rules:
 - Use only the supplied governance metrics.
 - Keep the response business friendly.
 - Recommend only governance actions.
-- Do not discuss data quality unless explicitly mentioned.
+- Discuss data quality only when deterministic DQ policy compliance evidence is supplied.
+- Never calculate or infer policy compliance; use the supplied deterministic status and rates exactly.
+- Treat remediation_status independently from policy compliance: approval of remediation never means the policy is MET.
+- When remediation_status is PARTIALLY_APPROVED, explicitly acknowledge partial approval and do not say that no remediation has been approved.
+- When remediation_status is ALL_DIAGNOSTICS_APPROVED or AUTHORITATIVE_APPROVED, state that execution and re-profile are still required before policy verification.
+- If a required DQ policy status is NOT_MET, the recommendation MUST NOT be LOW priority and MUST NOT say to merely continue monitoring.
+- If a required DQ policy status is NOT_EVALUATED, do not claim certification readiness until deterministic evidence exists.
+- A legacy CERTIFIED status does not override a current required DQ policy failure; call out the governance conflict when present.
 - Do not recommend software products.
 - Maximum 3 recommended actions.
 - Confidence must reflect the available evidence.
@@ -514,11 +988,17 @@ Certification Readiness Score:
 Ready For Certification:
 {prompt_context.get("ready_for_certification")}
 
+Certification / Policy Conflict:
+{prompt_context.get("certification_policy_conflict")}
+
 Derived Governance Blockers:
 {prompt_context.get("derived_governance_blockers")}
 
 Recommendation Required:
 {prompt_context.get("recommendation_required")}
+
+DQ Policy Compliance Evidence:
+{json.dumps(prompt_context.get("dq_policy_compliance"), default=str)}
 
 Return EXACTLY this JSON format:
 
@@ -546,6 +1026,10 @@ def build_governance_ai_recommendation(
     *,
     organization_id: str,
     provider: str | None = None,
+    profile_run_id: str | None = None,
+    domain: str | None = None,
+    policy_id: str | None = None,
+    policy_version: str | None = None,
 ) -> Dict[str, Any]:
     effective_organization_id = (
         _require_organization_id(
@@ -553,9 +1037,45 @@ def build_governance_ai_recommendation(
         )
     )
 
+    recommendation_row = dict(dataset_row)
+
+    effective_profile_run_id = str(
+        profile_run_id or ""
+    ).strip()
+    requested_domain = str(
+        domain
+        or recommendation_row.get("domain")
+        or ""
+    ).strip().upper()
+    row_domain = str(
+        recommendation_row.get("domain")
+        or ""
+    ).strip().upper()
+
+    if (
+        not isinstance(
+            recommendation_row.get("dq_policy_compliance"),
+            dict,
+        )
+        and effective_profile_run_id
+        and requested_domain
+        and (
+            not row_domain
+            or row_domain == requested_domain
+        )
+    ):
+        recommendation_row = attach_dq_policy_governance_context(
+            recommendation_row,
+            organization_id=effective_organization_id,
+            profile_run_id=effective_profile_run_id,
+            domain=requested_domain,
+            policy_id=policy_id,
+            policy_version=policy_version,
+        )
+
     context = (
         build_governance_recommendation_context(
-            dataset_row,
+            recommendation_row,
             organization_id=(
                 effective_organization_id
             ),
@@ -625,6 +1145,11 @@ def build_governance_ai_recommendation(
                 )
             )
 
+    recommendation = _apply_dq_policy_recommendation_guardrail(
+        recommendation,
+        context,
+    )
+
     # --------------------------------------------------
     # 2. Persist / reuse Governance recommendation
     # --------------------------------------------------
@@ -636,16 +1161,16 @@ def build_governance_ai_recommendation(
     persisted = repository.get_or_create_recommendation(
         organization_id=effective_organization_id,
         dataset_id=str(
-            dataset_row.get("dataset_id")
+            recommendation_row.get("dataset_id")
             or ""
         ),
         dataset_name=str(
-            dataset_row.get("dataset_name")
+            recommendation_row.get("dataset_name")
             or ""
         ),
         domain=(
-            str(dataset_row.get("domain"))
-            if dataset_row.get("domain")
+            str(recommendation_row.get("domain"))
+            if recommendation_row.get("domain")
             is not None
             else None
         ),
@@ -721,6 +1246,50 @@ def fallback_governance_recommendation(
 
     actions: list[str] = []
 
+    if "DQ_POLICY_NOT_MET" in blockers:
+        dq_policy = context.get("dq_policy_compliance")
+        primary_rule = {}
+
+        if isinstance(dq_policy, dict):
+            candidate_rules = [
+                item
+                for item in (dq_policy.get("rule_results") or [])
+                if isinstance(item, dict)
+                and bool(item.get("required"))
+            ]
+            if candidate_rules:
+                primary_rule = candidate_rules[0]
+
+        remediation_status = str(
+            primary_rule.get("remediation_status")
+            or ""
+        ).strip().upper()
+
+        if remediation_status == "PARTIALLY_APPROVED":
+            actions.append(
+                "Complete remaining diagnostic remediation approvals, execute approved changes, and re-profile the data."
+            )
+        elif remediation_status in {
+            "ALL_DIAGNOSTICS_APPROVED",
+            "AUTHORITATIVE_APPROVED",
+        }:
+            actions.append(
+                "Execute approved remediation and re-profile the data to verify policy compliance."
+            )
+        elif remediation_status == "PENDING_REVIEW":
+            actions.append(
+                "Complete steward review of available remediation artifacts before execution and re-profile."
+            )
+        else:
+            actions.append(
+                "Resolve required DQ policy control failures, approve remediation, execute changes, and re-profile the data."
+            )
+
+    if "DQ_POLICY_NOT_EVALUATED" in blockers:
+        actions.append(
+            "Run or verify required DQ policy controls before certification readiness is confirmed."
+        )
+
     if (
         "DATA_OWNER_MISSING"
         in blockers
@@ -746,6 +1315,11 @@ def fallback_governance_recommendation(
             "Resolve failed certification checks."
         )
 
+    if "DQ_POLICY_AT_RISK" in blockers:
+        actions.append(
+            "Review DQ policy controls that are below or near the required threshold."
+        )
+
     if (
         "NOT_READY_FOR_CERTIFICATION"
         in blockers
@@ -769,7 +1343,10 @@ def fallback_governance_recommendation(
         ),
         "priority": (
             "HIGH"
-            if len(blockers) >= 2
+            if (
+                "DQ_POLICY_NOT_MET" in blockers
+                or len(blockers) >= 2
+            )
             else "MEDIUM"
         ),
         "recommended_actions": actions[:3],

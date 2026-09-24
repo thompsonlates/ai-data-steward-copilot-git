@@ -295,22 +295,55 @@ class StripeBillingService:
         )
 
         try:
+            # Confirm that the stored customer exists in the Stripe
+            # account/mode configured by STRIPE_SECRET_KEY before
+            # attempting to create a Customer Portal session.
+            stripe_customer = stripe.Customer.retrieve(
+                normalized_stripe_customer_id
+            )
+
+            if getattr(stripe_customer, "deleted", False):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        "The stored Stripe customer has been deleted. "
+                        "Start a new checkout session or repair the "
+                        "Stripe customer mapping before opening billing."
+                    ),
+                )
+
             session = stripe.billing_portal.Session.create(
                 customer=normalized_stripe_customer_id,
                 return_url=return_url,
             )
+
+        except HTTPException:
+            raise
+
         except stripe.StripeError as exc:
+            stripe_message = str(exc)
             logger.warning(
                 "Stripe portal session creation failed: %s - %s",
                 type(exc).__name__,
-                str(exc),
+                stripe_message,
             )
+
+            if "No such customer" in stripe_message:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        "The stored Stripe customer does not exist in "
+                        "the Stripe account/mode configured for this "
+                        "environment. Verify STRIPE_SECRET_KEY and the "
+                        "stored stripe_customer_id, or complete a new "
+                        "checkout in the same Stripe mode."
+                    ),
+                ) from exc
 
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail=(
-                    "Unable to create the Stripe "
-                    "billing portal session."
+                    "Unable to create the Stripe billing portal session."
                 ),
             ) from exc
 
@@ -541,8 +574,8 @@ class StripeBillingService:
                 "Stripe price ID is missing."
             )
 
-        plan_code = self.price_to_plan.get(
-            stripe_price_id
+        plan_code = self._get_plan_code_for_price_id(
+            stripe_price_id=stripe_price_id
         )
 
         if not plan_code:

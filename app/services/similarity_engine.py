@@ -187,13 +187,15 @@ class SimilarityEngine:
                 return 0.05
 
         if normalized_field in {
-            "supplier_name_line_1",
-            "supplier_name_line_2",
-            "customer_name",
-            "provider_name",
-            "product_name",
-            "name",
-        }:
+                "supplier_name_line_1",
+                "supplier_name_line_2",
+                "customer_name",
+                "provider_name",
+                "product_name",
+                "location_name",
+                "organization_name",
+                "name",
+            }:
             if len(compact) < 4:
                 return 0.15
 
@@ -202,6 +204,7 @@ class SimilarityEngine:
             "address",
             "address_line_1",
             "address_line_2",
+            "location_address",
         }:
             if len(compact) < 6:
                 return 0.10
