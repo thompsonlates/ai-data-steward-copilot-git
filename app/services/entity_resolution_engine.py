@@ -976,6 +976,7 @@ class EntityResolutionEngine:
 
             member_id_score = customer_result["member_id_score"]
             phone_score = customer_result["phone_score"]
+            name_score = customer_result["name_score"]
             dob_score = customer_result["dob_score"]
             email_score = customer_result["email_score"]
             address_score = customer_result["address_score"]
