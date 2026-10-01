@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from difflib import SequenceMatcher
 from rapidfuzz.distance import JaroWinkler
 from typing import Any, Optional
+from app.services.entity_resolution.models import SignalScore
 from app.services.similarity_engine import (SimilarityEngine,email_domain_trust,)
 from app.services.entity_resolution.domain_scorers.location import score_location
 from app.services.entity_resolution.domain_scorers.organization import (
@@ -21,6 +21,35 @@ from app.services.entity_resolution.signal_builder import (
     build_signal_contributions,
     primary_signal_from_contributions,
 )
+from app.services.entity_resolution.policy import (
+    automation_policy_status,
+    automation_readiness_label,
+    automation_readiness_score,
+    automation_tier,
+    estimated_false_positive_risk,
+    learning_adjustment,
+    recommended_action_from_tier,
+    resolve_automation_thresholds,
+    resolve_readiness_label_thresholds,
+    resolve_signal_tone_thresholds,
+    resolve_source_trust_map,
+    resolve_weights,
+    risk_multiplier,
+    signal_tone,
+)
+
+from app.services.entity_resolution.scoring_helpers import (
+    dob_match,
+    exact_match_score,
+    member_id_match,
+    name_similarity,
+    normalize_phone,
+    normalize_text,
+    phone_score,
+    safe_score,
+    similarity,
+    source_trust_score,
+)
 
 from app.services.entity_resolution.evidence_timeline import (
     build_evidence_timeline,
@@ -29,20 +58,6 @@ from app.services.entity_resolution.evidence_timeline import (
 
 from app.api.schemas import MatchExplainRequest
 from datetime import datetime
-
-
-@dataclass
-class SignalScore:
-    name: str
-    score: float
-    weight: float
-    weighted_score: float
-    detail: str
-    signal_band: str
-    match_level: Optional[str] = None
-    domain_trust: Optional[float] = None
-    signal_type: Optional[str] = None
-
 
 
 class EntityResolutionEngine:
@@ -363,32 +378,14 @@ class EntityResolutionEngine:
         )
     
     def _normalize_phone(self, value: Optional[str]) -> str:
-        digits = "".join(
-            character
-        for character in str(value or "")
-        if character.isdigit()
-        )
-
-    # Normalize US country code: 1-904-555-1212 -> 9045551212
-        if len(digits) == 11 and digits.startswith("1"):
-            digits = digits[1:]
-
-        return digits
-
+        return normalize_phone(value)
 
     def _phone_score(
         self,
         phone_a: Optional[str],
         phone_b: Optional[str],
     ) -> Optional[float]:
-        normalized_a = self._normalize_phone(phone_a)
-        normalized_b = self._normalize_phone(phone_b)
-
-        # Missing phone evidence is unavailable, not a mismatch.
-        if not normalized_a or not normalized_b:
-            return None
-
-        return 1.0 if normalized_a == normalized_b else 0.0
+        return phone_score(phone_a, phone_b)
 
 
     def _phone_detail(
@@ -616,13 +613,7 @@ class EntityResolutionEngine:
             return round(sum(valid_scores) / len(valid_scores), 4)
     
     def _exact_match_score(self, value_a: Any, value_b: Any) -> float:
-        normalized_a = self._normalize_text(value_a)
-        normalized_b = self._normalize_text(value_b)
-        return (
-            1.0
-            if normalized_a and normalized_a == normalized_b
-            else 0.0
-        )
+        return exact_match_score(value_a, value_b)
 
     def _resolve_entity_id(self, record, domain: str) -> str:
         domain = (domain or "CUSTOMER").upper()
@@ -1688,111 +1679,50 @@ class EntityResolutionEngine:
                 composite_risk_band=composite_risk_band,
             )
 
-    def _resolve_weights(self, policy_config: Optional[dict[str, Any]]) -> dict[str, float]:
+    def _resolve_weights(
+        self,
+        policy_config: Optional[dict[str, Any]],
+    ) -> dict[str, float]:
         domain = (policy_config or {}).get("domain", "CUSTOMER").upper()
-        weights = self.get_domain_signal_weights(domain)
-        if not policy_config:
-            return weights
-
-        policy_weights = policy_config.get("signal_weights") or policy_config.get("weights")
-        if not isinstance(policy_weights, dict):
-            return weights
-
-        for key in weights:
-            value = policy_weights.get(key)
-            if value is None:
-                continue
-            try:
-                weights[key] = max(0.0, min(float(value), 1.0))
-            except (TypeError, ValueError):
-                continue
-
-        total = sum(weights.values())
-        if total > 0:
-            weights = {k: round(v / total, 6) for k, v in weights.items()}
-
-        return weights
+        domain_weights = self.get_domain_signal_weights(domain)
+        return resolve_weights(policy_config, domain_weights)
 
     def _resolve_source_trust_map(
         self,
         policy_config: Optional[dict[str, Any]],
     ) -> dict[str, float]:
-        source_trust_map = self.default_source_trust_map.copy()
-        if not policy_config:
-            return source_trust_map
-
-        policy_map = policy_config.get("source_trust_map")
-        if not isinstance(policy_map, dict):
-            return source_trust_map
-
-        for key, value in policy_map.items():
-            try:
-                source_trust_map[str(key).upper()] = max(0.0, min(float(value), 1.0))
-            except (TypeError, ValueError):
-                continue
-
-        return source_trust_map
+        return resolve_source_trust_map(
+            policy_config,
+            self.default_source_trust_map,
+        )
 
     def _resolve_automation_thresholds(
         self,
         policy_config: Optional[dict[str, Any]],
     ) -> dict[str, int]:
-        thresholds = self.default_automation_thresholds.copy()
-        if not policy_config:
-            return thresholds
-
-        policy_thresholds = policy_config.get("automation_thresholds") or {}
-        for key in thresholds:
-            value = policy_thresholds.get(key)
-            if value is None:
-                continue
-            try:
-                thresholds[key] = max(0, min(int(value), 100))
-            except (TypeError, ValueError):
-                continue
-
-        return thresholds
+        return resolve_automation_thresholds(
+            policy_config,
+            self.default_automation_thresholds,
+        )
 
     def _resolve_signal_tone_thresholds(
         self,
         policy_config: Optional[dict[str, Any]],
     ) -> dict[str, float]:
-        thresholds = self.default_signal_tone_thresholds.copy()
-        if not policy_config:
-            return thresholds
-
-        policy_thresholds = policy_config.get("signal_tone_thresholds") or {}
-        for key in thresholds:
-            value = policy_thresholds.get(key)
-            if value is None:
-                continue
-            try:
-                thresholds[key] = max(0.0, min(float(value), 1.0))
-            except (TypeError, ValueError):
-                continue
-
-        return thresholds
+        return resolve_signal_tone_thresholds(
+            policy_config,
+            self.default_signal_tone_thresholds,
+        )
 
     def _resolve_readiness_label_thresholds(
         self,
         policy_config: Optional[dict[str, Any]],
     ) -> dict[str, int]:
-        thresholds = self.default_readiness_label_thresholds.copy()
-        if not policy_config:
-            return thresholds
+        return resolve_readiness_label_thresholds(
+            policy_config,
+            self.default_readiness_label_thresholds,
+        )
 
-        policy_thresholds = policy_config.get("readiness_label_thresholds") or {}
-        for key in thresholds:
-            value = policy_thresholds.get(key)
-            if value is None:
-                continue
-            try:
-                thresholds[key] = max(0, min(int(value), 100))
-            except (TypeError, ValueError):
-                continue
-
-        return thresholds
-    
     def _similarity_band(
             self, 
             score: float
@@ -1858,116 +1788,28 @@ class EntityResolutionEngine:
         score: float,
         thresholds: dict[str, float],
     ) -> str:
-        if score is None:
-            return "neutral"
-        safe_score = float(score or 0)
-        safe_score = self._safe_score(score)
+        return signal_tone(
+            signal_name,
+            score,
+            thresholds,
+        )
 
-
-        strong_positive = thresholds.get("strong_positive", 0.92)
-        positive = thresholds.get("positive", 0.85)
-        neutral = thresholds.get("neutral", 0.70)
-        neutral_source = thresholds.get("neutral_source", 0.65)
-        safe_score = float(score or 0)
-
-        
-        # Deterministic identity anchors
-        if signal_name in {
-            "supplier_id_match",
-            "product_id_match",
-            "provider_id_match",
-            "patient_id_match",
-            "member_id_match",
-            "tax_id_match",
-            "gtin_match",
-            "item_category_match",
-            "npi_match",
-            "human_id_match",
-            "email_match",
-            "dob_match",
-        }:
-
-            if float(safe_score or 0) >= 1.0:
-                return "positive"
-            
-            return "warning"       
-
-        # Email identity signal
-        if signal_name in {
-            "email_match",
-            "contact_email_match",
-        }:
-
-            if safe_score >= strong_positive:
-                return "positive"
-
-            if safe_score >= neutral:
-                return "neutral"
-
-            return "warning"
-
-        # Name similarity
-        if signal_name == "name_similarity":
-        
-            if safe_score >= positive:
-                return "positive"
-
-            if safe_score >= neutral:
-                return "neutral"
-
-            return "warning"
-
-        # Address / Attribute matching
-        if signal_name in {
-            "address_similarity",
-            "attribute_similarity",
-        }:
-
-            if safe_score >= positive:
-                return "positive"
-
-            if safe_score >= neutral:
-                return "neutral"
-
-            return "warning"
-
-        # Source trust
-        if signal_name == "source_trust":
-
-            if safe_score >= 0.85:
-                return "positive"
-
-            if safe_score >= neutral_source:
-                return "neutral"
-
-            return "warning"
-
-        return "neutral"
-    
-
-    def _safe_score(self, value: Optional[float], default: float = 0.0) -> float:
-        if value is None:
-            return default
-        try:
-            return max(0.0, min(float(value), 1.0))
-        except (TypeError, ValueError):
-            return default
+    def _safe_score(
+        self,
+        value: Optional[float],
+        default: float = 0.0,
+    ) -> float:
+        return safe_score(value, default)
 
     def _normalize_text(self, value: Optional[str]) -> str:
-        return (value or "").strip().lower()
+        return normalize_text(value)
 
-    def _similarity(self, a: Optional[str], b: Optional[str]) -> float:
-
-        a_norm = self._normalize_text(a)
-        b_norm = self._normalize_text(b)
-
-        if not a_norm or not b_norm:
-            return 0.0
-
-        return round(
-            JaroWinkler.similarity(a_norm, b_norm),
-            4,
-    )
+    def _similarity(
+        self,
+        a: Optional[str],
+        b: Optional[str],
+    ) -> float:
+        return similarity(a, b)
 
     def _name_similarity(
         self,
@@ -1976,30 +1818,21 @@ class EntityResolutionEngine:
         first_b: Optional[str],
         last_b: Optional[str],
     ) -> float:
-        first_score = self._similarity(first_a, first_b)
-        last_score = self._similarity(last_a, last_b)
-        return round((first_score * 0.4) + (last_score * 0.6), 4)
+        return name_similarity(first_a, last_a, first_b, last_b)
 
-    def _dob_match(self, dob_a: Optional[str], dob_b: Optional[str]) -> float:
-        a = self._normalize_text(dob_a)
-        b = self._normalize_text(dob_b)
+    def _dob_match(
+        self,
+        dob_a: Optional[str],
+        dob_b: Optional[str],
+    ) -> float:
+        return dob_match(dob_a, dob_b)
 
-        if not a or not b:
-            return 0.0
-        return 1.0 if a == b else 0.0
-    
     def _member_id_match(
         self,
         member_id_a: Optional[str],
         member_id_b: Optional[str],
     ) -> float:
-        a = self._normalize_text(member_id_a)
-        b = self._normalize_text(member_id_b)
-
-        if not a or not b:
-            return 0.0
-        
-        return 1.0 if a == b else 0.0
+        return member_id_match(member_id_a, member_id_b)
 
     def _member_id_detail(
         self,
@@ -2023,65 +1856,41 @@ class EntityResolutionEngine:
         source_b: Optional[str],
         source_trust_map: dict[str, float],
     ) -> float:
-        trust_a = source_trust_map.get((source_a or "").upper(), 0.65)
-        trust_b = source_trust_map.get((source_b or "").upper(), 0.65)
+        return source_trust_score(
+            source_a,
+            source_b,
+            source_trust_map,
+        )
 
-        avg_trust = (trust_a + trust_b) / 2.0
-        distance_penalty = abs(trust_a - trust_b) * 0.25
+    def _learning_adjustment(
+        self,
+        override_rate_estimate: Optional[float],
+    ) -> float:
+        return learning_adjustment(override_rate_estimate)
 
-        return round(max(0.0, min(avg_trust - distance_penalty, 1.0)), 4)
-
-    def _learning_adjustment(self, override_rate_estimate: Optional[float]) -> float:
-        if override_rate_estimate is None:
-            return 0.0
-
-        try:
-            rate = max(0.0, min(float(override_rate_estimate), 1.0))
-        except (TypeError, ValueError):
-            return 0.0
-
-        if rate >= 0.30:
-            return -0.10
-        if rate >= 0.15:
-            return -0.06
-        if rate >= 0.05:
-            return -0.03
-        return 0.02
-
-    def _risk_multiplier(self, composite_risk_score: Optional[int]) -> float:
-        if composite_risk_score is None:
-            return 1.0
-
-        try:
-            risk = max(0, min(int(composite_risk_score), 100))
-        except (TypeError, ValueError):
-            return 1.0
-
-        return round(1.0 - (risk / 100.0) * 0.45, 4)
+    def _risk_multiplier(
+        self,
+        composite_risk_score: Optional[int],
+    ) -> float:
+        return risk_multiplier(composite_risk_score)
 
     def _automation_tier(
         self,
         confidence_score: int,
         thresholds: dict[str, int],
     ) -> str:
-        if confidence_score >= thresholds["auto_merge_ready_min"]:
-            return "AUTO_MERGE_READY"
-        if confidence_score >= thresholds["suggested_merge_min"]:
-            return "SUGGESTED_MERGE"
-        if confidence_score >= thresholds["review_advised_min"]:
-            return "REVIEW_ADVISED"
-        return "DO_NOT_AUTOMATE"
+        return automation_tier(
+            confidence_score,
+            thresholds,
+        )
 
-    def _recommended_action_from_tier(self, automation_tier: str) -> str:
-        tier = (automation_tier or "").upper()
-
-        if tier == "AUTO_MERGE_READY":
-            return "AUTO_MERGE"
-        if tier == "SUGGESTED_MERGE":
-            return "APPROVE_MERGE"
-        if tier == "REVIEW_ADVISED":
-            return "REVIEW_REQUIRED"
-        return "BLOCK_MERGE"
+    def _recommended_action_from_tier(
+        self,
+        automation_tier_value: str,
+    ) -> str:
+        return recommended_action_from_tier(
+            automation_tier_value
+        )
 
     def reconcile_automation_metrics(
         self,
@@ -2139,61 +1948,39 @@ class EntityResolutionEngine:
         composite_risk_score: Optional[int],
         final_recommended_action: str,
     ) -> int:
-        risk_score = 100 - max(0, min(int(composite_risk_score or 50), 100))
-
-        action_bonus_map = {
-            "AUTO_MERGE": 100,
-            "APPROVE_MERGE": 75,
-            "REVIEW_REQUIRED": 45,
-            "REVIEW": 45,
-            "BLOCK_MERGE": 10,
-            "REJECT_MERGE": 10,
-        }
-        action_bonus = action_bonus_map.get((final_recommended_action or "").upper(), 40)
-
-        readiness = (
-            decision_confidence_score * 0.55
-            + risk_score * 0.35
-            + action_bonus * 0.10
+        return automation_readiness_score(
+            decision_confidence_score,
+            composite_risk_score,
+            final_recommended_action,
         )
-        return max(0, min(round(readiness), 100))
 
     def _automation_readiness_label(
         self,
         readiness_score: int,
         thresholds: dict[str, int],
     ) -> str:
-        
+        return automation_readiness_label(
+            readiness_score,
+            thresholds,
+        )
 
-        if readiness_score >= thresholds["high"]:
-            return "HIGH_AUTOMATION_READINESS"
-        if readiness_score >= thresholds["moderate"]:
-            return "MODERATE_AUTOMATION_READINESS"
-        return "LOW_AUTOMATION_READINESS"
-    
-
-    def _automation_policy_status(self, final_recommended_action: str) -> str:
-        action = (final_recommended_action or "").upper()
-
-        if action == "AUTO_MERGE":
-            return "ELIGIBLE_FOR_AUTO_MERGE"
-        if action == "APPROVE_MERGE":
-            return "APPROVAL_READY"
-        if action in {"REVIEW_REQUIRED", "REVIEW"}:
-            return "MANUAL_REVIEW_REQUIRED"
-        if action in {"BLOCK_MERGE", "REJECT_MERGE"}:
-            return "BLOCKED_BY_POLICY"
-        return "MANUAL_REVIEW_REQUIRED"
+    def _automation_policy_status(
+        self,
+        final_recommended_action: str,
+    ) -> str:
+        return automation_policy_status(
+            final_recommended_action
+        )
 
     def _estimated_false_positive_risk(
         self,
         decision_confidence_score: int,
         composite_risk_score: Optional[int],
     ) -> int:
-        risk_component = max(0, min(int(composite_risk_score or 50), 100))
-        confidence_inverse = 100 - max(0, min(decision_confidence_score, 100))
-        blended = round((risk_component * 0.65) + (confidence_inverse * 0.35))
-        return max(0, min(blended, 100))
+        return estimated_false_positive_risk(
+            decision_confidence_score,
+            composite_risk_score,
+        )
 
     def _primary_signal(self, signals: list[SignalScore]) -> Optional[str]:
         if not signals:
@@ -2370,3 +2157,4 @@ class EntityResolutionEngine:
             f"Source trust evaluated for '{source_a or 'UNKNOWN'}' and "
             f"'{source_b or 'UNKNOWN'}'."            
         )
+
