@@ -1435,7 +1435,6 @@ class EntityResolutionEngine:
             automation_policy_status=automation_policy_status,
             primary_risk_driver=primary_risk_driver,
             composite_risk_band=composite_risk_band,
-            effective_email_score=round(email_score, 4),
 )
 
         return {
@@ -1654,7 +1653,6 @@ class EntityResolutionEngine:
             composite_risk_score: int | None,
             automation_readiness_score: int,
             risk_flag: str | None,
-            effective_email_score: float,
             recommended_action: str | None,
             address_match_insight: str | None,
             triggered_rules: list[str] | None,
@@ -1670,7 +1668,6 @@ class EntityResolutionEngine:
                 composite_risk_score=composite_risk_score,
                 automation_readiness_score=automation_readiness_score,
                 risk_flag=risk_flag,
-                effective_email_score=effective_email_score,
                 recommended_action=recommended_action,
                 address_match_insight=address_match_insight,
                 triggered_rules=triggered_rules,

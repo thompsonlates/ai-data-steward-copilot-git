@@ -9,7 +9,6 @@ def build_evidence_timeline(
     composite_risk_score: int | None,
     automation_readiness_score: int,
     risk_flag: str | None,
-    effective_email_score: float,
     recommended_action: str | None,
     address_match_insight: str | None,
     triggered_rules: list[str] | None,
