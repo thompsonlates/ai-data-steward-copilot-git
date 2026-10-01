@@ -174,7 +174,6 @@ def signal_tone(
         "item_category_match",
         "npi_match",
         "human_id_match",
-        "email_match",
         "dob_match",
     }:
         if float(safe_value or 0) >= 1.0:
