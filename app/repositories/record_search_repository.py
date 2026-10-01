@@ -144,6 +144,20 @@ class RecordSearchRepository:
             human_id = @human_id,
             phone_number = @phone_number,
 
+            organization_entity_id = @organization_entity_id,
+            organization_code = @organization_code,
+            organization_name = @organization_name,
+            organization_type = @organization_type,
+            parent_organization_id = @parent_organization_id,
+            organization_status = @organization_status,
+
+            location_id = @location_id,
+            site_id = @site_id,
+            location_code = @location_code,
+            location_name = @location_name,
+            location_type = @location_type,
+            location_address = @location_address,
+            parent_location_id = @parent_location_id,
             updated_at = @updated_at
 
         WHEN NOT MATCHED THEN
@@ -179,13 +193,26 @@ class RecordSearchRepository:
             address,
             human_id,
             phone_number,
+            organization_entity_id,
+            organization_code,
+            organization_name,
+            organization_type,
+            parent_organization_id,
+            organization_status,
+            location_id,
+            site_id,
+            location_code,
+            location_name,
+            location_type,
+            location_address,
+            parent_location_id,
             search_text,
             record_origin,
             created_by,
             created_at,
             updated_at
           )
-          VALUES (
+            VALUES (
             @organization_id,
             @record_id,
             @mdm_id,
@@ -217,6 +244,22 @@ class RecordSearchRepository:
             @address,
             @human_id,
             @phone_number,
+
+            @organization_entity_id,
+            @organization_code,
+            @organization_name,
+            @organization_type,
+            @parent_organization_id,
+            @organization_status,
+
+            @location_id,
+            @site_id,
+            @location_code,
+            @location_name,
+            @location_type,
+            @location_address,
+            @parent_location_id,
+
             @search_text,
             @record_origin,
             @created_by,
@@ -304,6 +347,19 @@ class RecordSearchRepository:
             "address",
             "human_id",
             "phone_number",
+            "organization_entity_id",
+            "organization_code",
+            "organization_name",
+            "organization_type",
+            "parent_organization_id",
+            "organization_status",
+            "location_id",
+            "site_id",
+            "location_code",
+            "location_name",
+            "location_type",
+            "location_address",
+            "parent_location_id",
         ):
             params.append(
                 bigquery.ScalarQueryParameter(
@@ -365,6 +421,16 @@ class RecordSearchRepository:
                 "gtin",
                 "sku",
             ],
+            "ORGANIZATION": [
+                "organization_entity_id",
+                "organization_code",
+            ],
+
+            "LOCATION": [
+                "location_id",
+                "site_id",
+                "location_code",
+            ],
         }
 
         candidates = candidates_by_domain.get(
@@ -404,6 +470,23 @@ class RecordSearchRepository:
                 )
                 or record.get("supplier_id")
                 or "Supplier"
+            ).strip()
+
+        if domain == "ORGANIZATION":
+            return str(
+                record.get("organization_name")
+                or record.get("organization_code")
+                or record.get("organization_entity_id")
+                or "Organization"
+            ).strip()
+
+        if domain == "LOCATION":
+            return str(
+                record.get("location_name")
+                or record.get("location_code")
+                or record.get("site_id")
+                or record.get("location_id")
+                or "Location"
             ).strip()
 
         first_name = str(
@@ -474,6 +557,21 @@ class RecordSearchRepository:
             "source_system",
             "human_id",
             "phone_number",
+            # Organization
+            "organization_entity_id",
+            "organization_code",
+            "organization_name",
+            "organization_type",
+            "parent_organization_id",
+            "organization_status",
+            # Location
+            "location_id",
+            "site_id",
+            "location_code",
+            "location_name",
+            "location_type",
+            "location_address",
+            "parent_location_id",
         )
 
         for field_name in searchable_fields:

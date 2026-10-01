@@ -1,4 +1,5 @@
 from __future__ import annotations
+import time
 
 import logging
 import re
@@ -73,16 +74,26 @@ class AzureSQLConnector:
         schema: str | None = None,
     ) -> list[dict[str, Any]]:
         query = '''
-        SELECT table_schema, table_name, table_type
-        FROM information_schema.tables
-        WHERE 1 = 1
+            SELECT
+                table_schema AS schema_name,
+                table_name,
+                table_type
+            FROM information_schema.tables
+            WHERE 1 = 1
         '''
+
         params: list[Any] = []
+
         if schema:
             query += " AND table_schema = ?"
             params.append(str(schema).strip())
+
         query += " ORDER BY table_schema, table_name"
-        return self._query_rows(query, parameters=params)
+
+        return self._query_rows(
+            query,
+            parameters=params,
+        )
 
     def get_columns(
         self,
@@ -174,7 +185,8 @@ class AzureSQLConnector:
     def _connect(self) -> Any:
         if pyodbc is None:
             raise RuntimeError(
-                "Azure SQL support requires pyodbc and Microsoft ODBC Driver 18 for SQL Server."
+                "Azure SQL support requires pyodbc and "
+                "Microsoft ODBC Driver 18 for SQL Server."
             )
 
         connection_string = (
@@ -187,7 +199,51 @@ class AzureSQLConnector:
             "TrustServerCertificate=no;"
             f"Connection Timeout={self.timeout_seconds};"
         )
-        return pyodbc.connect(connection_string)
+
+        max_attempts = 3
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return pyodbc.connect(connection_string)
+
+            except pyodbc.OperationalError as exc:
+                sqlstate = (
+                    str(exc.args[0]).strip()
+                    if exc.args
+                    else ""
+                )
+
+                transient = sqlstate in {
+                    "08001",  # Unable to establish connection
+                    "08S01",  # Communication link failure
+                }
+
+                if not transient or attempt >= max_attempts:
+                    raise
+
+                delay_seconds = attempt
+
+                logger.warning(
+                    "Azure SQL connection attempt %s/%s "
+                    "failed transiently. "
+                    "organization_id=%s connection_id=%s "
+                    "server=%s database=%s sqlstate=%s "
+                    "retrying_in_seconds=%s",
+                    attempt,
+                    max_attempts,
+                    self.organization_id,
+                    self.connection_id,
+                    self.server,
+                    self.database,
+                    sqlstate,
+                    delay_seconds,
+                )
+
+                time.sleep(delay_seconds)
+
+        raise RuntimeError(
+            "Azure SQL connection attempts exhausted unexpectedly."
+        )
 
     @staticmethod
     def _normalize_server(server: str) -> str:

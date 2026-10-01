@@ -66,6 +66,50 @@ async def search_records(
                     "product_id": row.get(
                         "product_id"
                     ),
+                    # Organization entity fields.
+                    # organization_id is intentionally excluded here:
+                    # it is the ADMS tenant boundary, not the
+                    # mastered Organization identifier.
+                    "organization_entity_id": row.get(
+                        "organization_entity_id"
+                    ),
+                    "organization_code": row.get(
+                        "organization_code"
+                    ),
+                    "organization_name": row.get(
+                        "organization_name"
+                    ),
+                    "organization_type": row.get(
+                        "organization_type"
+                    ),
+                    "parent_organization_id": row.get(
+                        "parent_organization_id"
+                    ),
+                    "organization_status": row.get(
+                        "organization_status"
+                    ),
+                    # Location entity fields
+                    "location_id": row.get(
+                        "location_id"
+                    ),
+                    "site_id": row.get(
+                        "site_id"
+                    ),
+                    "location_code": row.get(
+                        "location_code"
+                    ),
+                    "location_name": row.get(
+                        "location_name"
+                    ),
+                    "location_type": row.get(
+                        "location_type"
+                    ),
+                    "location_address": row.get(
+                        "location_address"
+                    ),
+                    "parent_location_id": row.get(
+                        "parent_location_id"
+                    ),
 
                     # Supplier fields
                     "supplier_name": row.get(

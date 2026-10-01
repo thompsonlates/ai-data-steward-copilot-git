@@ -78,7 +78,21 @@ class RecordSearchService:
             email,
             address,
             human_id,
-            phone_number
+            phone_number,
+            organization_entity_id,
+            organization_code,
+            organization_name,
+            organization_type,
+            parent_organization_id,
+            organization_status,
+            location_id,
+            site_id,
+            location_code,
+            location_name,
+            location_type,
+            location_address,
+            parent_location_id
+
         FROM `api-project-503305938314.ai_data_steward_mvp.MDM_RECORD_SEARCH_INDEX`
         WHERE organization_id = @organization_id
           AND UPPER(domain) = UPPER(@domain)

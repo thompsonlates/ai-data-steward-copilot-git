@@ -664,11 +664,24 @@ OUTPUT RULES:
 - PRODUCT_VARIANT_STANDARDIZATION must use implementation_type REGEX.
 - PRODUCT_VARIANT_STANDARDIZATION must set suggested_sql to null.
 - PRODUCT_VARIANT_STANDARDIZATION must set steward_approval_required to true.
-- FULL_NAME_STANDARDIZATION must use implementation_type REGEX.
-- FULL_NAME_STANDARDIZATION must set suggested_sql to null.
-- For FULL_NAME_STANDARDIZATION, suggested_regex may contain only the
-  governed presentation-normalization pattern; do not provide SQL as
-  an alternative implementation.
+- FULL_NAME_STANDARDIZATION is a deterministic presentation-only
+  standardization rule when the supplied deterministic evidence proves
+  that business meaning is unchanged.
+
+- REGEX may be used as a validation or normalization contract when the
+  execution target is not SQL or when no complete executable SQL
+  remediation artifact is available.
+
+- For SQL-backed sources, FULL_NAME_STANDARDIZATION may be eligible for
+  a governed SQL remediation when complete persisted observed-to-proposed
+  evidence exists and the correction can be bounded exclusively to the
+  affected values.
+
+- Do not invent observed values or proposed values.
+
+- AI analysis does not itself establish SQL write-back eligibility.
+  Executable SQL eligibility must be verified server-side against the
+  complete persisted finding evidence.
 - AUTO_FIX_CANDIDATE means the remediation is eligible for governed
   automation AFTER explicit steward approval; it does not mean approval
   may be bypassed.
@@ -759,6 +772,11 @@ def _domain_guidance(domain: str | None) -> str:
 
     if d == "ORGANIZATION":
         return (
+            "Parent Organization ID is hierarchy evidence and must not be treated as proof "
+            "that two child organizations are the same entity. When one record's "
+            "parent_organization_id exactly equals the other record's organization_entity_id, "
+            "the records represent distinct parent-child hierarchy nodes, not duplicate "
+            "organizations, and merging them would corrupt the organization hierarchy."
             "Use enterprise organization identity language. Treat Organization Entity ID and "
             "Organization Code as strong deterministic organization identifiers when exact and "
             "authoritative. Use Organization Name, Organization Type, Parent Organization ID, "
@@ -1041,13 +1059,52 @@ PRODUCT_VARIANT_UOM_ALLOWED_VALUE SPECIAL RULES:
 FULL_NAME_STANDARDIZATION_REMEDIATION_GUARDRAILS = """
 FULL_NAME_STANDARDIZATION SPECIAL RULES:
 
-- Use REGEX for deterministic presentation-only normalization.
-- NORMALIZE_FULL_NAME trims whitespace, collapses repeated internal
-  whitespace, and uppercases alphabetic characters.
-- Do not claim SQL is required for casing or whitespace normalization.
-- Do not recommend SQL for spreadsheet execution targets.
-- Never add, remove, reorder, infer, or alter name components.
+- Treat FULL_NAME_STANDARDIZATION as deterministic presentation-only
+  normalization when the persisted finding proves that business meaning
+  is unchanged.
+
+- NORMALIZE_FULL_NAME may trim leading/trailing whitespace, collapse
+  repeated internal whitespace, and apply the governed casing convention.
+
+- Never add, remove, reorder, infer, or semantically alter name components.
+
+- REGEX may be used for validation or as a governed normalization contract,
+  but REGEX alone does not constitute executable SQL source-data writeback.
+
+- For SQL-backed sources, a corrective UPDATE is eligible only when the
+  server-side governed remediation layer verifies complete persisted
+  observed_value -> proposed_value evidence for every affected value.
+
+- The AI model must never invent or reconstruct row-level name values.
+
+- When complete server-side evidence is unavailable, do not generate a
+  source-data UPDATE from aggregate evidence alone.
+
 - If semantic name correction is required, return MANUAL_REVIEW.
+""".strip()
+
+
+PHONE_NUMBER_JUNK_VALUE_REMEDIATION_GUARDRAILS = """
+PHONE_NUMBER_JUNK_VALUE SPECIAL RULES:
+
+- Treat the persisted physical source_column as authoritative. Never substitute
+  the logical field_name when generating SQL.
+- A broad phone-format predicate does not prove that a value is junk and must
+  never be used to null or overwrite every non-conforming phone number.
+- In particular, do not generate corrective UPDATE SQL whose affected-row
+  predicate uses NOT REGEXP_LIKE, NOT REGEXP_CONTAINS, NOT RLIKE, or an
+  equivalent broad format-negation test.
+- Default to MANUAL_REVIEW unless the persisted evidence contains every exact
+  affected observed junk value and the evidence count agrees with the stated
+  affected-record count.
+- When complete exact junk-value evidence is present, SQL may only target those
+  literal values through equality or an explicit IN allowlist on source_column.
+- Never infer, fabricate, or normalize a replacement telephone number.
+- Setting an exact, evidence-confirmed junk value to NULL is allowed only when
+  the UPDATE is bounded to that exact persisted allowlist and requires steward
+  approval.
+- If source_column is missing, evidence is incomplete, or the affected values
+  cannot be deterministically enumerated, return MANUAL_REVIEW.
 """.strip()
 
 
@@ -1070,6 +1127,11 @@ def _dq_remediation_domain_guardrails(
     ):
         guardrails.append(
             FULL_NAME_STANDARDIZATION_REMEDIATION_GUARDRAILS
+        )
+
+    if normalized_rule_id == "PHONE_NUMBER_JUNK_VALUE":
+        guardrails.append(
+            PHONE_NUMBER_JUNK_VALUE_REMEDIATION_GUARDRAILS
         )
 
     if (
@@ -1281,6 +1343,7 @@ def build_dq_remediation_prompt(
         "SNOWFLAKE",
         "DATABRICKS",
         "GENERIC",
+        "AZURE_SQL",
     }:
         raise ValueError(
             "Unsupported SQL dialect."
@@ -1327,6 +1390,11 @@ def build_dq_remediation_prompt(
                 "field_name"
             ),
 
+        "source_column":
+            safe_recommendation.get(
+                "source_column"
+            ),
+
         "dimension":
             safe_recommendation.get(
                 "dimension"
@@ -1351,6 +1419,15 @@ def build_dq_remediation_prompt(
             safe_recommendation.get(
                 "affected_percent"
             ),
+
+        # Row-level observed phone values may contain personal data and
+        # are intentionally not sent to the LLM. The server-side safety
+        # validator can inspect persisted evidence without disclosing it.
+        "evidence_sample_count": len(
+            safe_recommendation.get("evidence_samples") or []
+        ),
+
+        "exact_evidence_values_provided_to_model": False,
 
         "recommendation_title":
             safe_recommendation.get(
@@ -1640,6 +1717,16 @@ def build_dq_remediation_prompt(
     - The SQL artifact shown to the steward must already contain the
     correct Databricks raw regex literal. Do not rely on the execution
     layer to rewrite or escape approved SQL.
+
+    AZURE_SQL:
+    - Use Microsoft Azure SQL / SQL Server T-SQL syntax.
+    - Use schema-qualified table names such as dbo.Customer_Profile_Test.
+    - Use square brackets for identifiers when quoting is required.
+    - Use TOP rather than LIMIT.
+    - Do not use REGEXP_LIKE, REGEXP_CONTAINS, RLIKE, or BigQuery-style regex functions.
+    - Do not use BigQuery CAST(... AS STRING); use T-SQL-compatible data types.
+    - For deterministic string normalization, use T-SQL functions such as LTRIM, RTRIM, TRIM, UPPER, LOWER, REPLACE, and LIKE only when appropriate to the governed rule.
+    - Generated remediation must remain one bounded UPDATE with a restrictive WHERE clause.
 
     GENERIC:
     - Use broadly portable ANSI-style SQL where possible.
@@ -2290,7 +2377,13 @@ Critical alignment rules:
 55. For ORGANIZATION, organization_type and organization_status are supporting governance evidence; conflicts should increase caution but must not override aligned authoritative identifiers by themselves.
 56. For ORGANIZATION, missing organization identifiers or hierarchy values are unavailable evidence, not conflicting evidence.
 57. For ORGANIZATION, prefer REVIEW_REQUIRED when authoritative organization identifiers are incomplete and identity depends primarily on name, type, hierarchy, or location similarity.
+58. For ORGANIZATION, if Record A parent_organization_id exactly equals Record B organization_entity_id, or Record B parent_organization_id exactly equals Record A organization_entity_id, treat this as deterministic parent-child hierarchy evidence.
 
+59. For ORGANIZATION, when that parent-child relationship is established, the records represent distinct organization hierarchy nodes and must not be described as possible duplicates requiring review to determine whether they are the same organization.
+
+60. For ORGANIZATION, a confirmed parent-child relationship must support BLOCK_MERGE because merging the records would collapse the organization hierarchy and corrupt mastered entity identity.
+
+61. For ORGANIZATION, when a parent-child relationship is established, steward review may validate the governance action, but must not be described as necessary to determine whether the records are distinct entities.
 Decision calibration:
 - AUTO_MERGE: deterministic identifiers or highly aligned evidence with low risk and no conflicting identity attributes.
 - APPROVE_MERGE: strong evidence, but steward approval is still appropriate.
@@ -2386,4 +2479,3 @@ Output rules:
 """.strip()
 
     return prompt
-

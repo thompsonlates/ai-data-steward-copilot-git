@@ -31,3 +31,4 @@ y/
 sql/
 scripts/
 *.json
+env.yaml

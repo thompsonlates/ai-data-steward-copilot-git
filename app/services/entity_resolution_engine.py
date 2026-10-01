@@ -2792,9 +2792,18 @@ class EntityResolutionEngine:
                 parent_location_id_a,
                 parent_location_id_b,
             )
-            organization_entity_id_score = self._exact_match_score(
-                location_org_id_a,
-                location_org_id_b,
+            organization_entity_id_available = bool(
+                self._normalize_text(location_org_id_a)
+                and self._normalize_text(location_org_id_b)
+            )
+
+            organization_entity_id_score = (
+                self._exact_match_score(
+                    location_org_id_a,
+                    location_org_id_b,
+                )
+                if organization_entity_id_available
+                else None
             )
 
             match_score = (
@@ -2804,7 +2813,13 @@ class EntityResolutionEngine:
                 + location_name_score * domain_weights.get("location_name_similarity", 0.0)
                 + address_score * domain_weights.get("address_similarity", 0.0)
                 + parent_location_id_score * domain_weights.get("parent_location_id_match", 0.0)
-                + organization_entity_id_score * domain_weights.get("organization_entity_id_match", 0.0)
+                + (organization_entity_id_score
+                if organization_entity_id_score is not None
+                    else 0.0
+                ) * domain_weights.get(
+                    "organization_entity_id_match",
+                    0.0,
+                )
                 + source_score * domain_weights.get("source_trust", 0.0)
                 + learning_score * domain_weights.get("steward_learning", 0.0)
             )
@@ -2826,7 +2841,12 @@ class EntityResolutionEngine:
                 ("location_name_similarity", location_name_score, "location_name_similarity", f"Compared location names '{location_name_a or 'UNKNOWN'}' and '{location_name_b or 'UNKNOWN'}'.", "probabilistic"),
                 ("address_similarity", address_score, "address_similarity", self._address_detail(location_address_a, location_address_b, address_score, domain, address_match_insight), "probabilistic"),
                 ("parent_location_id_match", parent_location_id_score, "parent_location_id_match", f"Compared parent Location IDs '{parent_location_id_a or 'UNKNOWN'}' and '{parent_location_id_b or 'UNKNOWN'}'.", "deterministic"),
-                ("organization_entity_id_match", organization_entity_id_score, "organization_entity_id_match", f"Compared governing Organization entity IDs '{location_org_id_a or 'UNKNOWN'}' and '{location_org_id_b or 'UNKNOWN'}'.", "deterministic"),
+                ("organization_entity_id_match", organization_entity_id_score,"organization_entity_id_match",(
+                f"Compared governing Organization entity IDs "f"'{location_org_id_a}' and '{location_org_id_b}'." if organization_entity_id_available               else "Governing Organization entity ID was not provided "
+            "for both records; this signal is unavailable."
+            ),
+            "deterministic",
+        ),
                 ("source_trust", source_score, "source_trust", self._source_detail(record_a.source_system, record_b.source_system), "probabilistic"),
             ]:
                 signals.append(
@@ -3043,6 +3063,7 @@ class EntityResolutionEngine:
                 "weighted_score": round(float(s.get("weighted_score", 0)), 4),
                 "detail": s.get("detail") or "",
                 "signal_band": s.get("signal_band"),
+                "evidence_available": s.get("evidence_available", True),
                 "tone": self._signal_tone(
                     s.get("signal_name"),
                     s.get("signal_score"),
@@ -3145,6 +3166,7 @@ class EntityResolutionEngine:
             ),
             "detail": s.get("detail") or "",
             "signal_band": s.get("signal_band"),
+            "evidence_available": s.get("evidence_available", True),
 
             "tone": self._signal_tone(
                 s.get("signal_name"),
@@ -3265,13 +3287,13 @@ class EntityResolutionEngine:
         location_code_score: float = 0.0,
         location_name_score: float = 0.0,
         parent_location_id_score: float = 0.0,
-        organization_entity_id_score: float = 0.0,
+        organization_entity_id_score: float | None = 0.0,
         organization_code_score: float = 0.0,
         organization_name_score: float = 0.0,
         organization_type_score: float = 0.0,
         parent_organization_id_score: float = 0.0,
         organization_status_score: float = 0.0,
-    ) -> dict[str, float]:
+    )   -> dict[str, float | None]:
 
         normalized_domain = (domain or "CUSTOMER").upper()
 
@@ -3472,6 +3494,20 @@ class EntityResolutionEngine:
             "currency_match",
             "account_status_match",
             "email_match",
+            # Organization
+            "organization_entity_id_match",
+            "organization_code_match",
+            "organization_type_match",
+            "parent_organization_id_match",
+            "organization_status_match",
+
+            # Location
+            "location_id_match",
+            "site_id_match",
+            "location_code_match",
+            "location_type_match",
+            "parent_location_id_match",
+            "organization_entity_id_match",
         }
 
         supporting_signal_names = {
@@ -3483,6 +3519,8 @@ class EntityResolutionEngine:
             "item_category_similarity",
             "product_variant_similarity",
             "phone_match",
+            "organization_name_similarity",
+            "location_name_similarity",
         }
 
         signal_display_map = {
@@ -3517,6 +3555,21 @@ class EntityResolutionEngine:
             "currency_match": "Currency",
             "account_status_match": "Account Status",
             "email_match": "Email",
+            # Organization
+            "organization_entity_id_match": "Organization Entity ID",
+            "organization_code_match": "Organization Code",
+            "organization_name_similarity": "Organization Name Similarity",
+            "organization_type_match": "Organization Type",
+            "parent_organization_id_match": "Parent Organization ID",
+            "organization_status_match": "Organization Status",
+
+            # Location
+            "location_id_match": "Location ID",
+            "site_id_match": "Site ID",
+            "location_code_match": "Location Code",
+            "location_name_similarity": "Location Name Similarity",
+            "location_type_match": "Location Type",
+            "parent_location_id_match": "Parent Location ID",
         }
 
         timeline_signals = [
@@ -3532,6 +3585,7 @@ class EntityResolutionEngine:
                 signal_name,
                 signal_name.replace("_", " ").title(),
             )
+            evidence_available = signal.get("evidence_available", True)
 
             signal_score = float(
                 signal.get("signal_score")
@@ -3539,43 +3593,49 @@ class EntityResolutionEngine:
                 else signal.get("score") or 0
             )
 
-            if signal_name in {"product_id_match","patient_id_match","provider_id_match",}:
+            if not evidence_available:
+                title = f"{display_name} Evidence Unavailable"
+                status = "neutral"
+                tone = "neutral"
 
+            elif signal_name in {
+                "product_id_match",
+                "patient_id_match",
+                "provider_id_match",
+            }:
                 if signal_score >= 0.99:
                     title = f"{display_name} Exact Match"
                     status = "positive"
                     tone = "positive"
-
                 elif signal_score >= 0.85:
                     title = f"{display_name} Similar"
                     status = "neutral"
                     tone = "neutral"
-
                 else:
                     title = f"{display_name} Not Matched"
                     status = "warning"
                     tone = "warning"
 
             elif signal_name in deterministic_signal_names:
-
-                if signal_score >= 1.0:
-                    title = f"{display_name} Exact Match"
-                    status = "positive"
-                    tone = "positive"
-
-                else:
-                    title = f"{display_name} Not Matched"
-                    status = "warning"
-                    tone = "warning"
-
                 if signal_score >= 1.0:
                     title = f"{display_name} Exact Match"
                     status = "positive"
                     tone = "positive"
                 else:
-                    title = f"{display_name} Not Matched"
+                    organization_conflict_titles = {
+                        "organization_entity_id_match": "Organization Entity ID Conflict",
+                        "organization_code_match": "Organization Code Conflict",
+                        "organization_type_match": "Organization Type Conflict",
+                        "parent_organization_id_match": "Parent Organization IDs Differ",
+                        "organization_status_match": "Organization Status Difference",
+                    }
+                    title = organization_conflict_titles.get(
+                        signal_name,
+                        f"{display_name} Not Matched",
+                    )
                     status = "warning"
                     tone = "warning"
+
             else:
                 if signal_score >= 0.85:
                     title = f"{display_name} Strong"
@@ -3601,8 +3661,44 @@ class EntityResolutionEngine:
                     "signal_name": signal_name,
                     "signal_score": signal_score,
                 }
-            )    
-        
+            )
+
+        if (
+            str(primary_risk_driver or "").strip().upper()
+            == "ORGANIZATION_HIERARCHY_CONFLICT"
+        ):
+            events.append(
+                {
+                    "stage": "RISK",
+                    "step": len(events) + 1,
+                    "title": "Parent-Child Organization Relationship Detected",
+                    "detail": (
+                        "One organization explicitly identifies the other as its "
+                        "parent organization. These records represent separate nodes "
+                        "in the organization hierarchy, not duplicate organizations."
+                    ),
+                    "status": "warning",
+                    "tone": "warning",
+                    "signal_name": "organization_hierarchy",
+                    "signal_score": 1.0,
+                }
+            )
+            events.append(
+                {
+                    "stage": "RISK",
+                    "step": len(events) + 1,
+                    "title": "Organization Hierarchy Conflict Prevents Merge",
+                    "detail": (
+                        "A parent and child organization cannot be merged as the same "
+                        "mastered entity. Merging them would collapse the organization "
+                        "hierarchy and corrupt entity identity."
+                    ),
+                    "status": "warning",
+                    "tone": "warning",
+                    "signal_name": "organization_hierarchy",
+                    "signal_score": 1.0,
+                }
+            )
         if address_match_insight:
             events.append(
                 {
@@ -3868,26 +3964,51 @@ class EntityResolutionEngine:
     def _build_signal(
         self,
         name: str,
-        score: float,
+        score: float | None,
         weight: float,
         detail: str,
         match_level: str | None = None,
         signal_type: str = "probabilistic",
         **kwargs,
     ) -> dict[str, Any]:
+        evidence_available = score is not None
+        safe_score = self._safe_score(score) if evidence_available else 0.0
 
-        if score is None:
-            safe_score = 0.5
-        else:
-            safe_score = self._safe_score(score)
-
-        detail = detail or (
-            f"{name.replace('_', ' ').title()} was evaluated."
+        detail = detail or f"{name.replace('_', ' ').title()} was evaluated."
+        weighted_score = (
+            round(safe_score * weight, 4) if evidence_available else 0.0
         )
 
-        weighted_score = round(
-            safe_score * weight,
-            4,
+        signal_band = (
+            "UNAVAILABLE"
+            if not evidence_available
+            else (
+                match_level
+                or (
+                    "EXACT"
+                    if name
+                    in {
+                        "product_id_match",
+                        "sku_match",
+                        "patient_id_match",
+                        "provider_id_match",
+                        "human_id_match",
+                    }
+                    and safe_score >= 0.999
+                    else "SIMILAR"
+                    if name
+                    in {
+                        "product_id_match",
+                        "sku_match",
+                        "patient_id_match",
+                        "provider_id_match",
+                    }
+                    and safe_score >= 0.85
+                    else "DIFFERENT"
+                    if name in {"product_id_match", "sku_match"}
+                    else SimilarityEngine.similarity_band(safe_score)
+                )
+            )
         )
 
         return {
@@ -3895,30 +4016,13 @@ class EntityResolutionEngine:
             "signal_score": round(safe_score, 4),
             "signal_weight": round(weight, 4),
             "weighted_score": weighted_score,
+            "evidence_available": evidence_available,
             "detail": detail,
-         "signal_band": (
-            match_level
-                or (
-                "EXACT"
-                if name in {"product_id_match","sku_match","patient_id_match","provider_id_match", "human_id_match",
-            } and safe_score >= 0.999
-                else "SIMILAR"
-                if name in {"product_id_match","sku_match","patient_id_match","provider_id_match",
-            } and safe_score >= 0.85
-                else "DIFFERENT"
-                    if name in {"product_id_match", "sku_match"}
-                else SimilarityEngine.similarity_band(safe_score)
-    )
-),
-
-            "signal_impact": self._signal_impact(
-                safe_score
-            ),
-
+            "signal_band": signal_band,
+            "signal_impact": self._signal_impact(safe_score),
             "signal_type": signal_type,
-
             **kwargs,
-    }
+        }
 
     def _signal_tone(
         self,
@@ -4150,6 +4254,56 @@ class EntityResolutionEngine:
         if tier == "REVIEW_ADVISED":
             return "REVIEW_REQUIRED"
         return "BLOCK_MERGE"
+
+    def reconcile_automation_metrics(
+        self,
+        *,
+        decision_confidence_score: int,
+        composite_risk_score: int,
+        final_recommended_action: str,
+        policy_config: Optional[dict] = None,
+    ) -> dict:
+        """
+        Recompute automation governance metrics after the route has
+        reconciled deterministic evidence, attribute risk, and policy.
+
+        This keeps readiness, policy status, and false-positive risk
+        aligned with the authoritative final action.
+        """
+        readiness_label_thresholds = (
+            self._resolve_readiness_label_thresholds(
+                policy_config
+            )
+        )
+
+        automation_readiness_score = self._automation_readiness_score(
+            decision_confidence_score=decision_confidence_score,
+            composite_risk_score=composite_risk_score,
+            final_recommended_action=final_recommended_action,
+        )
+
+        automation_readiness_label = self._automation_readiness_label(
+            automation_readiness_score,
+            thresholds=readiness_label_thresholds,
+        )
+
+        automation_policy_status = self._automation_policy_status(
+            final_recommended_action
+        )
+
+        estimated_false_positive_risk = (
+            self._estimated_false_positive_risk(
+                decision_confidence_score=decision_confidence_score,
+                composite_risk_score=composite_risk_score,
+            )
+        )
+
+        return {
+            "automation_readiness_score": automation_readiness_score,
+            "automation_readiness_label": automation_readiness_label,
+            "automation_policy_status": automation_policy_status,
+            "estimated_false_positive_risk": estimated_false_positive_risk,
+        }
 
     def _automation_readiness_score(
         self,

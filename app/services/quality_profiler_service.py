@@ -2925,18 +2925,16 @@ class QualityProfilerService:
 
             if (
                 normalized_value
-                and
-                field_config
-                .standardization_required
+                and field_config.standardization_required
             ):
-                standardized = (
-                    self._canonical_string(
-                        normalized_value
-                    )
+                observed_standardization_value = str(value)
+
+                standardized = self._canonical_string(
+                    observed_standardization_value
                 )
 
                 passed = (
-                    normalized_value
+                    observed_standardization_value
                     == standardized
                 )
 
@@ -2983,7 +2981,7 @@ class QualityProfilerService:
                                 "format."
                             ),
                             observed_value=(
-                                normalized_value
+                                observed_standardization_value
                             ),
                             proposed_value=(
                                 standardized

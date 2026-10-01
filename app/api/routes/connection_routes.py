@@ -7,6 +7,8 @@ from app.api.route_dependencies import (
     _get_onedrive_connector,
 )
 
+from app.api.schemas import EnterpriseConnectionCapabilitiesUpdate
+
 router = APIRouter()
 
 
@@ -120,6 +122,26 @@ def get_enterprise_connection(
     return connection_service.get_connection(
         connection_id=connection_id,
         organization_id=require_current_organization_id(current_user),
+    )
+
+@router.patch(
+    "/connections/{connection_id}/capabilities",
+    response_model=EnterpriseConnectionResponse,
+    status_code=status.HTTP_200_OK,
+)
+def update_enterprise_connection_capabilities(
+    connection_id: str,
+    request: EnterpriseConnectionCapabilitiesUpdate,
+    current_user: AuthUser = Depends(
+        require_active_product_access
+    ),
+) -> EnterpriseConnectionResponse:
+    return connection_service.update_connection_capabilities(
+        connection_id=connection_id,
+        organization_id=require_current_organization_id(
+            current_user
+        ),
+        connection_capabilities=request.connection_capabilities,
     )
 
 @router.delete(

@@ -21,13 +21,8 @@ from app.repositories.connection_repository import ConnectionRepository
 from app.repositories.quality_profiler_repository import QualityProfilerRepository
 from app.repositories.dq_execution_repository import DqExecutionRepository
 from app.services.databricks_connector import DatabricksConnector
-from app.services.azure_sql_connector import AzureSQLConnector
 from app.services.entitlement_service import EntitlementService
 from app.services.secret_manager_service import SecretManagerService
-from app.services.snowflake_connection_factory import (
-    SnowflakeConnectionConfigurationError,
-    connect_snowflake,
-)
 from app.workflow.connectors.google_sheets_connector import GoogleSheetsConnector
 from app.workflow.connectors.onedrive_connector import OneDriveConnector
 
@@ -80,7 +75,6 @@ class DqExecutionService:
     }
 
     ALLOWED_VENDORS = {
-        "AZURE_SQL",
         "BIGQUERY",
         "DATABRICKS",
         "SNOWFLAKE",
@@ -124,10 +118,6 @@ class DqExecutionService:
 
     ONEDRIVE_EXECUTABLE_REGEX_RULES = {
         "PRODUCT_VARIANT_STANDARDIZATION",
-        "FULL_NAME_STANDARDIZATION",
-    }
-
-    SNOWFLAKE_EXECUTABLE_REGEX_RULES = {
         "FULL_NAME_STANDARDIZATION",
     }
 
@@ -250,12 +240,6 @@ class DqExecutionService:
                 credentials=context["credentials"],
                 sql=context["remediation_sql"],
             )
-        elif context["vendor"] == "SNOWFLAKE":
-            self._preflight_snowflake(
-                connection=context["connection"],
-                credentials=context["credentials"],
-                sql=context["remediation_sql"],
-            )
 
         execution_id = f"exec_{uuid.uuid4().hex[:24]}"
         validated_at = datetime.now(timezone.utc)
@@ -338,13 +322,6 @@ class DqExecutionService:
             requested_by=requested_by,
             technical_approved_by=technical_approved_by,
         )
-
-        if context["vendor"] == "SNOWFLAKE":
-            self._preflight_snowflake(
-                connection=context["connection"],
-                credentials=context["credentials"],
-                sql=context["remediation_sql"],
-            )
 
         execution_id = f"exec_{uuid.uuid4().hex[:24]}"
         started_at = datetime.now(timezone.utc)
@@ -429,14 +406,6 @@ class DqExecutionService:
                     sql=context["remediation_sql"],
                 )
                 vendor_result = self._execute_bigquery(
-                    connection=context["connection"],
-                    credentials=context["credentials"],
-                    sql=context["remediation_sql"],
-                )
-            elif context["vendor"] == "AZURE_SQL":
-                vendor_result = self._execute_azure_sql(
-                    organization_id=context["organization_id"],
-                    connection_id=context["connection_id"],
                     connection=context["connection"],
                     credentials=context["credentials"],
                     sql=context["remediation_sql"],
@@ -564,252 +533,6 @@ class DqExecutionService:
                     "DQ remediation execution failed against the target "
                     f"{context['vendor']} connection. No credential values "
                     "were returned."
-                ),
-            ) from exc
-
-    def validate_approved_snowflake_regex_remediation(
-        self,
-        *,
-        organization_id: str,
-        recommendation_id: str,
-        profile_run_id: str,
-        connection_id: str,
-        requested_by: str,
-        technical_approved_by: str,
-    ) -> dict[str, Any]:
-        """Preflight an approved Snowflake REGEX operation without DML."""
-        self.entitlement_service.require_governed_regex_execution(
-            organization_id=organization_id,
-        )
-        context = self._build_snowflake_regex_execution_context(
-            organization_id=organization_id,
-            recommendation_id=recommendation_id,
-            profile_run_id=profile_run_id,
-            connection_id=connection_id,
-            requested_by=requested_by,
-            technical_approved_by=technical_approved_by,
-        )
-        snowflake_client = self._snowflake_connect(
-            connection=context["connection"],
-            credentials=context["credentials"],
-        )
-        try:
-            self._preflight_snowflake(
-                connection=context["connection"],
-                credentials=context["credentials"],
-                sql=context["execution_sql"],
-                client=snowflake_client,
-            )
-            affected_rows = self._preview_snowflake_affected_rows(
-                connection=context["connection"],
-                credentials=context["credentials"],
-                count_sql=context["count_sql"],
-                client=snowflake_client,
-            )
-        finally:
-            snowflake_client.close()
-
-        execution_id = f"exec_{uuid.uuid4().hex[:24]}"
-        validated_at = datetime.now(timezone.utc)
-        try:
-            self.dq_execution_repository.create_validation_record(
-                execution_id=execution_id,
-                organization_id=context["organization_id"],
-                recommendation_id=context["recommendation_id"],
-                profile_run_id=context["profile_run_id"],
-                remediation_version_id=context["remediation_version_id"],
-                connection_id=context["connection_id"],
-                vendor=context["vendor"],
-                environment=context["environment"],
-                domain=context.get("domain"),
-                artifact_type=context["artifact_type"],
-                artifact_hash=context["artifact_hash"],
-                sql_dialect=context["sql_dialect"],
-                approval_status=context["approval_status"],
-                safety_status=context["safety_status"],
-                requested_by=context["requested_by"],
-                technical_approved_by=context["technical_approved_by"],
-                validated_at=validated_at,
-            )
-        except Exception as exc:
-            logger.exception(
-                "Snowflake REGEX validation audit persistence failed. "
-                "execution_id=%s organization_id=%s error=%s",
-                execution_id,
-                context["organization_id"],
-                type(exc).__name__,
-            )
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=(
-                    "Snowflake REGEX validation could not be recorded. "
-                    "No target data was changed."
-                ),
-            ) from exc
-
-        return self._build_result(
-            context=context,
-            execution_id=execution_id,
-            execution_status="VALIDATED_NOT_EXECUTED",
-            vendor_status="NOT_EXECUTED",
-            rows_affected=affected_rows,
-            statement_id=None,
-            executed_at=None,
-            error_message=None,
-            validated_at=validated_at,
-            rows_evaluated=affected_rows,
-            rows_changed=affected_rows,
-            rows_skipped=0,
-        )
-
-    def execute_approved_snowflake_regex_remediation(
-        self,
-        *,
-        organization_id: str,
-        recommendation_id: str,
-        profile_run_id: str,
-        connection_id: str,
-        requested_by: str,
-        technical_approved_by: str,
-    ) -> dict[str, Any]:
-        """Execute the sole allow-listed Snowflake REGEX operation."""
-        self.entitlement_service.require_governed_regex_execution(
-            organization_id=organization_id,
-        )
-        context = self._build_snowflake_regex_execution_context(
-            organization_id=organization_id,
-            recommendation_id=recommendation_id,
-            profile_run_id=profile_run_id,
-            connection_id=connection_id,
-            requested_by=requested_by,
-            technical_approved_by=technical_approved_by,
-        )
-        snowflake_client = self._snowflake_connect(
-            connection=context["connection"],
-            credentials=context["credentials"],
-        )
-        try:
-            self._preflight_snowflake(
-                connection=context["connection"],
-                credentials=context["credentials"],
-                sql=context["execution_sql"],
-                client=snowflake_client,
-            )
-            affected_rows = self._preview_snowflake_affected_rows(
-                connection=context["connection"],
-                credentials=context["credentials"],
-                count_sql=context["count_sql"],
-                client=snowflake_client,
-            )
-        except Exception:
-            snowflake_client.close()
-            raise
-
-        execution_id = f"exec_{uuid.uuid4().hex[:24]}"
-        started_at = datetime.now(timezone.utc)
-        try:
-            self.dq_execution_repository.create_governed_regex_execution(
-                execution_id=execution_id,
-                organization_id=context["organization_id"],
-                recommendation_id=context["recommendation_id"],
-                profile_run_id=context["profile_run_id"],
-                remediation_version_id=context["remediation_version_id"],
-                connection_id=context["connection_id"],
-                environment=context["environment"],
-                domain=context.get("domain"),
-                rule_id=context["rule_id"],
-                artifact_hash=context["artifact_hash"],
-                approval_status=context["approval_status"],
-                safety_status=context["safety_status"],
-                requested_by=context["requested_by"],
-                technical_approved_by=context["technical_approved_by"],
-                rows_evaluated=affected_rows,
-                rows_changed=affected_rows,
-                rows_skipped=0,
-                started_at=started_at,
-                vendor=context["vendor"],
-                execution_target=context["execution_target"],
-            )
-        except Exception as exc:
-            snowflake_client.close()
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=(
-                    "Snowflake REGEX execution audit could not be "
-                    "initialized. No target data was changed."
-                ),
-            ) from exc
-
-        try:
-            vendor_result = self._execute_snowflake(
-                connection=context["connection"],
-                credentials=context["credentials"],
-                sql=context["execution_sql"],
-                client=snowflake_client,
-            )
-            executed_at = datetime.now(timezone.utc)
-            rows_affected = vendor_result.get("rows_affected")
-            self.dq_execution_repository.mark_execution_succeeded(
-                execution_id=execution_id,
-                organization_id=context["organization_id"],
-                vendor_status=str(
-                    vendor_result.get("vendor_status") or "SUCCEEDED"
-                ),
-                rows_affected=rows_affected,
-                statement_id=vendor_result.get("statement_id"),
-                rows_evaluated=affected_rows,
-                rows_changed=rows_affected,
-                rows_skipped=0,
-                executed_at=executed_at,
-            )
-            return self._build_result(
-                context=context,
-                execution_id=execution_id,
-                execution_status="SUCCEEDED",
-                vendor_status=str(
-                    vendor_result.get("vendor_status") or "SUCCEEDED"
-                ),
-                rows_affected=rows_affected,
-                statement_id=vendor_result.get("statement_id"),
-                started_at=started_at,
-                executed_at=executed_at,
-                error_message=None,
-                rows_evaluated=affected_rows,
-                rows_changed=rows_affected,
-                rows_skipped=0,
-            )
-        except HTTPException:
-            raise
-        except Exception as exc:
-            logger.exception(
-                "Snowflake governed REGEX remediation failed. "
-                "execution_id=%s organization_id=%s error=%s",
-                execution_id,
-                context["organization_id"],
-                type(exc).__name__,
-            )
-            try:
-                self.dq_execution_repository.mark_execution_failed(
-                    execution_id=execution_id,
-                    organization_id=context["organization_id"],
-                    vendor_status="FAILED",
-                    error_code=type(exc).__name__,
-                    error_message=(
-                        "Snowflake governed REGEX remediation failed."
-                    ),
-                    executed_at=datetime.now(timezone.utc),
-                )
-            except Exception:
-                logger.exception(
-                    "Snowflake REGEX execution audit finalization failed. "
-                    "execution_id=%s",
-                    execution_id,
-                )
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=(
-                    "Snowflake governed REGEX remediation failed. "
-                    "No credential values were returned."
                 ),
             ) from exc
 
@@ -1643,16 +1366,6 @@ class DqExecutionService:
         if vendor == "GOOGLE_BIGQUERY":
             vendor = "BIGQUERY"
 
-        connection_type = str(connection.get("connection_type") or "").strip().upper()
-        if (
-            re.match(r"^SNOWFLAKE(?:\b|[_-])", vendor)
-            or (
-                connection_type in {"SNOWFLAKE", "SNOWFLAKE_DATABASE", "SNOWFLAKE_SQL"}
-                and vendor not in {"BIGQUERY", "DATABRICKS", "MONGODB", "AZURE_SQL"}
-            )
-        ):
-            vendor = "SNOWFLAKE"
-
         environment = str(
             connection.get("environment") or ""
         ).strip().upper()
@@ -1742,105 +1455,6 @@ class DqExecutionService:
                 sql=normalized_sql,
                 expected_target=f"{project_id}.{dataset_id}.{table_id}",
             )
-        elif vendor == "SNOWFLAKE":
-            source_type = str(recommendation.get("source_type") or "").strip().upper()
-            source_connection_id = str(recommendation.get("connection_id") or "").strip()
-            if source_type != "SNOWFLAKE" or source_connection_id != effective_connection_id:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="Execution connection does not match the profiled Snowflake source.",
-                )
-            details = self._connection_details(connection)
-            persisted = (
-                recommendation.get("database_name"),
-                recommendation.get("schema_name"),
-                recommendation.get("table_name"),
-            )
-            configured = (
-                details.get("database"),
-                details.get("schema") or details.get("schema_name"),
-            )
-            target = tuple(self._snowflake_identifier(value) for value in persisted)
-            configured_table = details.get("table_name") or details.get("target_table")
-            if (
-                target[:2] != tuple(self._snowflake_identifier(value) for value in configured)
-                or (configured_table and target[2] != self._snowflake_identifier(configured_table))
-            ):
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="Snowflake connection target has changed since profiling.",
-                )
-            self._validate_snowflake_update_target(sql=normalized_sql, expected_target=target)
-
-        elif vendor == "AZURE_SQL":
-            source_type = str(
-                recommendation.get("source_type") or ""
-            ).strip().upper()
-
-            source_connection_id = str(
-                recommendation.get("connection_id") or ""
-            ).strip()
-
-            if (
-                source_type != "AZURE_SQL"
-                or source_connection_id != effective_connection_id
-            ):
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=(
-                        "Execution connection does not match "
-                        "the profiled Azure SQL source."
-                    ),
-                )
-
-            details = self._connection_details(connection)
-
-            database = self._azure_sql_identifier(
-                recommendation.get("database_name")
-            )
-            schema_name = self._azure_sql_identifier(
-                recommendation.get("schema_name")
-            )
-            table_name = self._azure_sql_identifier(
-                recommendation.get("table_name")
-            )
-
-            configured_database = self._azure_sql_identifier(
-                details.get("database")
-                or connection.get("workspace_name")
-            )
-
-            if database != configured_database:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=(
-                        "Azure SQL connection database has changed "
-                        "since profiling."
-                    ),
-                )
-
-            configured_table = (
-                details.get("table_name")
-                or details.get("target_table")
-            )
-
-            if (
-                configured_table
-                and table_name
-                != self._azure_sql_identifier(configured_table)
-            ):
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=(
-                        "Azure SQL connection target has changed "
-                        "since profiling."
-                    ),
-                )
-
-            self._validate_azure_sql_update_target(
-                sql=normalized_sql,
-                expected_target=(schema_name, table_name),
-            )
 
         artifact_hash = hashlib.sha256(
             normalized_sql.encode("utf-8")
@@ -1901,336 +1515,6 @@ class DqExecutionService:
             ),
             "remediation_sql": normalized_sql,
             "artifact_hash": artifact_hash,
-            "connection": connection,
-            "credentials": credentials,
-        }
-
-    def _build_snowflake_regex_execution_context(
-        self,
-        *,
-        organization_id: str,
-        recommendation_id: str,
-        profile_run_id: str,
-        connection_id: str,
-        requested_by: str,
-        technical_approved_by: str,
-    ) -> dict[str, Any]:
-        effective_organization_id = self._require_organization_id(
-            organization_id
-        )
-        effective_recommendation_id = self._require_value(
-            recommendation_id,
-            field_name="recommendation_id",
-        )
-        effective_profile_run_id = self._require_value(
-            profile_run_id,
-            field_name="profile_run_id",
-        )
-        effective_connection_id = self._require_connection_id(connection_id)
-        effective_requested_by = self._require_actor(
-            requested_by,
-            field_name="requested_by",
-        )
-        effective_technical_approved_by = self._require_actor(
-            technical_approved_by,
-            field_name="technical_approved_by",
-        )
-
-        self.entitlement_service.require_active_product_access(
-            organization_id=effective_organization_id,
-        )
-        recommendation = self._load_approved_recommendation(
-            organization_id=effective_organization_id,
-            recommendation_id=effective_recommendation_id,
-            profile_run_id=effective_profile_run_id,
-        )
-
-        # Older/current recommendation rows may not carry the immutable
-        # remediation_version_id even though generation persisted the exact
-        # artifact in DQ_AI_REMEDIATION_VERSIONS. Hydrate only from the latest
-        # tenant-scoped version after proving that it is the same artifact the
-        # steward approved. Any mismatch fails closed.
-        if not str(
-            recommendation.get("remediation_version_id") or ""
-        ).strip():
-            versions = self.quality_repository.get_remediation_versions(
-                organization_id=effective_organization_id,
-                recommendation_id=effective_recommendation_id,
-            )
-
-            if not versions:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=(
-                        "Approved Snowflake remediation version is missing."
-                    ),
-                )
-
-            latest_version = dict(versions[0])
-            version_profile_run_id = str(
-                latest_version.get("profile_run_id") or ""
-            ).strip()
-            version_artifact_type = str(
-                latest_version.get("artifact_type") or ""
-            ).strip().upper()
-            version_regex = str(
-                latest_version.get("remediation_regex") or ""
-            ).strip()
-            version_safety_status = str(
-                latest_version.get("safety_status") or ""
-            ).strip().upper()
-
-            approved_artifact_type = str(
-                recommendation.get("remediation_artifact_type") or ""
-            ).strip().upper()
-            approved_regex = str(
-                recommendation.get("remediation_regex") or ""
-            ).strip()
-            approved_safety_status = str(
-                recommendation.get("remediation_safety_status") or ""
-            ).strip().upper()
-
-            if (
-                version_profile_run_id != effective_profile_run_id
-                or version_artifact_type != approved_artifact_type
-                or version_regex != approved_regex
-                or version_safety_status != approved_safety_status
-            ):
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=(
-                        "Latest Snowflake remediation version does not "
-                        "match the exact steward-approved artifact."
-                    ),
-                )
-
-            remediation_version_id = str(
-                latest_version.get("remediation_version_id") or ""
-            ).strip()
-            if not remediation_version_id:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=(
-                        "Approved Snowflake remediation version is missing."
-                    ),
-                )
-
-            recommendation = dict(recommendation)
-            recommendation["remediation_version_id"] = (
-                remediation_version_id
-            )
-            recommendation["remediation_version_number"] = (
-                latest_version.get("version_number")
-            )
-        domain = str(recommendation.get("domain") or "").strip().upper()
-        if domain:
-            self.entitlement_service.require_domain_entitlement(
-                organization_id=effective_organization_id,
-                domain=domain,
-            )
-
-        connection = self._load_connection(
-            organization_id=effective_organization_id,
-            connection_id=effective_connection_id,
-        )
-        self._validate_connection_for_execution(
-            connection=connection,
-            organization_id=effective_organization_id,
-        )
-        vendor = str(connection.get("vendor") or "").strip().upper()
-        if not re.match(r"^SNOWFLAKE(?:\b|[_-])", vendor):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    "Snowflake REGEX remediation requires an eligible "
-                    "Snowflake Enterprise Connection."
-                ),
-            )
-
-        source_type = str(
-            recommendation.get("source_type") or ""
-        ).strip().upper()
-        source_connection_id = str(
-            recommendation.get("connection_id") or ""
-        ).strip()
-        if (
-            source_type != "SNOWFLAKE"
-            or source_connection_id != effective_connection_id
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    "Execution connection does not match the profiled "
-                    "Snowflake source."
-                ),
-            )
-
-        artifact_type = str(
-            recommendation.get("remediation_artifact_type") or ""
-        ).strip().upper()
-        approval_status = str(
-            recommendation.get("remediation_approval_status") or ""
-        ).strip().upper()
-        safety_status = str(
-            recommendation.get("remediation_safety_status") or ""
-        ).strip().upper()
-        rule_id = str(
-            recommendation.get("rule_id") or ""
-        ).strip().upper()
-        field_name = str(
-            recommendation.get("field_name") or ""
-        ).strip()
-        source_column = str(
-            recommendation.get("source_column") or ""
-        ).strip()
-        remediation_regex = str(
-            recommendation.get("remediation_regex") or ""
-        ).strip()
-        remediation_version_id = str(
-            recommendation.get("remediation_version_id") or ""
-        ).strip()
-
-        if approval_status != "APPROVED":
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    "Snowflake REGEX remediation requires final steward "
-                    "approval."
-                ),
-            )
-        if artifact_type != "REGEX":
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    "Snowflake governed REGEX execution requires an "
-                    "approved REGEX artifact."
-                ),
-            )
-        if safety_status == "BLOCKED":
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Blocked DQ remediation artifacts cannot execute.",
-            )
-        if not remediation_version_id:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    "Approved Snowflake remediation version is missing."
-                ),
-            )
-
-        artifact = self.validate_snowflake_regex_artifact(
-            rule_id=rule_id,
-            field_name=field_name,
-            remediation_regex=remediation_regex,
-        )
-        persisted_hash = str(
-            recommendation.get("remediation_artifact_hash")
-            or recommendation.get("artifact_hash")
-            or ""
-        ).strip().lower()
-        if persisted_hash and persisted_hash != artifact["artifact_hash"]:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    "Approved Snowflake REGEX hash does not match the "
-                    "persisted remediation version."
-                ),
-            )
-
-        details = self._connection_details(connection)
-        configured_table = details.get("table_name") or details.get(
-            "target_table"
-        )
-        target = tuple(
-            self._snowflake_identifier(value)
-            for value in (
-                recommendation.get("database_name")
-                or details.get("database"),
-                recommendation.get("schema_name")
-                or details.get("schema")
-                or details.get("schema_name"),
-                recommendation.get("table_name")
-                or configured_table,
-            )
-        )
-        configured = (
-            self._snowflake_identifier(details.get("database")),
-            self._snowflake_identifier(
-                details.get("schema") or details.get("schema_name")
-            ),
-        )
-        if (
-            target[:2] != configured
-            or (
-                configured_table
-                and target[2]
-                != self._snowflake_identifier(configured_table)
-            )
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    "Snowflake connection target has changed since profiling."
-                ),
-            )
-
-        column = self._snowflake_identifier(source_column)
-        sql_contract = self._build_snowflake_full_name_regex_sql(
-            target=target,
-            column=column,
-        )
-        credential_reference = str(
-            connection.get("credential_reference") or ""
-        ).strip()
-        if not credential_reference:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Connection credential reference is missing.",
-            )
-        try:
-            credentials = self.secret_manager.access_secret(
-                credential_reference
-            )
-        except Exception as exc:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Unable to retrieve Snowflake connection credentials.",
-            ) from exc
-        if not isinstance(credentials, dict):
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Snowflake connection credentials have an invalid shape.",
-            )
-
-        return {
-            "organization_id": effective_organization_id,
-            "recommendation_id": effective_recommendation_id,
-            "profile_run_id": effective_profile_run_id,
-            "connection_id": effective_connection_id,
-            "requested_by": effective_requested_by,
-            "technical_approved_by": effective_technical_approved_by,
-            "domain": domain or None,
-            "vendor": "SNOWFLAKE",
-            "environment": str(
-                connection.get("environment") or ""
-            ).strip().upper(),
-            "artifact_type": artifact_type,
-            "approval_status": approval_status,
-            "safety_status": safety_status,
-            # The approved artifact is REGEX. SNOWFLAKE identifies the
-            # execution vendor/target, not a SQL artifact dialect. The audit
-            # repository intentionally requires sql_dialect=None for REGEX.
-            "sql_dialect": None,
-            "remediation_version_id": remediation_version_id,
-            "rule_id": rule_id,
-            "field_name": field_name,
-            "source_column": source_column,
-            "remediation_regex": artifact["pattern"],
-            "artifact_hash": artifact["artifact_hash"],
-            "execution_target": "SNOWFLAKE",
-            "execution_sql": sql_contract["execution_sql"],
-            "count_sql": sql_contract["count_sql"],
             "connection": connection,
             "credentials": credentials,
         }
@@ -3158,22 +2442,12 @@ class DqExecutionService:
         if vendor == "GOOGLE_BIGQUERY":
             vendor = "BIGQUERY"
 
-        connection_type = str(connection.get("connection_type") or "").strip().upper()
-        if (
-            re.match(r"^SNOWFLAKE(?:\b|[_-])", vendor)
-            or (
-                connection_type in {"SNOWFLAKE", "SNOWFLAKE_DATABASE", "SNOWFLAKE_SQL"}
-                and vendor not in {"BIGQUERY", "DATABRICKS", "MONGODB", "AZURE_SQL"}
-            )
-        ):
-            vendor = "SNOWFLAKE"
-
         if vendor not in self.ALLOWED_VENDORS:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
                     "Initial governed DQ execution supports only "
-                    "Azure SQL,, BigQuery, Databricks, and Snowflake."
+                    "BigQuery, Databricks, and Snowflake."
                 ),
             )
 
@@ -3501,89 +2775,6 @@ class DqExecutionService:
             value=value,
         )
 
-    @classmethod
-    def validate_snowflake_regex_artifact(
-        cls,
-        *,
-        rule_id: str,
-        field_name: str | None,
-        remediation_regex: str,
-    ) -> dict[str, Any]:
-        """Validate the exact approved Snowflake REGEX contract."""
-        normalized_rule_id = str(rule_id or "").strip().upper()
-        normalized_field_name = str(field_name or "").strip().lower()
-        normalized_regex = str(remediation_regex or "").strip()
-
-        if normalized_rule_id not in cls.SNOWFLAKE_EXECUTABLE_REGEX_RULES:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    "This DQ rule does not have an approved executable "
-                    "Snowflake REGEX contract."
-                ),
-            )
-        if normalized_field_name != "full_name":
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    "The initial Snowflake REGEX contract is restricted "
-                    "to the governed full_name field."
-                ),
-            )
-        if normalized_regex != cls.FULL_NAME_STANDARDIZATION_REGEX:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    "Approved Snowflake REGEX does not exactly match the "
-                    "governed FULL_NAME_STANDARDIZATION pattern."
-                ),
-            )
-        try:
-            re.compile(normalized_regex)
-        except re.error as exc:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Approved Snowflake REGEX remediation is invalid.",
-            ) from exc
-
-        return {
-            "artifact_type": "REGEX",
-            "execution_target": "SNOWFLAKE",
-            "rule_id": normalized_rule_id,
-            "field_name": normalized_field_name,
-            "pattern": normalized_regex,
-            "operation": "TRIM_COLLAPSE_WHITESPACE",
-            "artifact_hash": hashlib.sha256(
-                normalized_regex.encode("utf-8")
-            ).hexdigest(),
-        }
-
-    @staticmethod
-    def _build_snowflake_full_name_regex_sql(
-        *,
-        target: tuple[str, str, str],
-        column: str,
-    ) -> dict[str, str]:
-        qualified_target = ".".join(target)
-        normalized_value = (
-            f"REGEXP_REPLACE(TRIM({column}), '[[:space:]]+', ' ')"
-        )
-        predicate = (
-            f"{column} IS NOT NULL "
-            f"AND {column} <> {normalized_value}"
-        )
-        return {
-            "count_sql": (
-                f"SELECT COUNT(*) FROM {qualified_target} "
-                f"WHERE {predicate}"
-            ),
-            "execution_sql": (
-                f"UPDATE {qualified_target} "
-                f"SET {column} = {normalized_value} "
-                f"WHERE {predicate}"
-            ),
-        }
-
     # ------------------------------------------------------------------
     # SQL safety
     # ------------------------------------------------------------------
@@ -3598,8 +2789,6 @@ class DqExecutionService:
             "BIGQUERY": {"BIGQUERY", "GENERIC"},
             "SNOWFLAKE": {"SNOWFLAKE", "GENERIC"},
             "DATABRICKS": {"DATABRICKS", "GENERIC"},
-            "AZURE_SQL": {"AZURE_SQL", "SQL_SERVER", "TSQL", "GENERIC"},
-
         }
 
         if sql_dialect not in allowed_dialects.get(
@@ -3700,107 +2889,60 @@ class DqExecutionService:
     # Snowflake execution
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _snowflake_identifier(value: Any) -> str:
-        name = str(value or "").strip()
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", name):
-            raise HTTPException(status_code=409, detail="Snowflake profile target identifier is missing or invalid.")
-        return name.upper()
-
-    @classmethod
-    def _validate_snowflake_update_target(cls, *, sql: str, expected_target: tuple[str, str, str]) -> None:
-        part = r'(?:"(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_$]*)'
-        match = re.match(
-            rf"^\s*UPDATE\s+({part})\.({part})\.({part})(?=\s)",
-            sql, flags=re.IGNORECASE,
-        )
-        if not match:
-            raise HTTPException(status_code=409, detail="Snowflake UPDATE must name the fully qualified profiled target.")
-        actual = tuple(
-            value[1:-1].replace('""', '"') if value.startswith('"') else value.upper()
-            for value in match.groups()
-        )
-        if actual != expected_target:
-            raise HTTPException(status_code=409, detail="Approved Snowflake SQL target does not match the persisted profile source.")
-
-    def _snowflake_connect(self, *, connection: dict[str, Any], credentials: dict[str, Any]):
-        try:
-            return connect_snowflake(
-                connection=connection,
-                credentials=credentials,
-                autocommit=False,
-                login_timeout=60,
-            )
-        except SnowflakeConnectionConfigurationError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-    def _preflight_snowflake(
-        self,
-        *,
-        connection: dict[str, Any],
-        credentials: dict[str, Any],
-        sql: str,
-        client: Any | None = None,
-    ) -> None:
-        """Compile the exact approved UPDATE without running target DML."""
-        owns_client = client is None
-        active_client = client or self._snowflake_connect(
-            connection=connection,
-            credentials=credentials,
-        )
-        try:
-            cursor = active_client.cursor()
-            try:
-                cursor.execute(f"EXPLAIN USING TEXT {sql}")
-                cursor.fetchall()
-            finally:
-                cursor.close()
-        finally:
-            if owns_client:
-                active_client.close()
-
-    def _preview_snowflake_affected_rows(
-        self,
-        *,
-        connection: dict[str, Any],
-        credentials: dict[str, Any],
-        count_sql: str,
-        client: Any | None = None,
-    ) -> int:
-        """Return the eligible-row count without mutating Snowflake."""
-        owns_client = client is None
-        active_client = client or self._snowflake_connect(
-            connection=connection,
-            credentials=credentials,
-        )
-        try:
-            cursor = active_client.cursor()
-            try:
-                cursor.execute(count_sql)
-                row = cursor.fetchone()
-                return int(row[0] if row else 0)
-            finally:
-                cursor.close()
-        finally:
-            if owns_client:
-                active_client.close()
-
     def _execute_snowflake(
         self,
         *,
         connection: dict[str, Any],
         credentials: dict[str, Any],
         sql: str,
-        client: Any | None = None,
     ) -> dict[str, Any]:
-        snowflake_connection = client
+        details = self._connection_details(
+            connection
+        )
+        credential_values = self._flatten_credentials(
+            credentials
+        )
+
+        username = credential_values.get("username")
+        password = credential_values.get("password")
+        account = (
+            credential_values.get("account")
+            or details.get("account")
+            or connection.get("workspace_name")
+        )
+
+        if not username or not password or not account:
+            raise RuntimeError(
+                "Snowflake username/password/account configuration is incomplete."
+            )
+
+        snowflake_connection = None
 
         try:
-            if snowflake_connection is None:
-                snowflake_connection = self._snowflake_connect(
-                    connection=connection,
-                    credentials=credentials,
-                )
+            snowflake_connection = snowflake.connector.connect(
+                user=username,
+                password=password,
+                account=account,
+                warehouse=(
+                    credential_values.get("warehouse")
+                    or details.get("warehouse")
+                ),
+                database=(
+                    credential_values.get("database")
+                    or details.get("database")
+                ),
+                schema=(
+                    credential_values.get("schema")
+                    or details.get("schema")
+                    or details.get("schema_name")
+                ),
+                role=(
+                    credential_values.get("role")
+                    or details.get("role")
+                ),
+                login_timeout=20,
+                autocommit=False,
+            )
 
             cursor = snowflake_connection.cursor()
 
@@ -3839,149 +2981,6 @@ class DqExecutionService:
         finally:
             if snowflake_connection is not None:
                 snowflake_connection.close()
-
-    # ------------------------------------------------------------------
-    # Azure SQL execution
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _azure_sql_identifier(value: Any) -> str:
-        name = str(value or "").strip()
-
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    "Azure SQL profile target identifier "
-                    "is missing or invalid."
-                ),
-            )
-
-        return name.lower()
-
-
-    @classmethod
-    def _validate_azure_sql_update_target(
-        cls,
-        *,
-        sql: str,
-        expected_target: tuple[str, str],
-    ) -> None:
-        part = r"(?:\[[A-Za-z_][A-Za-z0-9_]*\]|[A-Za-z_][A-Za-z0-9_]*)"
-
-        match = re.match(
-            rf"^\s*UPDATE\s+({part})\.({part})(?=\s)",
-            sql,
-            flags=re.IGNORECASE,
-        )
-
-        if not match:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    "Azure SQL UPDATE must name the "
-                    "schema-qualified profiled target."
-                ),
-            )
-
-        actual = tuple(
-            (
-                value[1:-1]
-                if value.startswith("[") and value.endswith("]")
-                else value
-            ).lower()
-            for value in match.groups()
-        )
-
-        if actual != expected_target:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    "Approved Azure SQL target does not match "
-                    "the persisted profile source."
-                ),
-            )
-
-    def _execute_azure_sql(
-        self,
-        *,
-        organization_id: str,
-        connection_id: str,
-        connection: dict[str, Any],
-        credentials: dict[str, Any],
-        sql: str,
-    ) -> dict[str, Any]:
-        """
-        Execute one already-governed UPDATE statement against Azure SQL.
-
-        AzureSQLConnector owns the database transaction and performs an
-        explicit commit on success and rollback on failure.
-        """
-        details = self._connection_details(connection)
-        credential_values = self._flatten_credentials(credentials)
-
-        server = str(
-            credential_values.get("server")
-            or details.get("server")
-            or connection.get("api_endpoint")
-            or ""
-        ).strip()
-
-        database = str(
-            credential_values.get("database")
-            or details.get("database")
-            or connection.get("workspace_name")
-            or ""
-        ).strip()
-
-        username = str(
-            credential_values.get("username")
-            or ""
-        ).strip()
-
-        password = str(
-            credential_values.get("password")
-            or ""
-        )
-
-        port_raw = (
-            credential_values.get("port")
-            or details.get("port")
-            or 1433
-        )
-
-        if not server:
-            raise RuntimeError(
-                "Azure SQL server is required for governed DQ execution."
-            )
-
-        if not database:
-            raise RuntimeError(
-                "Azure SQL database is required for governed DQ execution."
-            )
-
-        if not username or not password:
-            raise RuntimeError(
-                "Azure SQL username and password are required for governed DQ execution."
-            )
-
-        try:
-            port = int(port_raw)
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError(
-                "Azure SQL port must be a valid integer."
-            ) from exc
-
-        connector = AzureSQLConnector(
-            organization_id=organization_id,
-            connection_id=connection_id,
-            server=server,
-            database=database,
-            username=username,
-            password=password,
-            port=port,
-        )
-
-        return connector.execute_update(sql=sql)
 
     # ------------------------------------------------------------------
     # BigQuery execution
@@ -4611,12 +3610,7 @@ class DqExecutionService:
             ],
             "execution_status": execution_status,
             "vendor_status": vendor_status,
-            "execution_target": context.get("execution_target"),
-            "rule_id": context.get("rule_id"),
             "rows_affected": rows_affected,
-            "rows_evaluated": rows_evaluated,
-            "rows_changed": rows_changed,
-            "rows_skipped": rows_skipped,
             "statement_id": statement_id,
             "started_at": (
                 started_at.isoformat()

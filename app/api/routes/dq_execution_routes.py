@@ -157,6 +157,166 @@ def validate_dq_remediation_execution(
             ),
         ) from exc
 
+@router.post(
+    "/dq/recommendations/{recommendation_id}/validate-snowflake-regex",
+    response_model=DqExecutionResponse,
+    status_code=status.HTTP_200_OK,
+)
+def validate_snowflake_regex_remediation(
+    recommendation_id: str,
+    req: DqExecutionValidationRequest,
+    current_user: AuthUser = Depends(require_active_product_access),
+) -> DqExecutionResponse:
+    """Preflight the exact approved Snowflake REGEX operation without DML."""
+    organization_id = require_current_organization_id(current_user)
+    normalized_recommendation_id = str(recommendation_id or "").strip()
+    requested_by = str(current_user.email or "").strip()
+
+    if not normalized_recommendation_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="recommendation_id is required.",
+        )
+    if not requested_by:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Authenticated user email is required for Snowflake "
+                "REGEX validation."
+            ),
+        )
+
+    try:
+        result = (
+            dq_execution_service
+            .validate_approved_snowflake_regex_remediation(
+                organization_id=organization_id,
+                recommendation_id=normalized_recommendation_id,
+                profile_run_id=req.profile_run_id,
+                connection_id=req.connection_id,
+                requested_by=requested_by,
+                technical_approved_by=req.technical_approved_by,
+            )
+        )
+        if str(result.get("organization_id") or "").strip() != organization_id:
+            logger.error(
+                "Cross-tenant Snowflake REGEX validation response blocked. "
+                "organization_id=%s recommendation_id=%s",
+                organization_id,
+                normalized_recommendation_id,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=(
+                    "Security validation failed: execution response belongs "
+                    "to a different organization."
+                ),
+            )
+        return DqExecutionResponse(**result)
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    except Exception as exc:
+        logger.exception(
+            "Snowflake REGEX validation route failed. "
+            "organization_id=%s recommendation_id=%s error=%s",
+            organization_id,
+            normalized_recommendation_id,
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to validate Snowflake REGEX remediation.",
+        ) from exc
+
+
+@router.post(
+    "/dq/recommendations/{recommendation_id}/execute-snowflake-regex",
+    response_model=DqExecutionResponse,
+    status_code=status.HTTP_200_OK,
+)
+def execute_snowflake_regex_remediation(
+    recommendation_id: str,
+    req: DqExecutionRequest,
+    current_user: AuthUser = Depends(require_active_product_access),
+) -> DqExecutionResponse:
+    """Execute the allow-listed approved Snowflake REGEX operation."""
+    organization_id = require_current_organization_id(current_user)
+    normalized_recommendation_id = str(recommendation_id or "").strip()
+    requested_by = str(current_user.email or "").strip()
+
+    if not normalized_recommendation_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="recommendation_id is required.",
+        )
+    if not requested_by:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Authenticated user email is required for Snowflake "
+                "REGEX execution."
+            ),
+        )
+    if req.confirm_execution is not True:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Explicit confirmation is required before executing "
+                "Snowflake REGEX remediation."
+            ),
+        )
+
+    try:
+        result = (
+            dq_execution_service
+            .execute_approved_snowflake_regex_remediation(
+                organization_id=organization_id,
+                recommendation_id=normalized_recommendation_id,
+                profile_run_id=req.profile_run_id,
+                connection_id=req.connection_id,
+                requested_by=requested_by,
+                technical_approved_by=req.technical_approved_by,
+            )
+        )
+        if str(result.get("organization_id") or "").strip() != organization_id:
+            logger.error(
+                "Cross-tenant Snowflake REGEX execution response blocked. "
+                "organization_id=%s recommendation_id=%s",
+                organization_id,
+                normalized_recommendation_id,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=(
+                    "Security validation failed: execution response belongs "
+                    "to a different organization."
+                ),
+            )
+        return DqExecutionResponse(**result)
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    except Exception as exc:
+        logger.exception(
+            "Snowflake REGEX execution route failed. "
+            "organization_id=%s recommendation_id=%s error=%s",
+            organization_id,
+            normalized_recommendation_id,
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to execute Snowflake REGEX remediation.",
+        ) from exc
 
 @router.post(
     "/dq/recommendations/"

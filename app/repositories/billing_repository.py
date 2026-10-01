@@ -708,6 +708,113 @@ class BillingRepository:
 
         return subscription
 
+    def assign_plan_to_active_subscription(
+        self,
+        *,
+        organization_id: str,
+        plan_code: str,
+        updated_by: str,
+    ) -> None:
+        effective_organization_id = self._require_organization_id(
+            organization_id
+        )
+
+        normalized_plan_code = str(
+            plan_code or ""
+        ).strip().upper()
+
+        normalized_updated_by = str(
+            updated_by or ""
+        ).strip()
+
+        if not normalized_plan_code:
+            raise ValueError("plan_code is required.")
+
+        if not normalized_updated_by:
+            raise ValueError("updated_by is required.")
+
+        execution_entitlements = self._execution_entitlements_for_plan(
+            normalized_plan_code
+        )
+
+        sql = f"""
+        UPDATE `{self.subscriptions_table}`
+        SET
+            plan_code = @plan_code,
+
+            steward_intelligence_enabled =
+                @steward_intelligence_enabled,
+
+            governed_regex_execution_enabled =
+                @governed_regex_execution_enabled,
+
+            governed_sql_execution_enabled =
+                @governed_sql_execution_enabled,
+
+            policy_auto_execution_enabled =
+                @policy_auto_execution_enabled,
+
+            updated_at = CURRENT_TIMESTAMP(),
+            updated_by = @updated_by
+        WHERE
+            organization_id = @organization_id
+            AND is_current = TRUE
+            AND UPPER(subscription_status) = 'ACTIVE'
+        """
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter(
+                    "organization_id",
+                    "STRING",
+                    effective_organization_id,
+                ),
+                bigquery.ScalarQueryParameter(
+                    "plan_code",
+                    "STRING",
+                    normalized_plan_code,
+                ),
+                bigquery.ScalarQueryParameter(
+                    "steward_intelligence_enabled",
+                    "BOOL",
+                    execution_entitlements[
+                        "steward_intelligence_enabled"
+                    ],
+                ),
+                bigquery.ScalarQueryParameter(
+                    "governed_regex_execution_enabled",
+                    "BOOL",
+                    execution_entitlements[
+                        "governed_regex_execution_enabled"
+                    ],
+                ),
+                bigquery.ScalarQueryParameter(
+                    "governed_sql_execution_enabled",
+                    "BOOL",
+                    execution_entitlements[
+                        "governed_sql_execution_enabled"
+                    ],
+                ),
+                bigquery.ScalarQueryParameter(
+                    "policy_auto_execution_enabled",
+                    "BOOL",
+                    execution_entitlements[
+                        "policy_auto_execution_enabled"
+                    ],
+                ),
+                bigquery.ScalarQueryParameter(
+                    "updated_by",
+                    "STRING",
+                    normalized_updated_by,
+                ),
+            ]
+        )
+
+        self.client.query(
+            sql,
+            job_config=job_config,
+        ).result()
+
     def activate_subscription_from_checkout(
         self,
         *,

@@ -509,6 +509,67 @@ class ConnectionRepository:
                 "organization."
             )
 
+    def update_connection_capabilities(
+        self,
+        *,
+        connection_id: str,
+        organization_id: str,
+        connection_capabilities: list[str],
+        updated_at: datetime,
+    ) -> None:
+        effective_connection_id = self._require_connection_id(
+            connection_id
+        )
+        effective_organization_id = self._require_organization_id(
+            organization_id
+        )
+
+        sql = f"""
+        UPDATE `{self.registry_table}`
+        SET
+            connection_capabilities = @connection_capabilities,
+            updated_at = @updated_at
+        WHERE connection_id = @connection_id
+        AND organization_id = @organization_id
+        """
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter(
+                    "connection_id",
+                    "STRING",
+                    effective_connection_id,
+                ),
+                bigquery.ScalarQueryParameter(
+                    "organization_id",
+                    "STRING",
+                    effective_organization_id,
+                ),
+                bigquery.ArrayQueryParameter(
+                    "connection_capabilities",
+                    "STRING",
+                    connection_capabilities,
+                ),
+                bigquery.ScalarQueryParameter(
+                    "updated_at",
+                    "TIMESTAMP",
+                    updated_at,
+                ),
+            ]
+        )
+
+        query_job = self.client.query(
+            sql,
+            job_config=job_config,
+        )
+        query_job.result()
+
+        if query_job.num_dml_affected_rows != 1:
+            raise RuntimeError(
+                "Connection capabilities were not updated "
+                "for the authenticated organization."
+            )
+
     def complete_google_oauth_connection(
         self,
         *,

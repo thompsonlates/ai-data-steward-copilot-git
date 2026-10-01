@@ -25,6 +25,10 @@ from app.repositories.connection_repository import ConnectionRepository
 from app.services.azure_sql_connector import AzureSQLConnector
 from app.services.mongodb_connector import MongoDBConnector
 from app.services.secret_manager_service import SecretManagerService
+from app.services.snowflake_connection_factory import (
+    SnowflakeConnectionConfigurationError,
+    connect_snowflake,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -282,6 +286,93 @@ class ConnectionService:
             normalized_record
         )
 
+    def update_connection_capabilities(
+        self,
+        *,
+        connection_id: str,
+        organization_id: str,
+        connection_capabilities: list[str],
+    ) -> EnterpriseConnectionResponse:
+        effective_organization_id = self._require_organization_id(
+            organization_id
+        )
+        effective_connection_id = self._require_connection_id(
+            connection_id
+        )
+
+        record = self.repository.get_connection(
+            connection_id=effective_connection_id,
+            organization_id=effective_organization_id,
+        )
+
+        if record is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Enterprise connection not found",
+            )
+
+        self._assert_connection_tenant(
+            connection=record,
+            organization_id=effective_organization_id,
+        )
+
+        if not bool(record.get("is_active")):
+            raise HTTPException(
+                status_code=400,
+                detail="Enterprise connection must be active.",
+            )
+
+        effective_environment = self._normalize_environment(
+            record.get("environment")
+        )
+
+        effective_capabilities = list(
+            dict.fromkeys(
+                str(value or "").strip().upper()
+                for value in connection_capabilities
+                if str(value or "").strip()
+            )
+        )
+
+        allowed_capabilities = {
+            "READ_DATA",
+            "READ_METADATA",
+            "TEST_CONNECTION",
+            "EXECUTE_DQ_REMEDIATION",
+            "EXECUTE_SQL",
+            "WRITE_DATA",
+        }
+
+        unsupported = sorted(
+            set(effective_capabilities) - allowed_capabilities
+        )
+
+        if unsupported:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Unsupported Enterprise Connection capabilities: "
+                    + ", ".join(unsupported)
+                ),
+            )
+
+        self._validate_execution_capabilities_for_environment(
+            environment=effective_environment,
+            capabilities=effective_capabilities,
+        )
+
+        self.repository.update_connection_capabilities(
+            connection_id=effective_connection_id,
+            organization_id=effective_organization_id,
+            connection_capabilities=effective_capabilities,
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        return self.get_connection(
+            connection_id=effective_connection_id,
+            organization_id=effective_organization_id,
+        )
+
     def list_connections(
         self,
         *,
@@ -429,40 +520,31 @@ class ConnectionService:
         connection: dict[str, Any],
         credentials: dict[str, Any],
     ) -> tuple[bool, str]:
-        username = credentials.get("username")
-        password = credentials.get("password")
-
-        account = (
-            credentials.get("account")
-            or connection.get("workspace_name")
-        )
-
-        if not username or not password or not account:
-            return False, "Snowflake credentials are incomplete"
-
         snowflake_connection = None
-
         try:
-            snowflake_connection = snowflake.connector.connect(
-                user=username,
-                password=password,
-                account=account,
-                warehouse=credentials.get("warehouse"),
-                database=credentials.get("database"),
-                schema=credentials.get("schema"),
-                login_timeout=15,
-            )
+            try:
+                snowflake_connection = connect_snowflake(
+                    connection=connection,
+                    credentials=credentials,
+                    login_timeout=60,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Snowflake connection test failed: connection_id=%s",
+                    connection.get("connection_id"),
+                )
+                return False, (
+                    f"Snowflake test failed: "
+                    f"{type(exc).__name__}: {str(exc)}"
+    )
 
             cursor = snowflake_connection.cursor()
-
             try:
                 cursor.execute("SELECT CURRENT_VERSION()")
                 cursor.fetchone()
             finally:
                 cursor.close()
-
             return True, "Snowflake connection succeeded"
-
         finally:
             if snowflake_connection is not None:
                 snowflake_connection.close()
@@ -1426,6 +1508,134 @@ class ConnectionService:
 
         return connection, credentials
 
+    def get_snowflake_connection_context(
+        self,
+        *,
+        connection_id: str,
+        organization_id: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Resolve an active Snowflake connection and its tenant-bound secret."""
+        effective_org = self._require_organization_id(organization_id)
+        effective_id = self._require_connection_id(connection_id)
+        connection = self.repository.get_connection_for_test(
+            connection_id=effective_id, organization_id=effective_org,
+        )
+        if connection is None:
+            raise HTTPException(status_code=404, detail="Enterprise connection not found")
+        self._assert_connection_tenant(
+            connection=connection, organization_id=effective_org,
+        )
+        if not connection.get("is_active", False):
+            raise HTTPException(status_code=409, detail="Enterprise connection is inactive")
+        vendor = str(connection.get("vendor") or "").strip().upper()
+        connection_type = str(connection.get("connection_type") or "").strip().upper()
+        snowflake_vendor = bool(re.match(r"^SNOWFLAKE(?:\b|[_-])", vendor))
+        snowflake_type = connection_type in {
+            "SNOWFLAKE", "SNOWFLAKE_DATABASE", "SNOWFLAKE_SQL",
+        }
+        other_vendor = vendor in {
+            "BIGQUERY", "GOOGLE_BIGQUERY", "DATABRICKS", "MONGODB", "AZURE_SQL",
+        }
+        if not snowflake_vendor and (not snowflake_type or other_vendor):
+            logger.warning(
+                "Snowflake connection metadata rejected. organization_id=%s connection_id=%s vendor=%s connection_type=%s",
+                effective_org, effective_id, vendor or "MISSING", connection_type or "MISSING",
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=("Selected connection is not configured as Snowflake "
+                        f"(vendor={vendor or 'MISSING'}, connection_type={connection_type or 'MISSING'})."),
+            )
+        reference = str(connection.get("credential_reference") or "").strip()
+        if not reference:
+            raise HTTPException(status_code=500, detail="Connection credential reference is missing")
+        try:
+            credentials = self.secret_manager.access_secret(reference)
+        except Exception as exc:
+            logger.exception(
+                "Snowflake credential retrieval failed. organization_id=%s connection_id=%s",
+                effective_org, effective_id,
+            )
+            raise HTTPException(status_code=500, detail="Unable to retrieve Snowflake credentials") from exc
+        if not isinstance(credentials, dict):
+            raise HTTPException(status_code=500, detail="Stored Snowflake credentials are invalid")
+        return connection, credentials
+
+    def get_azure_sql_connection_context(
+        self,
+        *,
+        connection_id: str,
+        organization_id: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Resolve an active Azure SQL connection and its tenant-bound secret."""
+        effective_org = self._require_organization_id(organization_id)
+        effective_id = self._require_connection_id(connection_id)
+
+        connection = self.repository.get_connection_for_test(
+            connection_id=effective_id,
+            organization_id=effective_org,
+        )
+
+        if connection is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Enterprise connection not found",
+            )
+
+        self._assert_connection_tenant(
+            connection=connection,
+            organization_id=effective_org,
+        )
+
+        if not connection.get("is_active", False):
+            raise HTTPException(
+                status_code=409,
+                detail="Enterprise connection is inactive",
+            )
+
+        vendor = str(connection.get("vendor") or "").strip().upper()
+
+        if vendor != "AZURE_SQL":
+            raise HTTPException(
+                status_code=409,
+                detail="Enterprise connection is not Azure SQL",
+            )
+
+        credential_reference = str(
+            connection.get("credential_reference") or ""
+        ).strip()
+
+        if not credential_reference:
+            raise HTTPException(
+                status_code=500,
+                detail="Connection credential reference is missing",
+            )
+
+        try:
+            credentials = self.secret_manager.access_secret(
+                credential_reference
+            )
+        except Exception as exc:
+            logger.exception(
+                "Secret retrieval failed. "
+                "organization_id=%s connection_id=%s error=%s",
+                organization_id,
+                connection_id,
+                type(exc).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Unable to retrieve connection credentials",
+            ) from exc
+
+        if not isinstance(credentials, dict):
+            raise HTTPException(
+                status_code=500,
+                detail="Stored Azure SQL credentials are invalid",
+            )
+
+        return connection, credentials
+
     def get_bigquery_connection_context(
         self,
         *,
@@ -1539,7 +1749,48 @@ class ConnectionService:
                 detail="Unable to retrieve connection credentials",
             ) from exc
 
-        vendor = str(connection.get("vendor") or "").upper()
+        # TEMP DEBUG - never log secret values
+        additional_properties = credentials.get("additional_properties")
+        additional_properties = (
+            additional_properties
+            if isinstance(additional_properties, dict)
+            else {}
+        )
+
+        logger.warning(
+            "CONNECTION_TEST_DEBUG "
+            "connection_id=%s "
+            "vendor=%s "
+            "credential_keys=%s "
+            "additional_property_keys=%s "
+            "top_username=%r "
+            "nested_username=%r "
+            "top_password_present=%s "
+            "nested_password_present=%s "
+            "top_password_length=%s "
+            "nested_password_length=%s",
+            effective_connection_id,
+            connection.get("vendor"),
+            sorted(credentials.keys()),
+            sorted(additional_properties.keys()),
+            credentials.get("username"),
+            additional_properties.get("username"),
+            bool(credentials.get("password")),
+            bool(additional_properties.get("password")),
+            len(str(credentials.get("password") or "")),
+            len(str(additional_properties.get("password") or "")),
+        )
+
+        vendor = str(connection.get("vendor") or "").strip().upper()
+        connection_type = str(connection.get("connection_type") or "").strip().upper()
+        if (
+            re.match(r"^SNOWFLAKE(?:\b|[_-])", vendor)
+            or (
+                connection_type in {"SNOWFLAKE", "SNOWFLAKE_DATABASE", "SNOWFLAKE_SQL"}
+                and vendor not in {"BIGQUERY", "GOOGLE_BIGQUERY", "DATABRICKS", "MONGODB", "AZURE_SQL"}
+            )
+        ):
+            vendor = "SNOWFLAKE"
         authentication_type = str(
             credentials.get("authentication_type") or ""
         ).upper()

@@ -1,7 +1,6 @@
 """Behavior-preserving route extraction from the former monolithic routes.py."""
 
 import json
-import re
 
 from app.api.route_dependencies import *
 from app.api.route_dependencies import (
@@ -67,7 +66,8 @@ def generate_dq_remediation_sql(
 
         requested_connection_id = str(req.connection_id or "").strip()
 
-        # Enterprise path: resolve the exact persisted source target first.
+        # Enterprise Connection path: resolve the Databricks target first.
+        # Native Databricks profiles must never require a BigQuery stage table.
         if requested_connection_id:
             connection = connection_repository.get_connection(
                 connection_id=requested_connection_id,
@@ -90,23 +90,13 @@ def generate_dq_remediation_sql(
                 connection.get("environment") or ""
             ).strip().upper()
 
-            normalized_vendor = (
-                "BIGQUERY" if vendor == "GOOGLE_BIGQUERY" else vendor
-            )
-            connection_type = str(connection.get("connection_type") or "").strip().upper()
-            if (
-                re.match(r"^SNOWFLAKE(?:\b|[_-])", vendor)
-                or (
-                    connection_type in {"SNOWFLAKE", "SNOWFLAKE_DATABASE", "SNOWFLAKE_SQL"}
-                    and vendor not in {"BIGQUERY", "GOOGLE_BIGQUERY", "DATABRICKS", "MONGODB", "AZURE_SQL"}
-                )
-            ):
-                normalized_vendor = "SNOWFLAKE"
-            if normalized_vendor not in {"DATABRICKS", "BIGQUERY", "SNOWFLAKE",  "AZURE_SQL"}:
-                raise ValueError("Selected connection is not a supported native profile source.")
-            if environment not in {"DEV", "DEVELOPMENT", "STG", "STAGE", "STAGING"}:
+            if vendor != "DATABRICKS":
                 raise ValueError(
-                    "Native remediation generation is allowed only "
+                    "Selected connection is not a Databricks connection."
+                )
+            if environment not in {"DEV", "STG"}:
+                raise ValueError(
+                    "Databricks remediation generation is allowed only "
                     "for DEV or STG connections."
                 )
 
@@ -116,126 +106,28 @@ def generate_dq_remediation_sql(
                     details = json.loads(details)
                 except (TypeError, ValueError) as exc:
                     raise ValueError(
-                        "Enterprise connection_details are invalid."
+                        "Databricks connection_details are invalid."
                     ) from exc
             if not isinstance(details, dict):
-                raise ValueError("Enterprise connection_details are invalid.")
+                raise ValueError("Databricks connection_details are invalid.")
 
-            source_context = quality_profiler_repository.get_profile_source_context(
-                organization_id=organization_id,
-                profile_run_id=persisted_profile_run_id,
-            )
-            if not source_context:
-                raise ValueError("Persisted profile source context was not found.")
-            if str(source_context.get("source_type") or "").strip().upper() != normalized_vendor:
-                raise ValueError("Selected connection vendor does not match the profiled source.")
-            if str(source_context.get("connection_id") or "").strip() != requested_connection_id:
-                raise ValueError("Selected connection does not match the profiled source.")
+            catalog = str(details.get("catalog") or "").strip()
+            schema_name = str(
+                details.get("schema") or details.get("schema_name") or ""
+            ).strip()
+            table_name = str(details.get("table_name") or "").strip()
 
-            if normalized_vendor == "DATABRICKS":
-                catalog = str(details.get("catalog") or "").strip()
-                schema_name = str(details.get("schema") or details.get("schema_name") or "").strip()
-                table_name = str(details.get("table_name") or "").strip()
-                if not all([catalog, schema_name, table_name]):
-                    raise ValueError("Databricks connection must define catalog, schema, and table_name.")
-                source_table = f"{catalog}.{schema_name}.{table_name}"
-                sql_dialect = "DATABRICKS"
-            elif normalized_vendor == "SNOWFLAKE":
-                identifier = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
-                def snowflake_name(value, label):
-                    name = str(value or "").strip()
-                    if not identifier.fullmatch(name):
-                        raise ValueError(f"Snowflake {label} is missing or invalid.")
-                    return name.upper()
-                database = snowflake_name(details.get("database"), "database")
-                schema_name = snowflake_name(details.get("schema") or details.get("schema_name"), "schema")
-                table_name = snowflake_name(source_context.get("table_name"), "profile table")
-                configured_table = details.get("table_name") or details.get("target_table")
-                if (
-                    database != snowflake_name(source_context.get("database_name"), "profile database")
-                    or schema_name != snowflake_name(source_context.get("schema_name"), "profile schema")
-                    or (configured_table and table_name != snowflake_name(configured_table, "connection table"))
-                ):
-                    raise ValueError("Connection target does not match the profiled Snowflake source.")
-                source_table = f"{database}.{schema_name}.{table_name}"
-                sql_dialect = "SNOWFLAKE"
-            elif normalized_vendor == "AZURE_SQL":
-                identifier = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
-                def azure_sql_name(value, label):
-                    name = str(value or "").strip()
-                    if not identifier.fullmatch(name):
-                        raise ValueError(
-                            f"Azure SQL {label} is missing or invalid."
-                        )
-                    return name
-
-                database = azure_sql_name(
-                    details.get("database")
-                    or connection.get("workspace_name"),
-                    "database",
+            if not all([catalog, schema_name, table_name]):
+                raise ValueError(
+                    "Databricks connection must define catalog, schema, "
+                    "and table_name."
                 )
 
-                schema_name = azure_sql_name(
-                    source_context.get("schema_name")
-                    or details.get("schema")
-                    or details.get("schema_name")
-                    or "dbo",
-                    "schema",
-                )
-
-                table_name = azure_sql_name(
-                    source_context.get("table_name"),
-                    "profile table",
-                )
-
-                profile_database = azure_sql_name(
-                    source_context.get("database_name")
-                    or database,
-                    "profile database",
-                )
-
-                configured_table = (
-                    details.get("table_name")
-                    or details.get("target_table")
-                )
-
-                if (
-                    database.lower() != profile_database.lower()
-                    or (
-                        configured_table
-                        and table_name.lower()
-                        != azure_sql_name(
-                            configured_table,
-                            "connection table",
-                        ).lower()
-                    )
-                ):
-                    raise ValueError(
-                        "Connection target does not match the profiled Azure SQL source."
-                    )
-
-                source_table = f"{schema_name}.{table_name}"
-                sql_dialect = "AZURE_SQL"
-            else:
-                project_id = str(source_context.get("project_id") or "").strip()
-                dataset_id = str(source_context.get("dataset_id") or "").strip()
-                table_id = str(source_context.get("table_id") or "").strip()
-                if not all([project_id, dataset_id, table_id]):
-                    raise ValueError("Persisted BigQuery source target is incomplete.")
-                source_table = f"{project_id}.{dataset_id}.{table_id}"
-                sql_dialect = "BIGQUERY"
+            source_table = f"{catalog}.{schema_name}.{table_name}"
+            sql_dialect = "DATABRICKS"
         else:
             # Existing file / Google Sheets path: use the server-managed
             # BigQuery profile stage only when no Enterprise Connection exists.
-            source_context = quality_profiler_repository.get_profile_source_context(
-                organization_id=organization_id,
-                profile_run_id=persisted_profile_run_id,
-            )
-            if source_context and str(source_context.get("source_type") or "").upper() in {
-                "SNOWFLAKE", "BIGQUERY", "DATABRICKS", "AZURE_SQL",
-            }:
-                raise ValueError("Native profile remediation requires its exact profiled connection_id.")
             source_table = (
                 quality_profiler_repository.get_profile_stage_table_id(
                     organization_id=organization_id,

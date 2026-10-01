@@ -458,6 +458,7 @@ class DqRemediationGenerateRequest(BaseModel):
         "BIGQUERY",
         "SNOWFLAKE",
         "DATABRICKS",
+        "AZURE_SQL",
         "GENERIC",
     ] = "BIGQUERY"
 
@@ -502,8 +503,9 @@ class DqRemediationGenerateResponse(
         "BIGQUERY",
         "SNOWFLAKE",
         "DATABRICKS",
+        "AZURE_SQL",
         "GENERIC",
-    ]
+]
 
     safety_status: Literal[
         "SAFE_DIAGNOSTIC",
@@ -756,6 +758,7 @@ class DqExecutionResponse(
     "SNOWFLAKE",
     "BIGQUERY",
     "GOOGLE_BIGQUERY",
+    "AZURE_SQL",
     "GOOGLE",
     "ONEDRIVE",
     "MICROSOFT_ONEDRIVE",
@@ -794,6 +797,7 @@ class DqExecutionResponse(
             "DATABRICKS",
             "BIGQUERY",
             "GENERIC",
+            "AZURE_SQL",
         ]
     ] = None
 
@@ -879,6 +883,52 @@ class BigQueryProfileRequest(BaseModel):
     row_limit: int = Field(default=100_000, ge=1, le=100_000)
 
 
+class SnowflakePreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    connection_id: str = Field(min_length=1)
+    table_name: str | None = None
+    preview_limit: int = Field(default=25, ge=1, le=100)
+
+
+class SnowflakeTablesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    connection_id: str = Field(min_length=1)
+
+
+class SnowflakeProfileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    connection_id: str = Field(min_length=1)
+    table_name: str | None = None
+    domain: str = Field(min_length=1)
+    business_key_field: str = Field(min_length=1)
+    column_mappings: list[GoogleSheetsColumnMapping] = Field(min_length=1)
+    row_limit: int = Field(default=100_000, ge=1, le=100_000)
+
+class AzureSQLTablesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    connection_id: str = Field(min_length=1)
+    schema_name: str | None = None
+
+
+class AzureSQLPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    connection_id: str = Field(min_length=1)
+    schema_name: str = Field(min_length=1)
+    table_name: str = Field(min_length=1)
+    preview_limit: int = Field(default=25, ge=1, le=100)
+
+
+class AzureSQLProfileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    connection_id: str = Field(min_length=1)
+    schema_name: str = Field(min_length=1)
+    table_name: str = Field(min_length=1)
+    domain: str = Field(min_length=1)
+    business_key_field: str = Field(min_length=1)
+    column_mappings: list[GoogleSheetsColumnMapping] = Field(min_length=1)
+    row_limit: int = Field(default=1000, ge=1, le=1000)
+
+
 class DqDashboardResponse(BaseModel):
     days: int
     domain: Optional[str] = None
@@ -930,6 +980,14 @@ class EnterpriseConnectionUpdate(BaseModel):
     is_active: bool | None = None
 
     credentials: ConnectionCredentialInput | None = None
+
+class EnterpriseConnectionCapabilitiesUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    connection_capabilities: list[str] = Field(
+        min_length=1,
+        max_length=20,
+    )
 
 
 class EnterpriseConnectionResponse(TenantScopedResponseModel):

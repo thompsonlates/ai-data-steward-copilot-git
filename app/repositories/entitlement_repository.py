@@ -7,6 +7,19 @@ from google.cloud import bigquery
 
 
 class EntitlementRepository:
+    SUPPORTED_DOMAINS = frozenset(
+        {
+            "CUSTOMER",
+            "SUPPLIER",
+            "PRODUCT",
+            "PROVIDER",
+            "PATIENT",
+            "BANKING",
+            "LOCATION",
+            "ORGANIZATION",
+        }
+    )
+
     def __init__(
         self,
         *,
@@ -601,6 +614,9 @@ class EntitlementRepository:
                 "PROVIDER",
                 "PATIENT",
                 "BANKING",
+                "LOCATION",
+                "ORGANIZATION",
+                "OTHER",
             }
 
             if normalized not in allowed_domains:

@@ -105,29 +105,34 @@ async def match_explain(
             "PROVIDER": "provider_address",
             "SUPPLIER": "supplier_address",
             "PATIENT": "patient_address",
+            "LOCATION": "location_address",
         }.get(domain, "address")
 
         address_a = getattr(req.record_a, address_field, None)
         address_b = getattr(req.record_b, address_field, None)
 
-        logger.info(
-        f"[ADDRESS DEBUG] domain={domain} "
-        f"address_a={address_a} "
-        f"address_b={address_b}"
-)
+        if domain == "ORGANIZATION":
+            record_a_address_intelligence = None
+            record_b_address_intelligence = None
+            address_match_insight = None
+            address_similarity_score = 0.0
+        else:
+            record_a_address_intelligence = address_service.validate(
+                address_a
+            )
+            record_b_address_intelligence = address_service.validate(
+                address_b
+            )
 
-        record_a_address_intelligence = address_service.validate(address_a)
-        record_b_address_intelligence = address_service.validate(address_b)
+            address_match_insight = address_service.compare(
+                record_a_address_intelligence,
+                record_b_address_intelligence,
+            )
 
-        address_match_insight = address_service.compare(
-            record_a_address_intelligence,
-            record_b_address_intelligence,
-        )
-
-        address_similarity_score = compute_address_similarity(
-            record_a_address_intelligence.standardized_address,
-            record_b_address_intelligence.standardized_address,
-        )
+            address_similarity_score = compute_address_similarity(
+                record_a_address_intelligence.standardized_address,
+                record_b_address_intelligence.standardized_address,
+            )
         entity_policy_config = {
             "policy_config": policy_cfg,
             "policy_thresholds": policy_thresholds,
@@ -249,6 +254,115 @@ async def match_explain(
             int(attribute_risk_score or 0),
         )
 
+                # ---------------------------------------------------
+        # Final Action Reconciliation
+        # ---------------------------------------------------
+        # Merge decisions must resolve conservatively across
+        # deterministic entity evidence, attribute risk, and
+        # governance policy. A less-conservative policy action
+        # must never override a deterministic merge block.
+
+        policy_recommended_action = str(
+            policy_rec.get("recommendation") or ""
+        ).strip().upper()
+
+        entity_recommended_action = str(
+            entity_resolution.get("final_recommended_action") or ""
+        ).strip().upper()
+
+        action_rank = {
+            "AUTO_MERGE": 1,
+            "APPROVE_MERGE": 2,
+            "REVIEW_REQUIRED": 3,
+            "REVIEW": 3,
+            "BLOCK_MERGE": 4,
+            "REJECT_MERGE": 4,
+        }
+
+        action_candidates = [
+            action
+            for action in {
+                policy_recommended_action,
+                entity_recommended_action,
+            }
+            if action in action_rank
+        ]
+
+        # HIGH/CRITICAL deterministic attribute risk must never
+        # result in an automated or approved merge.
+        if response_risk_flag in {
+            "HIGH",
+            "CRITICAL",
+            "SEVERE",
+        }:
+            action_candidates.append(
+                "BLOCK_MERGE"
+            )
+
+        final_recommended_action = (
+            max(
+                action_candidates,
+                key=lambda action: action_rank[action],
+            )
+            if action_candidates
+            else "REVIEW_REQUIRED"
+        )
+
+        automation_metrics = (
+            entity_engine.reconcile_automation_metrics(
+                decision_confidence_score=int(
+                    entity_resolution.get("decision_confidence_score") or 0
+                ),
+                composite_risk_score=composite_risk_score,
+                final_recommended_action=final_recommended_action,
+                policy_config=entity_policy_config,
+            )
+        )
+
+        reconciled_timeline = (
+            entity_engine.build_match_evidence_timeline(
+                signals=entity_resolution.get("signals") or [],
+                decision_confidence_score=int(
+                    entity_resolution.get(
+                        "decision_confidence_score"
+                    )
+                    or 0
+                ),
+                automation_tier=entity_resolution.get(
+                    "automation_tier"
+                )
+                or "DO_NOT_AUTOMATE",
+                primary_signal=entity_resolution.get(
+                    "primary_signal"
+                ),
+                composite_risk_score=composite_risk_score,
+                automation_readiness_score=int(
+                    automation_metrics.get(
+                        "automation_readiness_score"
+                    )
+                    or 0
+                ),
+                risk_flag=response_risk_flag,
+                effective_email_score=float(
+                    entity_resolution.get(
+                        "effective_email_score"
+                    )
+                    or 0.0
+                ),
+
+
+                recommended_action=final_recommended_action,
+                address_match_insight=address_match_insight,
+                triggered_rules=req.triggered_rules,
+                automation_policy_status=automation_metrics.get(
+                    "automation_policy_status"
+                )
+                or "MANUAL_REVIEW_REQUIRED",
+                primary_risk_driver=primary_risk_driver,
+                composite_risk_band=response_risk_flag,
+            )
+        )
+
 
         prompt = build_match_explain_prompt(
             req=req,
@@ -325,7 +439,8 @@ async def match_explain(
         record_b_member_id = getattr(req.record_b, "member_id", None)
 
         if (
-            record_a_member_id
+            domain not in {"ORGANIZATION", "LOCATION"}
+            and record_a_member_id
             and record_b_member_id
             and str(record_a_member_id).strip().lower()
             == str(record_b_member_id).strip().lower()
@@ -354,22 +469,12 @@ async def match_explain(
                             ),
                         },
                     )
-        
-        policy_recommended_action = str(
-                    policy_rec.get("recommendation") or ""
-                ).strip().upper()
-        final_recommended_action = (
-                    policy_recommended_action
-                    if policy_recommended_action in VALID_DECISIONS
-                    else ai_payload["recommended_action"]
-                )
-
-      
+              
         insight_prompt = build_ai_insight_prompt(
                     domain=domain,
                     ai_decision=ai_payload["ai_decision"],
                     recommended_action=final_recommended_action,
-                    confidence=ai_payload["confidence"],
+                    confidence=entity_resolution.get("decision_confidence_score") or 0,
                     risk_flag=response_risk_flag,
                     triggered_rules=req.triggered_rules or [],
                     primary_signal=entity_resolution.get("primary_signal"),
@@ -378,6 +483,7 @@ async def match_explain(
                         or policy_rec.get("composite_risk_score")
                     ),
                     signal_contributions=entity_resolution.get("signal_contributions"),
+                    primary_risk_driver=primary_risk_driver,
                 )
         ai_insight = generate_text_insight(
                     llm,
@@ -385,6 +491,13 @@ async def match_explain(
                     organization_id=require_current_organization_id(
                         current_user
     ),
+)
+        print(
+            "CONFIDENCE DEBUG:",
+            {
+                "ai_payload_confidence": ai_payload.get("confidence"),
+                "decision_confidence_score": entity_resolution.get("decision_confidence_score"),
+            },
 )
 
         response_obj = MatchExplainResponse(
@@ -398,7 +511,7 @@ async def match_explain(
             explanation_summary=ai_payload["explanation_summary"],
             rule_analysis=ai_payload["rule_analysis"],
             recommended_action=final_recommended_action,
-            final_recommended_action=entity_resolution.get("final_recommended_action"),
+            final_recommended_action=final_recommended_action,
             model_version=model_version,
             model_provider=model_provider,
             prompt_version=DEFAULT_PROMPT_VERSION,
@@ -418,12 +531,12 @@ async def match_explain(
             address_similarity_score=address_similarity_score,
             decision_confidence_score=entity_resolution.get("decision_confidence_score"),
             automation_tier=entity_resolution.get("automation_tier"),
-            automation_readiness_score=entity_resolution.get("automation_readiness_score"),
-            automation_readiness_label=entity_resolution.get("automation_readiness_label"),
-            automation_policy_status=entity_resolution.get("automation_policy_status"),
-            estimated_false_positive_risk=entity_resolution.get(
-                "estimated_false_positive_risk"
-            ),
+            automation_readiness_score=automation_metrics.get("automation_readiness_score"),
+            automation_readiness_label=automation_metrics.get("automation_readiness_label"),
+            automation_policy_status=automation_metrics.get("automation_policy_status"),
+            estimated_false_positive_risk=automation_metrics.get(
+            "estimated_false_positive_risk"
+        ),
             entity_similarity_score=entity_resolution.get(
             "entity_similarity_score",
             entity_resolution.get("match_score", 0.0),
@@ -433,16 +546,16 @@ async def match_explain(
             entity_resolution.get("signals")
         ),
             entity_resolution_summary=entity_resolution.get("entity_resolution_summary"),
-            match_evidence_timeline=normalize_match_evidence_timeline(
-            entity_resolution.get("match_evidence_timeline")
-            ),
+           match_evidence_timeline=normalize_match_evidence_timeline(
+                reconciled_timeline
+        ),
             timeline_events=normalize_match_evidence_timeline(
-            entity_resolution.get("timeline_events")
-            ),
+                reconciled_timeline
+        ),
             ai_insight=ai_insight,
             entity_resolution_signals=normalize_entity_resolution_signals(
             entity_resolution.get("signals")
-            ),
+        ),
             
             signal_weights=entity_resolution.get("signal_weights"),
             signal_contributions=entity_resolution.get("signal_contributions"),

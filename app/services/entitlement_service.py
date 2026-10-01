@@ -672,6 +672,23 @@ class EntitlementService:
         *,
         organization_id: str,
     ) -> list[str]:
+        plan_code = self.repository.get_current_plan_for_organization(
+            organization_id=organization_id,
+        )
+
+        if plan_code:
+            plan = self.repository.get_plan_entitlement(
+                plan_code=plan_code,
+            )
+
+            if plan and self._as_bool(
+                plan.get("all_domains_enabled"),
+                default=False,
+            ):
+                return sorted(
+                    self.repository.SUPPORTED_DOMAINS
+                )
+
         rows = self.repository.list_enabled_domains(
             organization_id=organization_id,
         )

@@ -824,7 +824,6 @@ def build_ai_insight_prompt(
     primary_signal: str | None,
     composite_risk_score: float | None,
     signal_contributions: list[dict] | None = None,
-    primary_risk_driver: str | None = None,
 ) -> str:
     return f"""
 You are AI Data Steward Copilot.
@@ -834,23 +833,14 @@ Write one concise steward-facing explanation for an MDM match decision.
 Domain: {domain}
 AI Decision: {ai_decision}
 Recommended Action: {recommended_action}
-Decision Confidence: {confidence}/100
+Confidence: {confidence}
 Risk Flag: {risk_flag}
 Triggered Rules: {triggered_rules}
 Primary Signal: {primary_signal}
 Composite Risk Score: {composite_risk_score}
-Primary Risk Driver: {primary_risk_driver}
 Signal Contributions: {signal_contributions or []}
 
 Requirements:
-- If Domain is ORGANIZATION and Primary Risk Driver is ORGANIZATION_HIERARCHY_CONFLICT, state that a deterministic parent-child hierarchy relationship has been confirmed and that the records are distinct organization hierarchy nodes.
-- Do not describe the hierarchy conflict as likely, possible, potential, suspected, or requiring further identity determination.
-- Explain that BLOCK_MERGE protects the mastered organization hierarchy because merging a parent and child would collapse separate hierarchy nodes and corrupt entity identity.
-- Do not instruct the steward to determine whether the organizations are distinct. Steward review may validate or override the governance action, but entity distinctness has already been established by the hierarchy relationship.
-- Decision Confidence above is the authoritative overall confidence for this match decision.
-- If you mention confidence, use Decision Confidence exactly as provided on the 0-100 scale.
-- Signal scores, signal weights, and signal contributions are individual evidence measurements, not overall decision confidence.
-- Never describe a signal score, signal weight, or signal contribution as the overall confidence.
 - 1 to 2 sentences only.
 - Plain English for a data steward.
 - Explain why the steward should trust, review, or block the decision.

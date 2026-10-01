@@ -29,8 +29,6 @@ from . import search_routes
 from . import auth_routes
 
 from app.api.routes.bigquery_routes import router as bigquery_router
-from app.api.routes.snowflake_routes import router as snowflake_router
-from app.api.routes.azure_sql_routes import router as azure_sql_router
 
 
 router = APIRouter()
@@ -39,8 +37,6 @@ router.include_router(onedrive_routes.router)
 router.include_router(google_sheets_routes.router)
 router.include_router(databricks_routes.router)
 router.include_router(bigquery_router)
-router.include_router(snowflake_router)
-router.include_router(azure_sql_router)
 router.include_router(csv_routes.router)
 router.include_router(oauth_routes.router)
 router.include_router(connection_routes.router)

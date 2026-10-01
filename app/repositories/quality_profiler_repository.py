@@ -86,6 +86,9 @@ class QualityProfilerRepository:
             project_id STRING,
             dataset_id STRING,
             table_id STRING,
+            database_name STRING,
+            schema_name STRING,
+            table_name STRING,
             spreadsheet_id STRING,
             drive_id STRING,
             item_id STRING,
@@ -105,7 +108,10 @@ class QualityProfilerRepository:
         table = self.client.get_table(self.profile_source_context_table_id)
         fields = {field.name: field for field in table.schema}
 
-        for column_name in ("project_id", "dataset_id", "table_id"):
+        for column_name in (
+            "project_id", "dataset_id", "table_id",
+            "database_name", "schema_name", "table_name",
+        ):
             if column_name not in fields:
                 self.client.query(
                     f"ALTER TABLE `{self.profile_source_context_table_id}` "
@@ -133,6 +139,9 @@ class QualityProfilerRepository:
         project_id: str | None = None,
         dataset_id: str | None = None,
         table_id: str | None = None,
+        database_name: str | None = None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
         spreadsheet_id: str | None = None,
         drive_id: str | None = None,
         item_id: str | None = None,
@@ -153,6 +162,8 @@ class QualityProfilerRepository:
             "GOOGLE_SHEETS",
             "ONEDRIVE_EXCEL",
             "BIGQUERY",
+            "SNOWFLAKE",
+            "AZURE_SQL",
         }:
             raise ValueError("Unsupported profile source context type.")
         if not normalized_connection_id:
@@ -160,6 +171,9 @@ class QualityProfilerRepository:
         normalized_project_id = str(project_id or "").strip() or None
         normalized_dataset_id = str(dataset_id or "").strip() or None
         normalized_table_id = str(table_id or "").strip() or None
+        normalized_database_name = str(database_name or "").strip() or None
+        normalized_schema_name = str(schema_name or "").strip() or None
+        normalized_table_name = str(table_name or "").strip() or None
 
         normalized_spreadsheet_id = str(spreadsheet_id or "").strip() or None
         normalized_drive_id = str(drive_id or "").strip() or None
@@ -186,6 +200,18 @@ class QualityProfilerRepository:
             raise ValueError(
                 "project_id, dataset_id, and table_id are required for BigQuery."
             )
+        if normalized_source_type == "SNOWFLAKE" and not all(
+            [normalized_database_name, normalized_schema_name, normalized_table_name]
+        ):
+            raise ValueError(
+                "database_name, schema_name, and table_name are required for Snowflake."
+            )
+        if normalized_source_type == "AZURE_SQL" and not all(
+            [normalized_database_name, normalized_schema_name, normalized_table_name]
+        ):
+            raise ValueError(
+                "database_name, schema_name, and table_name are required for Azure SQL."
+            )
 
         self._ensure_profile_source_context_table()
 
@@ -203,6 +229,9 @@ class QualityProfilerRepository:
             project_id = @project_id,
             dataset_id = @dataset_id,
             table_id = @table_id,
+            database_name = @database_name,
+            schema_name = @schema_name,
+            table_name = @table_name,
             spreadsheet_id = @spreadsheet_id,
             drive_id = @drive_id,
             item_id = @item_id,
@@ -212,11 +241,13 @@ class QualityProfilerRepository:
         WHEN NOT MATCHED THEN INSERT (
             organization_id, profile_run_id, source_type, connection_id,
             project_id, dataset_id, table_id,
+            database_name, schema_name, table_name,
             spreadsheet_id, drive_id, item_id, sheet_name, header_row,
             created_at, updated_at
         ) VALUES (
             @organization_id, @profile_run_id, @source_type, @connection_id,
             @project_id, @dataset_id, @table_id,
+            @database_name, @schema_name, @table_name,
             @spreadsheet_id, @drive_id, @item_id, @sheet_name, @header_row,
             CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
         )
@@ -230,6 +261,9 @@ class QualityProfilerRepository:
                 bigquery.ScalarQueryParameter("project_id", "STRING", normalized_project_id),
                 bigquery.ScalarQueryParameter("dataset_id", "STRING", normalized_dataset_id),
                 bigquery.ScalarQueryParameter("table_id", "STRING", normalized_table_id),
+                bigquery.ScalarQueryParameter("database_name", "STRING", normalized_database_name),
+                bigquery.ScalarQueryParameter("schema_name", "STRING", normalized_schema_name),
+                bigquery.ScalarQueryParameter("table_name", "STRING", normalized_table_name),
                 bigquery.ScalarQueryParameter("spreadsheet_id", "STRING", normalized_spreadsheet_id),
                 bigquery.ScalarQueryParameter("drive_id", "STRING", normalized_drive_id),
                 bigquery.ScalarQueryParameter("item_id", "STRING", normalized_item_id),
@@ -1952,6 +1986,162 @@ class QualityProfilerRepository:
             dict(row)
             for row in rows
         ]
+
+    def get_remediation_evidence(
+        self,
+        *,
+        organization_id: str,
+        profile_run_id: str,
+        rule_id: str,
+        field_name: str,
+        expected_count: int,
+        max_rows: int = 500,
+    ) -> list[dict[str, Any]]:
+        """
+        Return complete tenant-scoped persisted finding evidence required to
+        construct a deterministic governed remediation artifact.
+
+        Unlike get_finding_evidence(), this method is not for AI prompting or
+        steward-facing sampling. It is server-side remediation evidence and
+        fails closed when the persisted evidence is incomplete or ambiguous.
+        """
+        organization_id = self._require_organization_id(
+            organization_id
+        )
+
+        normalized_profile_run_id = str(
+            profile_run_id or ""
+        ).strip()
+
+        normalized_rule_id = str(
+            rule_id or ""
+        ).strip().upper()
+
+        normalized_field_name = str(
+            field_name or ""
+        ).strip().lower()
+
+        safe_expected_count = int(expected_count)
+        safe_max_rows = int(max_rows)
+
+        if not normalized_profile_run_id:
+            raise ValueError("profile_run_id is required.")
+
+        if not normalized_rule_id:
+            raise ValueError("rule_id is required.")
+
+        if not normalized_field_name:
+            raise ValueError("field_name is required.")
+
+        if safe_expected_count < 1:
+            raise ValueError(
+                "expected_count must be at least 1."
+            )
+
+        if safe_max_rows < 1:
+            raise ValueError(
+                "max_rows must be at least 1."
+            )
+
+        if safe_expected_count > safe_max_rows:
+            raise ValueError(
+                "Deterministic remediation exceeds the governed "
+                f"evidence limit of {safe_max_rows} findings."
+            )
+
+        sql = f"""
+        SELECT
+            finding_id,
+            source_row_id,
+            record_id,
+            field_name,
+            rule_id,
+            dimension,
+            severity,
+            observed_value,
+            proposed_value
+        FROM `{self.findings_table_id}`
+        WHERE organization_id = @organization_id
+        AND profile_run_id = @profile_run_id
+        AND UPPER(TRIM(rule_id)) = @rule_id
+        AND LOWER(TRIM(field_name)) = @field_name
+        ORDER BY source_row_id, finding_id
+        """
+
+        params = [
+            bigquery.ScalarQueryParameter(
+                "organization_id",
+                "STRING",
+                organization_id,
+            ),
+            bigquery.ScalarQueryParameter(
+                "profile_run_id",
+                "STRING",
+                normalized_profile_run_id,
+            ),
+            bigquery.ScalarQueryParameter(
+                "rule_id",
+                "STRING",
+                normalized_rule_id,
+            ),
+            bigquery.ScalarQueryParameter(
+                "field_name",
+                "STRING",
+                normalized_field_name,
+            ),
+        ]
+
+        rows = [
+            dict(row)
+            for row in self.client.query(
+                sql,
+                job_config=bigquery.QueryJobConfig(
+                    query_parameters=params
+                ),
+            ).result()
+        ]
+
+        if len(rows) != safe_expected_count:
+            raise ValueError(
+                "Deterministic remediation evidence is incomplete. "
+                f"Expected {safe_expected_count} persisted findings "
+                f"but found {len(rows)}."
+            )
+
+        for row in rows:
+            observed_value = row.get("observed_value")
+            proposed_value = row.get("proposed_value")
+
+            if observed_value is None:
+                raise ValueError(
+                    "Deterministic remediation evidence contains a "
+                    "finding without observed_value."
+                )
+
+            if proposed_value is None:
+                raise ValueError(
+                    "Deterministic remediation evidence contains a "
+                    "finding without proposed_value."
+                )
+
+        observed_to_proposed: dict[str, str] = {}
+
+        for row in rows:
+            observed = str(row["observed_value"])
+            proposed = str(row["proposed_value"])
+
+            existing = observed_to_proposed.get(observed)
+
+            if existing is not None and existing != proposed:
+                raise ValueError(
+                    "Deterministic remediation evidence contains "
+                    "conflicting proposed values for the same "
+                    "observed value."
+                )
+
+            observed_to_proposed[observed] = proposed
+
+        return rows
     
     def get_profile_rule_compliance_inputs(
         self,
@@ -2588,6 +2778,9 @@ class QualityProfilerRepository:
                 source_context.project_id,
                 source_context.dataset_id,
                 source_context.table_id,
+                source_context.database_name,
+                source_context.schema_name,
+                source_context.table_name,
                 source_context.spreadsheet_id,
                 source_context.drive_id,
                 source_context.item_id,

@@ -32,6 +32,16 @@ HIGH_RISK_CONFLICTS = {
         "sap_business_partner_id",
         "routing_number",
     },
+
+        "ORGANIZATION": {
+        "organization_entity_id",
+        "organization_code",
+    },
+    "LOCATION": {
+        "location_id",
+        "site_id",
+        "location_code",
+    },
 }
 
 MEDIUM_RISK_CONFLICTS = {
@@ -69,6 +79,20 @@ MEDIUM_RISK_CONFLICTS = {
         "email",
         "phone_number",
     },
+
+        "ORGANIZATION": {
+        "organization_name",
+        "organization_type",
+        "parent_organization_id",
+        "organization_status",
+    },
+    "LOCATION": {
+        "location_name",
+        "location_type",
+        "location_address",
+        "parent_location_id",
+        "organization_entity_id",
+    },
 }
 
 RISK_DRIVER_RANK = {
@@ -90,13 +114,29 @@ RISK_DRIVER_RANK = {
     "dob": 14,
     "dob_invalid_format": 15,
 
-    "account_number_last4": 20,
-    "institution_name": 21,
-    "account_type": 22,
-    "currency": 23,
-    "account_status": 24,
+    "organization_hierarchy": 16,
+    "organization_entity_id": 17,
+    "organization_code": 18,
+    "location_id": 19,
+    "site_id": 20,
+    "location_code": 21,
 
-    "name": 30,
+    "account_number_last4": 21,
+    "institution_name": 22,
+    "account_type": 23,
+    "currency": 24,
+    "account_status": 25,
+
+    "parent_organization_id": 26,
+    "organization_type": 27,
+    "organization_status": 28,
+    "organization_name": 29,
+    "parent_location_id": 30,
+    "location_name": 31,
+    "location_type": 32,
+    "location_address": 33,
+
+    "name": 34,
     "product_variant": 35,
     "item_category": 36,
     "product_name": 37,
@@ -206,6 +246,130 @@ def _conflicts(
         and a != b
     )
 
+def _location_signal_conflict(
+    field: str,
+    record_a: Any,
+    record_b: Any,
+    signal_packets: list[Dict[str, Any]] | None,
+) -> bool:
+    """
+    Evaluate Location conflicts using authoritative entity-resolution
+    signal bands when a corresponding signal exists.
+
+    Falls back to deterministic field comparison when no authoritative
+    signal is available for the field.
+    """
+    signal_map = {
+        "location_name": "location_name_similarity",
+        "location_address": "address_similarity",
+        "parent_location_id": "parent_location_id_match",
+        "organization_entity_id": "organization_entity_id_match",
+    }
+
+    signal_name = signal_map.get(field)
+
+    if not signal_name or not signal_packets:
+        return _conflicts(
+            record_a,
+            record_b,
+            field,
+        )
+
+    for signal in signal_packets:
+        if (
+            str(
+                signal.get("signal_name")
+                or ""
+            ).lower()
+            != signal_name
+        ):
+            continue
+
+        evidence_available = signal.get(
+            "evidence_available",
+            True,
+        )
+
+        signal_band = str(
+            signal.get("signal_band")
+            or ""
+        ).strip().upper()
+
+        # Missing evidence is not conflicting evidence.
+        if not evidence_available or signal_band == "UNAVAILABLE":
+            return False
+
+        # The entity-resolution engine is authoritative
+        # for similarity-aware Location evidence.
+        if signal_band in {
+            "EXACT",
+            "STRONG",
+            "SIMILAR",
+        }:
+            return False
+
+        if signal_band in {
+            "DIFFERENT",
+            "CONFLICT",
+        }:
+            return True
+
+        # Unknown/legacy band: preserve existing behavior.
+        return _conflicts(
+            record_a,
+            record_b,
+            field,
+        )
+
+    return _conflicts(
+        record_a,
+        record_b,
+        field,
+    )
+
+def _organization_hierarchy_conflict(
+    record_a: Any,
+    record_b: Any,
+) -> bool:
+    """
+    Return True when one organization is explicitly the parent
+    of the other organization.
+
+    A parent/child relationship is deterministic evidence that
+    the two records represent distinct hierarchy nodes and must
+    not be merged as the same organization entity.
+    """
+    a_entity_id = _val(
+        record_a,
+        "organization_entity_id",
+    )
+    b_entity_id = _val(
+        record_b,
+        "organization_entity_id",
+    )
+
+    a_parent_id = _val(
+        record_a,
+        "parent_organization_id",
+    )
+    b_parent_id = _val(
+        record_b,
+        "parent_organization_id",
+    )
+
+    return bool(
+        (
+            a_parent_id
+            and b_entity_id
+            and a_parent_id == b_entity_id
+        )
+        or (
+            b_parent_id
+            and a_entity_id
+            and b_parent_id == a_entity_id
+        )
+    )
+
 
 def _has_invalid_dob_signal(
     signal_packets: list[
@@ -287,14 +451,31 @@ def evaluate_risk(
     ]
 
     medium_conflicts = [
-        field
-        for field in medium_fields
-        if _conflicts(
+    field
+    for field in medium_fields
+    if (
+        _location_signal_conflict(
+            field,
+            record_a,
+            record_b,
+            signal_packets,
+        )
+        if normalized_domain == "LOCATION"
+        else _conflicts(
             record_a,
             record_b,
             field,
         )
-    ]
+    )
+]
+
+    organization_hierarchy_conflict = (
+        normalized_domain == "ORGANIZATION"
+        and _organization_hierarchy_conflict(
+            record_a,
+            record_b,
+        )
+    )
 
     risk_score = 0
 
@@ -303,8 +484,19 @@ def evaluate_risk(
         + medium_conflicts
     )
 
+    if organization_hierarchy_conflict:
+        risk_drivers.append(
+            "organization_hierarchy"
+        )
+
     if high_conflicts:
         risk_score += 70
+
+    if organization_hierarchy_conflict:
+        risk_score = max(
+            risk_score,
+            90,
+        )
 
     if medium_conflicts:
         risk_score += 20
