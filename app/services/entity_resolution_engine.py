@@ -5,6 +5,27 @@ from difflib import SequenceMatcher
 from rapidfuzz.distance import JaroWinkler
 from typing import Any, Optional
 from app.services.similarity_engine import (SimilarityEngine,email_domain_trust,)
+from app.services.entity_resolution.domain_scorers.location import score_location
+from app.services.entity_resolution.domain_scorers.organization import (
+    score_organization,
+)
+from app.services.entity_resolution.domain_scorers.patient import score_patient
+
+from app.services.entity_resolution.domain_scorers.provider import score_provider
+from app.services.entity_resolution.domain_scorers.supplier import score_supplier
+from app.services.entity_resolution.domain_scorers.product import score_product
+from app.services.entity_resolution.domain_scorers.customer import score_customer
+from app.services.entity_resolution.domain_scorers.banking import score_banking
+from app.services.entity_resolution.signal_builder import (
+    build_signal,
+    build_signal_contributions,
+    primary_signal_from_contributions,
+)
+
+from app.services.entity_resolution.evidence_timeline import (
+    build_evidence_timeline,
+)
+
 
 from app.api.schemas import MatchExplainRequest
 from datetime import datetime
@@ -938,2012 +959,230 @@ class EntityResolutionEngine:
         organization_status_score = 0.0
                 
         if normalized_domain == "CUSTOMER":
-
-            customer_full_name_a = (
-            getattr(record_a, "full_name", None)
-            or " ".join(
-                [
-                    getattr(record_a, "first_name", "") or "",
-                    getattr(record_a, "last_name", "") or "",
-                ]
-            ).strip()
-        )
-
-            customer_full_name_b = (
-            getattr(record_b, "full_name", None)
-            or " ".join(
-                [
-                    getattr(record_b, "first_name", "") or "",
-                    getattr(record_b, "last_name", "") or "",
-                ]
-            ).strip()
-)
-
-            full_name_a = customer_full_name_a.strip().lower()
-            full_name_b = customer_full_name_b.strip().lower()
-
-            name_similarity_score = SequenceMatcher(
-            None,
-            full_name_a,
-            full_name_b,
-        )   .ratio()
-
-            customer_phone_a = getattr(
-            record_a,
-            "phone_number",
-            None,
-        )
-
-            customer_phone_b = getattr(
-                record_b,
-                "phone_number",
-                None,
+            customer_result = score_customer(
+                engine=self,
+                record_a=record_a,
+                record_b=record_b,
+                domain=domain,
+                domain_weights=domain_weights,
+                member_id_score=member_id_score,
+                record_a_id=record_a_id,
+                record_b_id=record_b_id,
+                dob_score=dob_score,
+                email_score=email_score,
+                email_match_level=email_match_level,
+                domain_trust_score=domain_trust_score,
+                address_score=address_score,
+                source_score=source_score,
+                learning_score=learning_score,
+                risk_multiplier=risk_multiplier,
+                address_match_insight=address_match_insight,
             )
 
-            phone_score = SimilarityEngine.phone_similarity(
-                customer_phone_a,
-                customer_phone_b,
-            )
+            signals = customer_result["signals"]
+            match_score = customer_result["match_score"]
+            raw_entity_score = customer_result["raw_entity_score"]
 
-            phone_weight = (
-                domain_weights.get(
-                    "phone_match",
-                    0.0,
-                )
-                if phone_score is not None
-                else 0.0
-            )
+            member_id_score = customer_result["member_id_score"]
+            phone_score = customer_result["phone_score"]
+            dob_score = customer_result["dob_score"]
+            email_score = customer_result["email_score"]
+            address_score = customer_result["address_score"]
 
-            phone_score_value = (
-                phone_score
-                if phone_score is not None
-                else 0.0
-            )
-
-            match_score = (
-            member_id_score
-            * domain_weights.get(
-                "member_id_match",
-                0.0,
-            )
-            + phone_score_value
-            * domain_weights.get(
-                "phone_match",
-                0.0,
-            )
-            + name_similarity_score
-            * domain_weights.get(
-                "name_similarity",
-                0.0,
-            )
-            + dob_score
-            * domain_weights.get(
-                "dob_match",
-                0.0,
-            )
-            + email_score
-            * domain_weights.get(
-                "email_match",
-                0.0,
-            )
-            + address_score
-            * domain_weights.get(
-                "address_similarity",
-                0.0,
-            )
-            + source_score
-            * domain_weights.get(
-                "source_trust",
-                0.0,
-            )
-            + learning_score
-            * domain_weights.get(
-                "steward_learning",
-                0.0,
-            )
-        )
-            if (
-            dob_score == 1.0
-            and address_score >= 0.95
-            and name_similarity_score >= 0.85
-            ):
-                match_score = max(match_score, 0.82)
-
-            elif (
-            dob_score == 1.0
-            and name_similarity_score >= 0.90
-        ):
-                match_score = max(match_score, 0.78)
-            
-            signals.append(
-                self._build_signal(
-                    "name_similarity",
-                    name_similarity_score,
-                    domain_weights.get("name_similarity", 0.0),
-                    (
-                        "Names align closely across records."
-                        if name_similarity_score >= 0.90
-                        else "Names partially align."
-                ),
-        )
-    )
-
-            signals.append(
-                self._build_signal(
-                    "member_id_match",
-                    member_id_score,
-                    domain_weights.get("member_id_match", 0.0),
-                    self._member_id_detail(
-                        record_a_id,
-                        record_b_id,
-                    ),
-                )
-        )
-
-            signals.append(
-                self._build_signal(
-                    "phone_match",
-                    (
-                        phone_score
-                        if phone_score is not None
-                        else 0.5
-                    ),
-                    phone_weight,
-                    self._phone_detail(
-                        customer_phone_a,
-                        customer_phone_b,
-                    ),
-                    signal_type="deterministic",
-                )
-            )
-
-            signals.append(
-                self._build_signal(
-                    "dob_match",
-                    dob_score,
-                    domain_weights.get("dob_match", 0.0),
-                    self._dob_detail(
-                        record_a.dob,
-                        record_b.dob,
-                    ),
-                )
-            )
-
-            signals.append(
-                self._build_signal(
-                    "address_similarity",
-                    address_score,
-                    domain_weights.get("address_similarity", 0.0),
-                    self._address_detail(
-                            record_a.address,
-                            record_b.address,
-                            address_score,
-                            domain,
-                            address_match_insight,
-                        ),
-                        signal_type="probabilistic",
-                    )
-            )
-
-            signals.append(
-                self._build_signal(
-                    "email_match",
-                    email_score,
-                    domain_weights.get("email_match", 0.0),
-                    self._email_detail(
-                            record_a.email,
-                            record_b.email,
-                        ),
-                        match_level=email_match_level,
-                        domain_trust=domain_trust_score,
-                        signal_type="probabilistic",
-                )
-            )
-
-            signals.append(
-                self._build_signal(
-                    "source_trust",
-                    source_score,
-                    domain_weights.get("source_trust", 0.0),
-                    self._source_detail(
-                        record_a.source_system,
-                        record_b.source_system,
-                    ),
-                    signal_type="probabilistic",
-                )
-            )
-            raw_entity_score = round(match_score * risk_multiplier, 4)
 
         elif normalized_domain == "PRODUCT":
-
-            signals = []
-
-            product_id_a = getattr(record_a, "product_id", None)
-            product_id_b = getattr(record_b, "product_id", None)
-
-            product_name_a = getattr(record_a, "product_name", None)
-            product_name_b = getattr(record_b, "product_name", None)
-
-            product_variant_a = getattr(record_a, "product_variant", None)
-            product_variant_b = getattr(record_b, "product_variant", None)
-
-            item_category_a = getattr(record_a, "item_category", None)
-            item_category_b = getattr(record_b, "item_category", None)
-
-
-            gtin_a = getattr(record_a, "gtin", None)
-            gtin_b = getattr(record_b, "gtin", None)
-
-            sku_a = getattr(record_a, "sku", None)
-            sku_b = getattr(record_b, "sku", None)
-
-            product_id_score = self._similarity(product_id_a, product_id_b)
-
-            product_name_score = self._similarity(product_name_a, product_name_b)
-            
-            gtin_score = (
-                    1.0
-                    if self._normalize_text(gtin_a)
-                    and self._normalize_text(gtin_a) == self._normalize_text(gtin_b)
-                    else 0.0
-                )
-
-            sku_score = self._similarity(sku_a, sku_b)
-
-            item_category_score = (
-                    1.0
-                    if self._normalize_text(item_category_a)
-                    and self._normalize_text(item_category_a)
-                    == self._normalize_text(item_category_b)
-                    else 0.0
-)
-            product_variant_score = self._similarity(product_variant_a, product_variant_b)
-
-            attribute_similarity_score = self._product_attribute_similarity(
-                    record_a,
-                    record_b,
-                )
-
-    # Use product name score as the domain-specific name signal
-            name_score = product_name_score
-
-            match_score = (
-                product_id_score * domain_weights.get("product_id_match", 0.0)
-                    + gtin_score * domain_weights.get("gtin_match", 0.0)
-                    + sku_score * domain_weights.get("sku_match", 0.0)
-                    + product_name_score * domain_weights.get("name_similarity", 0.0)
-                    + product_variant_score * domain_weights.get("product_variant_similarity", 0.0)
-                    + item_category_score * domain_weights.get("item_category_similarity",0.0,)
-                    + attribute_similarity_score * domain_weights.get("attribute_similarity",
-                    0.0,
-                )
-                + source_score * domain_weights.get("source_trust", 0.0)
-                + learning_score * domain_weights.get("steward_learning", 0.0)
+            product_result = score_product(
+                engine=self,
+                record_a=record_a,
+                record_b=record_b,
+                domain_weights=domain_weights,
+                source_score=source_score,
+                learning_score=learning_score,
+                risk_multiplier=risk_multiplier,
             )
 
-            match_score = round(match_score, 4)
+            signals = product_result["signals"]
+            match_score = product_result["match_score"]
+            raw_entity_score = product_result["raw_entity_score"]
 
-            signals.append(
-                    self._build_signal(
-                        "product_id_match",
-                        product_id_score,
-                        domain_weights.get("product_id_match", 0.0),
-                        self._product_id_detail(product_id_a, product_id_b),
-                        signal_type="deterministic",
-                    )
-                )
-
-            signals.append(
-                    self._build_signal(
-                        "gtin_match",
-                        gtin_score,
-                        domain_weights.get("gtin_match", 0.0),
-                        self._gtin_detail(gtin_a, gtin_b),
-                        signal_type="deterministic",
-                    )
-                )
-
-            signals.append(
-                    self._build_signal(
-                        "sku_match",
-                        sku_score,
-                        domain_weights.get("sku_match", 0.0),
-                        self._sku_detail(sku_a, sku_b),
-                        signal_type="deterministic",
-                    )
-                )
-
-            signals.append(
-                    self._build_signal(
-                        "name_similarity",
-                        product_name_score,
-                        domain_weights.get("name_similarity", 0.0),
-                        self._name_detail(
-                            product_name_a,
-                            product_variant_a,
-                            product_name_b,
-                            product_variant_b,
-                        ),
-                signal_type="probabilistic",
-                )
-            )
-
-            signals.append(
-                    self._build_signal(
-                        "product_variant_similarity",
-                        product_variant_score,
-                        domain_weights.get("product_variant_similarity", 0.0),
-                        self._product_variant_detail(product_variant_a, product_variant_b),
-                        signal_type="probabilistic",
-                    )
-                )
-            
-            signals.append(
-                    self._build_signal(
-                        "item_category_similarity",
-                        item_category_score,
-                        domain_weights.get("item_category_similarity", 0.0),
-                        self._item_category_detail(item_category_a, item_category_b),
-                        signal_type="probabilistic",
-                    )
-                )
-
-          
-            signals.append(
-                    self._build_signal(
-                        "source_trust",
-                        source_score,
-                        domain_weights.get("source_trust", 0.0),
-                        self._source_detail(
-                            record_a.source_system,
-                            record_b.source_system,
-                        ),
-                        signal_type="probabilistic",
-                    )
-                )
-
-            raw_entity_score = round(match_score * risk_multiplier, 4)
+            product_id_score = product_result["product_id_score"]
+            gtin_score = product_result["gtin_score"]
+            sku_score = product_result["sku_score"]
+            name_score = product_result["name_score"]
+            product_variant_score = product_result["product_variant_score"]
+            item_category_score = product_result["item_category_score"]
+            attribute_similarity_score = product_result[
+                "attribute_similarity_score"
+            ]
             
 
         elif normalized_domain == "SUPPLIER":
-
-            signals = []
-
-            supplier_address_similarity_score = address_score
-
-            supplier_email_a = (
-                getattr(record_a, "contact_email", None)
-                or getattr(record_a, "email", None)
-                or ""
-            ).strip().lower()
-
-            supplier_email_b = (
-                getattr(record_b, "contact_email", None)
-                or getattr(record_b, "email", None)
-                or ""
-            ).strip().lower()
-
-
-            supplier_email_similarity = SimilarityEngine.email_similarity(
-                supplier_email_a,
-                supplier_email_b,
+            supplier_result = score_supplier(
+                engine=self,
+                record_a=record_a,
+                record_b=record_b,
+                domain=domain,
+                domain_weights=domain_weights,
+                supplier_id_score=supplier_id_score,
+                tax_id_score=tax_id_score,
+                supplier_id_a=supplier_id_a,
+                supplier_id_b=supplier_id_b,
+                address_score=address_score,
+                source_score=source_score,
+                risk_multiplier=risk_multiplier,
+                address_match_insight=address_match_insight,
             )
 
-            supplier_domain_a = (
-                supplier_email_a.split("@")[1]
-                if "@" in supplier_email_a
-                else ""
-            )
+            signals = supplier_result["signals"]
+            match_score = supplier_result["match_score"]
+            raw_entity_score = supplier_result["raw_entity_score"]
 
-            supplier_domain_b = (
-                supplier_email_b.split("@")[1]
-                if "@" in supplier_email_b
-                else ""
-            )
-
-            supplier_domain_trust_score = min(
-                email_domain_trust(supplier_domain_a),
-                email_domain_trust(supplier_domain_b),
-            )
-
-            email_score = min(
-                supplier_email_similarity * supplier_domain_trust_score,
-                1.0,
-            )
-            supplier_email_match_level = "DIFFERENT"
-
-            if email_score >= 0.99:
-                supplier_email_match_level = "EXACT"
-            elif email_score >= 0.90:
-                supplier_email_match_level = "SIMILAR"
-            elif email_score >= 0.70:
-                supplier_email_match_level = "FUZZY"
-
-            supplier_name_a = (
-            getattr(record_a, "supplier_name", None)
-            or getattr(record_a, "first_name", None)
-            or ""
-            )
-
-            supplier_name_b = (
-                getattr(record_b, "supplier_name", None)
-                or getattr(record_b, "first_name", None)
-                or ""
-            )
-
-            name_score = self._similarity(supplier_name_a, supplier_name_b)
-
-            supplier_address_a = (
-                getattr(record_a, "supplier_address", None)
-                or getattr(record_a, "address", None) or ""
-            )
-
-            supplier_address_b = (
-                getattr(record_b, "supplier_address", None)
-                or getattr(record_b, "address", None) or ""
-            )
-
-            supplier_address_similarity_score = SimilarityEngine.address_similarity(
-                supplier_address_a,
-                supplier_address_b,
-            )
-
-            supplier_name_a = (
-                getattr(record_a, "supplier_name", None)
-                or getattr(record_a, "first_name", None)
-                or ""
-            )
-
-            supplier_name_b = (
-                getattr(record_b, "supplier_name", None)
-                or getattr(record_b, "first_name", None)
-                or ""
-            )
-
-            name_score = self._similarity(
-                supplier_name_a,
-                supplier_name_b,
-            )
-
-            address_score = supplier_address_similarity_score
-
-
-
-
-   
-            match_score = (
-                supplier_id_score     * 0.40 +
-                tax_id_score          * 0.25 +
-                name_score            * 0.10 +
-                email_score           * 0.15 +
-                address_score         * 0.05 +
-                source_score          * 0.05
-            )
-            match_score = round(match_score, 2)
-
-            if supplier_id_score == 1.0 and tax_id_score == 1.0:
-                match_score = max(match_score, 0.98)
-
-            elif supplier_id_score == 1.0:
-                match_score = max(match_score, 0.94)
-
-            elif tax_id_score == 1.0:
-                match_score = max(match_score, 0.90)
-            
-
-            signals.append(
-                self._build_signal(
-                    "supplier_id_match",
-                    supplier_id_score,
-                    domain_weights.get("supplier_id_match", 0.0),
-                    self._supplier_id_detail(
-                    supplier_id_a,
-                    supplier_id_b,
-                ),
-            )
-        )
-            
-            signals.append(
-                self._build_signal(
-                    "name_similarity",
-                    name_score,
-                    domain_weights.get("name_similarity", 0.0),
-                    self._name_detail(
-                        supplier_name_a,
-                        None,
-                        supplier_name_b,
-                        None,
-                    ),
-                    signal_type="probabilistic",
-    )
-)
-
-            signals.append(
-                    self._build_signal(
-                        "address_similarity",
-                        supplier_address_similarity_score,
-                        domain_weights.get("address_similarity", 0.0),
-                        self._address_detail(
-                            supplier_address_a,
-                            supplier_address_b,
-                            supplier_address_similarity_score,
-                            domain,
-                            address_match_insight,
-                        ),
-
-                    signal_type="probabilistic",
-    )
-)
-
-
-            signals.append(
-                self._build_signal(
-                    "tax_id_match",
-                    tax_id_score,
-                    domain_weights.get("tax_id_match", 0.0),
-                    self._tax_id_detail(
-                        getattr(record_a, "tax_id", None),
-                        getattr(record_b, "tax_id", None),
-                    ),
-                )
-            )
-
-            signals.append(
-                self._build_signal(
-                    "contact_email_match",
-                    email_score,
-                    domain_weights.get("contact_email_match", 0.0),
-                    self._contact_email_detail(
-                        supplier_email_a,
-                        supplier_email_b,
-                    ),
-
-                    match_level=supplier_email_match_level,
-                    domain_trust=supplier_domain_trust_score,
-                    signal_type="probabilistic",
-                )
-            )
-            signals.append(
-                self._build_signal(
-                    "source_trust",
-                    source_score,
-                    domain_weights.get("source_trust", 0.0),
-                    self._source_detail(
-                        record_a.source_system,
-                        record_b.source_system,
-            ),
-        )
-)
-            raw_entity_score = round(match_score * risk_multiplier, 4)
+            supplier_id_score = supplier_result["supplier_id_score"]
+            tax_id_score = supplier_result["tax_id_score"]
+            name_score = supplier_result["name_score"]
+            email_score = supplier_result["email_score"]
+            address_score = supplier_result["address_score"]
         
         elif normalized_domain == "PROVIDER":
-            
-            signals = []
-
-      
-            provider_email_score = 0.0
-
-            specialty_score = self._similarity(
-            getattr(record_a, "specialty", None),
-            getattr(record_b, "specialty", None),
-        )
-
-            # ---------------------------------------------------------
-            # Provider Email Evaluation
-            # ---------------------------------------------------------
-
-            provider_email_match_level = "DIFFERENT"
-            provider_domain_trust_score = 0.0
-
-            provider_email_a = (
-            getattr(record_a, "provider_email", None)
-            or getattr(record_a, "email", None)
-            or ""
-            ).strip().lower()
-
-            provider_email_b = (
-                    getattr(record_b, "provider_email", None)
-                    or getattr(record_b, "email", None)
-                    or ""
-            ).strip().lower()
-
-        if provider_email_a and provider_email_b:
-                    
-            provider_email_similarity = (SimilarityEngine.email_similarity(
-                    provider_email_a,
-                    provider_email_b,
-                    )
-                )
-            provider_email_score = round(
-            provider_email_similarity,
-                    4,
-    )
-                
-
-            # -----------------------------------------------------
-            # Domain Extraction
-            # -----------------------------------------------------
-
-            provider_domain_a = ""
-            provider_domain_b = ""
-
-            if "@" in provider_email_a:
-                    provider_domain_a = provider_email_a.split("@")[1]
-
-            if "@" in provider_email_b:
-                        provider_domain_b = provider_email_b.split("@")[1]
-
-            # -----------------------------------------------------
-            # Domain Trust Evaluation
-            # -----------------------------------------------------
-
-            provider_domain_trust_a = email_domain_trust(provider_domain_a)
-            provider_domain_trust_b = email_domain_trust(provider_domain_b)
-
-                # Conservative trust model
-            provider_domain_trust_score = min(
-            provider_domain_trust_a,
-            provider_domain_trust_b,
-                )
-
-            # -----------------------------------------------------
-            # Composite Email Score
-            # -----------------------------------------------------
-
-            provider_email_score = min(
-                provider_email_similarity * provider_domain_trust_score,
-                1.0,
-                )
-
-            # -----------------------------------------------------
-            # Explainability Classification
-            # -----------------------------------------------------
-
-            if provider_email_score >= 0.99:
-                                provider_email_match_level = "EXACT"
-
-            elif provider_email_score >= 0.90:
-                                provider_email_match_level = "SIMILAR"
-
-            elif provider_email_score >= 0.70:
-                                provider_email_match_level = "FUZZY" 
-
-            provider_name_a = " ".join([
-                    getattr(record_a, "provider_first_name", "") or "",
-                    getattr(record_a, "provider_last_name", "") or "",
-                ]).strip()
-
-            provider_name_b = " ".join([
-                    getattr(record_b, "provider_first_name", "") or "",
-                    getattr(record_b, "provider_last_name", "") or "",
-                ]).strip()
-
-            name_score = self._similarity(
-                    provider_name_a,
-                    provider_name_b,
-                )
-                                
-                #specialty score----------------------------
-            specialty_score = self._similarity(
-                getattr(record_a, "specialty", None),
-                getattr(record_b, "specialty", None),
-                )
-                #----------------------------------------------------
-            provider_address_a = (
-                    getattr(record_a, "provider_address", None)
-                    or getattr(record_a, "address", None)
-                )
-
-            provider_address_b = (
-                    getattr(record_b, "provider_address", None)
-                    or getattr(record_b, "address", None)
-                )
-
-            address_score = self._similarity(
-                        provider_address_a,
-                        provider_address_b,
-                )
-            provider_phone_a = getattr(record_a, "phone_number", None)
-            provider_phone_b = getattr(record_b, "phone_number", None)
-
-            phone_score = SimilarityEngine.phone_similarity(
-            provider_phone_a,
-            provider_phone_b,
-        )
-
-            phone_weight = (
-                domain_weights.get("phone_match", 0.0)
-                if phone_score is not None
-                else 0.0
+            provider_result = score_provider(
+                engine=self,
+                record_a=record_a,
+                record_b=record_b,
+                domain=domain,
+                domain_weights=domain_weights,
+                provider_id_score=provider_id_score,
+                npi_score=npi_score,
+                source_score=source_score,
+                learning_score=learning_score,
+                risk_multiplier=risk_multiplier,
+                address_match_insight=address_match_insight,
             )
 
-            phone_score_value = (
-                phone_score
-                if phone_score is not None
-                else 0.0
-            )
+            signals = provider_result["signals"]
+            match_score = provider_result["match_score"]
+            raw_entity_score = provider_result["raw_entity_score"]
 
-            match_score = (
-                provider_id_score * domain_weights.get("provider_id_match", 0.0) +
-                npi_score * domain_weights.get("npi_match", 0.0) +
-                phone_score_value * domain_weights.get("phone_match", 0.0) +
-                name_score * domain_weights.get("name_similarity", 0.0) +
-                provider_email_score * domain_weights.get("provider_email_match", 0.0) +
-                address_score * domain_weights.get("address_similarity", 0.0) +
-                specialty_score * domain_weights.get("specialty_similarity", 0.0) +
-                source_score * domain_weights.get("source_trust", 0.0) +
-                learning_score * domain_weights.get("steward_learning", 0.0)
-        )
-
-   
-                # -----------------------------------------------------
-                # Signal Registration
-                # -----------------------------------------------------
-
-            signals.append(
-                    self._build_signal(
-                                "provider_id_match",
-                                provider_id_score,
-                                domain_weights.get("provider_id_match", 0.0),
-                                self._provider_id_detail(
-                                    getattr(record_a, "provider_id", None),
-                                    getattr(record_b, "provider_id", None),
-                                ),
-                            )
-                        )
-
-            signals.append(
-                    self._build_signal(
-                            "provider_email_match",
-                            provider_email_score,
-                            domain_weights.get("provider_email_match", 0.0),
-                            self._email_detail(
-                                provider_email_a,
-                                provider_email_b,
-                            ),
-                            match_level=provider_email_match_level,
-                            domain_trust=provider_domain_trust_score,
-                            signal_type="probabilistic",
-                        )
-                    )
-         
-            signals.append(
-                    self._build_signal(
-                            "address_similarity",
-                            address_score,
-                            domain_weights.get("address_similarity", 0.0),
-                            self._address_detail(
-                                provider_address_a,
-                                provider_address_b,
-                                address_score,
-                                domain,
-                                address_match_insight,
-                            ),
-                            signal_type="probabilistic",
-                        )
-                    )
-            
-            signals.append(
-                    self._build_signal(
-                            "phone_match",
-                            (
-                            phone_score
-                            if phone_score is not None
-                            else 0.5
-                            ),
-                            phone_weight,
-                            self._phone_detail(
-                                provider_phone_a,
-                                provider_phone_b,
-                                ),
-                            signal_type="probabilistic",
-                        )
-                    )
-                
-            signals.append(
-                        self._build_signal(
-                            "npi_match",
-                            npi_score,
-                            domain_weights.get("npi_match", 0.0),
-                            self._npi_detail(
-                                getattr(record_a, "npi", None),
-                                getattr(record_b, "npi", None),
-                            ),
-                            signal_type="deterministic",
-                        )
-                    )
-            signals.append(
-                    self._build_signal(
-                        "name_similarity",
-                        name_score,
-                        domain_weights.get("name_similarity", 0.0),
-                        self._name_detail(
-                            getattr(
-                                record_a,
-                                "provider_first_name",
-                                None,
-                            )
-                            or getattr(
-                                record_a,
-                                "first_name",
-                                None,
-                            ),
-                            getattr(
-                                record_b,
-                                "provider_first_name",
-                                None,
-                            )
-                            or getattr(
-                                record_b,
-                                "first_name",
-                                None,
-                            ),
-
-                            getattr(
-                                record_a,
-                                "provider_last_name",
-                                None,
-                            )
-                            or getattr(
-                                record_a,
-                                "last_name",
-                                None,
-                            ),
-
-                            getattr(
-                                record_b,
-                                "provider_last_name",
-                                None,
-                            )
-                            or getattr(
-                                record_b,
-                                "last_name",
-                                None,
-            ),
-        ),
-            signal_type="probabilistic",
-    )
-)
-            
-           
-            signals.append(
-                        self._build_signal(
-                            "source_trust",
-                            source_score,
-                            domain_weights.get("source_trust", 0.0),
-                            self._source_detail(
-                                record_a.source_system,
-                                record_b.source_system,
-                            ),
-                            signal_type="probabilistic",
-                        )
-                    )
-
-            # ----------------------------------------
-            # Composite Signal Reinforcement
-            # ----------------------------------------
-
-
-
-            if phone_score is None or phone_score != 0.0:
-                if (
-                    provider_email_score >= 1.0
-                    and name_score >= 0.85
-                    and address_score >= 0.90
-                ):
-                    match_score += 0.15
-
-                elif (
-                    name_score >= 0.90
-                    and address_score >= 0.90
-                ):
-                    match_score += 0.10
-
-                elif (
-                    provider_email_score >= 1.0
-                    and name_score >= 0.80
-                ):
-                    match_score += 0.08
-
-            # Prevent overflow
-            match_score = min(match_score, 1.0)
-                        
-            raw_entity_score = round(match_score * risk_multiplier,4,)
-            
+            provider_id_score = provider_result["provider_id_score"]
+            npi_score = provider_result["npi_score"]
+            phone_score = provider_result["phone_score"]
+            name_score = provider_result["name_score"]
+            provider_email_score = provider_result["provider_email_score"]
+            address_score = provider_result["address_score"]
+            specialty_score = provider_result["specialty_score"]
         elif normalized_domain == "PATIENT":
-
-            signals = []
-
-            patient_first_name_a = (
-                getattr(record_a, "patient_first_name", None)
-                or getattr(record_a, "first_name", None)
-            )
-            patient_first_name_b = (
-                getattr(record_b, "patient_first_name", None)
-                or getattr(record_b, "first_name", None)
-            )
-
-            patient_last_name_a = (
-                getattr(record_a, "patient_last_name", None)
-                or getattr(record_a, "last_name", None)
-            )
-            patient_last_name_b = (
-                getattr(record_b, "patient_last_name", None)
-                or getattr(record_b, "last_name", None)
+            patient_result = score_patient(
+                engine=self,
+                record_a=record_a,
+                record_b=record_b,
+                domain=domain,
+                domain_weights=domain_weights,
+                patient_id_score=patient_id_score,
+                source_score=source_score,
+                risk_multiplier=risk_multiplier,
+                address_match_insight=address_match_insight,
             )
 
-            patient_dob_a = (
-                getattr(record_a, "patient_dob", None)
-                or getattr(record_a, "dob", None)
-            )
-            patient_dob_b = (
-                getattr(record_b, "patient_dob", None)
-                or getattr(record_b, "dob", None)
-            )
+            signals = patient_result["signals"]
+            match_score = patient_result["match_score"]
+            raw_entity_score = patient_result["raw_entity_score"]
 
-            patient_email_a = (
-                getattr(record_a, "patient_email", None)
-                or getattr(record_a, "email", None)
-                or ""
-            ).strip().lower()
+            patient_id_score = patient_result["patient_id_score"]
+            phone_score = patient_result["phone_score"]
+            dob_score = patient_result["dob_score"]
+            name_score = patient_result["name_score"]
+            email_score = patient_result["email_score"]
+            address_score = patient_result["address_score"]
 
-            patient_email_b = (
-                getattr(record_b, "patient_email", None)
-                or getattr(record_b, "email", None)
-                or ""
-            ).strip().lower()
-
-            patient_address_a = (
-                getattr(record_a, "patient_address", None)
-                or getattr(record_a, "address", None)
-            )
-            patient_address_b = (
-                getattr(record_b, "patient_address", None)
-                or getattr(record_b, "address", None)
-            )
-            patient_phone_a = getattr(
-            record_a,
-            "phone_number",
-            None,
-            )
-
-            patient_phone_b = getattr(
-                record_b,
-                "phone_number",
-                None,
-            )
-
-            phone_score = SimilarityEngine.phone_similarity(
-                patient_phone_a,
-                patient_phone_b,
-            )
-
-            name_score = self._name_similarity(
-                patient_first_name_a,
-                patient_last_name_a,
-                patient_first_name_b,
-                patient_last_name_b,
-            )
-
-            dob_a_valid = self._is_valid_dob(patient_dob_a)
-            dob_b_valid = self._is_valid_dob(patient_dob_b)
-
-            if patient_dob_a and not dob_a_valid:
-                dob_score = 0.0
-                dob_detail = f"Record A DOB value '{patient_dob_a}' is invalid for a DOB field."
-
-            elif patient_dob_b and not dob_b_valid:
-                dob_score = 0.0
-                dob_detail = f"Record B DOB value '{patient_dob_b}' is invalid for a DOB field."
-
-            elif dob_a_valid and dob_b_valid:
-                dob_score = self._dob_match(patient_dob_a, patient_dob_b)
-                dob_detail = self._dob_detail(patient_dob_a, patient_dob_b)
-
-            else:
-                dob_score = 0.0
-                dob_detail = "DOB evidence is unavailable or incomplete."
-
-            patient_email_similarity = SimilarityEngine.email_similarity(
-                patient_email_a,
-                patient_email_b,
-            )
-
-            patient_domain_a = (
-                patient_email_a.split("@")[1]
-                if "@" in patient_email_a
-                else ""
-            )
-            patient_domain_b = (
-                patient_email_b.split("@")[1]
-                if "@" in patient_email_b
-                else ""
-            )
-
-            patient_domain_trust_score = min(
-                email_domain_trust(patient_domain_a),
-                email_domain_trust(patient_domain_b),
-            )
-
-            email_score = min(
-                patient_email_similarity * patient_domain_trust_score,
-                1.0,
-            )
-
-            email_match_level = "DIFFERENT"
-            if email_score >= 0.99:
-                email_match_level = "EXACT"
-            elif email_score >= 0.90:
-                email_match_level = "SIMILAR"
-            elif email_score >= 0.70:
-                email_match_level = "FUZZY"
-
-            address_score = SimilarityEngine.address_similarity(
-                patient_address_a,
-                patient_address_b,
-            )
-
-            patient_identity_score = (
-                patient_id_score if patient_id_score is not None else 0.0
-            )
-           
-            phone_weight = (
-                domain_weights.get("phone_match", 0.0)
-                if phone_score is not None
-                else 0.0
-            )
-
-            phone_score = phone_score or 0.0
-            match_score = (
-                patient_identity_score * 0.20
-                + phone_score * phone_weight
-                + dob_score * 0.25
-                + name_score * 0.20
-                + address_score * 0.15
-                + email_score * 0.10
-            )
-
-            total_weight = (
-                0.20 +      # patient id
-                phone_weight +
-                0.25 +      # dob
-                0.20 +      # name
-                0.15 +      # address
-                0.10        # email
-            )
-
-            match_score /= total_weight
-
-            match_score = round(min(match_score, 0.95), 4)
-            raw_entity_score = match_score
-
-            if patient_identity_score >= 0.90:
-                match_score = min(match_score + 0.10, 1.0)
-
-            if (
-                patient_identity_score >= 0.90
-                and dob_score == 1.0
-                and name_score >= 0.90
-                and address_score >= 0.95
-            ):
-                match_score = min(max(match_score, 0.90), 0.92)
-
-            elif (
-                patient_identity_score >= 0.90
-                and dob_score == 1.0
-                and name_score >= 0.85
-            ):
-                                
-                match_score = min(max(match_score, 0.86), 0.90)
-
-            match_score = min(match_score, 0.92)
-
-            raw_entity_score = round(match_score * risk_multiplier, 4)
-
-
-            signals.append(
-                self._build_signal(
-                    "patient_id_match",
-                    patient_id_score,
-                    domain_weights.get("patient_id_match", 0.0),
-                    self._patient_id_detail(
-                        getattr(record_a, "patient_id", None),
-                        getattr(record_b, "patient_id", None),
-                    ),
-                    signal_type="deterministic",
-                )
-            )
-
-            signal_score = (
-                phone_score
-                if phone_score is not None
-                else 0.5
-            )
-
-            signal_weight = (
-                domain_weights.get("phone_match",0.0)
-                if phone_score is not None
-                else 0.0
-            )
-
-            signals.append(
-                self._build_signal(
-                    "phone_match",
-                    signal_score,
-                    signal_weight,
-                    self._phone_detail(
-                        patient_phone_a,
-                        patient_phone_b,
-                    ),
-                    signal_type="deterministic",
-                )
-            )
-
-            signals.append(
-                self._build_signal(
-                    "dob_match",
-                    dob_score,
-                    domain_weights.get("dob_match", 0.0),
-                    dob_detail,
-                    signal_type="deterministic",
-                )
-            )
-
-            signals.append(
-                self._build_signal(
-                    "name_similarity",
-                    name_score,
-                    domain_weights.get("name_similarity", 0.0),
-                    self._name_detail(
-                        patient_first_name_a,
-                        patient_last_name_a,
-                        patient_first_name_b,
-                        patient_last_name_b,
-                    ),
-                    signal_type="probabilistic",
-                )
-            )
-
-            signals.append(
-                self._build_signal(
-                    "email_match",
-                    email_score,
-                    domain_weights.get("email_match", 0.0),
-                    self._email_detail(patient_email_a, patient_email_b),
-                    match_level=email_match_level,
-                    domain_trust=patient_domain_trust_score,
-                    signal_type="probabilistic",
-                )
-            )
-
-            signals.append(
-                self._build_signal(
-                    "address_similarity",
-                    address_score,
-                    domain_weights.get("address_similarity", 0.0),
-                    self._address_detail(
-                        patient_address_a,
-                        patient_address_b,
-                        address_score,
-                        domain,
-                        address_match_insight,
-                    ),
-                    signal_type="probabilistic",
-                )
-            )
-
-            signals.append(
-                self._build_signal(
-                    "source_trust",
-                    source_score,
-                    domain_weights.get("source_trust", 0.0),
-                    self._source_detail(
-                        record_a.source_system,
-                        record_b.source_system,
-                    ),
-                    signal_type="probabilistic",
-                )
-            )
-
-            raw_entity_score = round(match_score * risk_multiplier, 4)
         elif normalized_domain == "BANKING":
-
-            signals = []
-
-            account_id_a = getattr(
-                record_a,
-                "account_id",
-                None,
-            )
-            account_id_b = getattr(
-                record_b,
-                "account_id",
-                None,
+            banking_result = score_banking(
+                engine=self,
+                record_a=record_a,
+                record_b=record_b,
+                domain_weights=domain_weights,
+                source_score=source_score,
+                learning_score=learning_score,
+                risk_multiplier=risk_multiplier,
             )
 
-            banking_customer_id_a = getattr(
-                record_a,
-                "banking_customer_id",
-                None,
-            )
-            banking_customer_id_b = getattr(
-                record_b,
-                "banking_customer_id",
-                None,
-            )
+            signals = banking_result["signals"]
+            match_score = banking_result["match_score"]
+            raw_entity_score = banking_result["raw_entity_score"]
 
-            sap_bp_id_a = getattr(
-                record_a,
-                "sap_business_partner_id",
-                None,
-            )
-            sap_bp_id_b = getattr(
-                record_b,
-                "sap_business_partner_id",
-                None,
-            )
+            account_id_score = banking_result["account_id_score"]
+            customer_id_score = banking_result["customer_id_score"]
+            sap_business_partner_id_score = banking_result[
+                "sap_business_partner_id_score"
+            ]
+            routing_number_score = banking_result[
+                "routing_number_score"
+            ]
+            account_number_last4_score = banking_result[
+                "account_number_last4_score"
+            ]
+            institution_name_score = banking_result[
+                "institution_name_score"
+            ]
+            account_type_score = banking_result[
+                "account_type_score"
+            ]
+            currency_score = banking_result["currency_score"]
+            email_score = banking_result["email_score"]
+            phone_score = banking_result["phone_score"]
 
-            routing_number_a = getattr(
-                record_a,
-                "routing_number",
-                None,
-            )
-            routing_number_b = getattr(
-                record_b,
-                "routing_number",
-                None,
-            )
-
-            account_last4_a = getattr(
-                record_a,
-                "account_number_last4",
-                None,
-            )
-            account_last4_b = getattr(
-                record_b,
-                "account_number_last4",
-                None,
-            )
-
-            institution_name_a = getattr(
-                record_a,
-                "institution_name",
-                None,
-            )
-            institution_name_b = getattr(
-                record_b,
-                "institution_name",
-                None,
-            )
-
-            account_type_a = getattr(
-                record_a,
-                "account_type",
-                None,
-            )
-            account_type_b = getattr(
-                record_b,
-                "account_type",
-                None,
-            )
-
-            currency_a = getattr(
-                record_a,
-                "currency",
-                None,
-            )
-            currency_b = getattr(
-                record_b,
-                "currency",
-                None,
-            )
-
-            banking_email_a = (
-                getattr(
-                    record_a,
-                    "email",
-                    None,
-                )
-                or ""
-            ).strip().lower()
-
-            banking_email_b = (
-                getattr(
-                    record_b,
-                    "email",
-                    None,
-                )
-                or ""
-            ).strip().lower()
-
-            banking_phone_a = getattr(
-                record_a,
-                "phone_number",
-                None,
-            )
-
-            banking_phone_b = getattr(
-                record_b,
-                "phone_number",
-                None,
-            )
-
-            # -------------------------------------------------
-            # Deterministic banking identifiers
-            # -------------------------------------------------
-
-            account_id_score = (
-                1.0
-                if self._normalize_text(
-                    account_id_a
-                )
-                and self._normalize_text(
-                    account_id_a
-                )
-                == self._normalize_text(
-                    account_id_b
-                )
-                else 0.0
-            )
-
-            customer_id_score = (
-                1.0
-                if self._normalize_text(
-                    banking_customer_id_a
-                )
-                and self._normalize_text(
-                    banking_customer_id_a
-                )
-                == self._normalize_text(
-                    banking_customer_id_b
-                )
-                else 0.0
-            )
-
-            sap_business_partner_id_score = (
-                1.0
-                if self._normalize_text(
-                    sap_bp_id_a
-                )
-                and self._normalize_text(
-                    sap_bp_id_a
-                )
-                == self._normalize_text(
-                    sap_bp_id_b
-                )
-                else 0.0
-            )
-
-            routing_number_score = (
-                1.0
-                if self._normalize_text(
-                    routing_number_a
-                )
-                and self._normalize_text(
-                    routing_number_a
-                )
-                == self._normalize_text(
-                    routing_number_b
-                )
-                else 0.0
-            )
-
-            account_number_last4_score = (
-                1.0
-                if self._normalize_text(
-                    account_last4_a
-                )
-                and self._normalize_text(
-                    account_last4_a
-                )
-                == self._normalize_text(
-                    account_last4_b
-                )
-                else 0.0
-            )
-
-            # -------------------------------------------------
-            # Probabilistic / contextual banking evidence
-            # -------------------------------------------------
-
-            institution_name_score = (
-                self._similarity(
-                    institution_name_a,
-                    institution_name_b,
-                )
-            )
-
-            account_type_score = (
-                1.0
-                if self._normalize_text(
-                    account_type_a
-                )
-                and self._normalize_text(
-                    account_type_a
-                )
-                == self._normalize_text(
-                    account_type_b
-                )
-                else 0.0
-            )
-
-            currency_score = (
-                1.0
-                if self._normalize_text(
-                    currency_a
-                )
-                and self._normalize_text(
-                    currency_a
-                )
-                == self._normalize_text(
-                    currency_b
-                )
-                else 0.0
-            )
-
-            phone_score = (
-                SimilarityEngine.phone_similarity(
-                    banking_phone_a,
-                    banking_phone_b,
-                )
-            )
-
-            phone_weight = (
-                domain_weights.get(
-                    "phone_match",
-                    0.0,
-                )
-                if phone_score is not None
-                else 0.0
-            )
-
-            phone_score_value = (
-                phone_score
-                if phone_score is not None
-                else 0.0
-            )
-
-            banking_email_similarity = (
-                SimilarityEngine.email_similarity(
-                    banking_email_a,
-                    banking_email_b,
-                )
-            )
-
-            banking_domain_a = (
-                banking_email_a.split("@")[1]
-                if "@" in banking_email_a
-                else ""
-            )
-
-            banking_domain_b = (
-                banking_email_b.split("@")[1]
-                if "@" in banking_email_b
-                else ""
-            )
-
-            banking_domain_trust_score = min(
-                email_domain_trust(
-                    banking_domain_a
-                ),
-                email_domain_trust(
-                    banking_domain_b
-                ),
-            )
-
-            email_score = min(
-                banking_email_similarity
-                * banking_domain_trust_score,
-                1.0,
-            )
-
-            banking_email_match_level = (
-                "DIFFERENT"
-            )
-
-            if email_score >= 0.99:
-                banking_email_match_level = (
-                    "EXACT"
-                )
-            elif email_score >= 0.90:
-                banking_email_match_level = (
-                    "SIMILAR"
-                )
-            elif email_score >= 0.70:
-                banking_email_match_level = (
-                    "FUZZY"
-                )
-
-            # -------------------------------------------------
-            # Composite banking score
-            # -------------------------------------------------
-
-            match_score = (
-                account_id_score
-                * domain_weights.get(
-                    "account_id_match",
-                    0.0,
-                )
-                + customer_id_score
-                * domain_weights.get(
-                    "customer_id_match",
-                    0.0,
-                )
-                + sap_business_partner_id_score
-                * domain_weights.get(
-                    "sap_business_partner_id_match",
-                    0.0,
-                )
-                + routing_number_score
-                * domain_weights.get(
-                    "routing_number_match",
-                    0.0,
-                )
-                + account_number_last4_score
-                * domain_weights.get(
-                    "account_number_last4_match",
-                    0.0,
-                )
-                + institution_name_score
-                * domain_weights.get(
-                    "institution_name_similarity",
-                    0.0,
-                )
-                + account_type_score
-                * domain_weights.get(
-                    "account_type_match",
-                    0.0,
-                )
-                + currency_score
-                * domain_weights.get(
-                    "currency_match",
-                    0.0,
-                )
-                + email_score
-                * domain_weights.get(
-                    "email_match",
-                    0.0,
-                )
-                + phone_score_value
-                * domain_weights.get(
-                    "phone_match",
-                    0.0,
-                )
-                + source_score
-                * domain_weights.get(
-                    "source_trust",
-                    0.0,
-                )
-                + learning_score
-                * domain_weights.get(
-                    "steward_learning",
-                    0.0,
-                )
-            )
-
-            # Reinforcement rules.
-            # Avoid allowing last-four alone to drive a high-confidence match.
-            if (
-                account_id_score == 1.0
-                and routing_number_score == 1.0
-            ):
-                match_score = max(
-                    match_score,
-                    0.95,
-                )
-
-            elif (
-                customer_id_score == 1.0
-                and sap_business_partner_id_score
-                == 1.0
-            ):
-                match_score = max(
-                    match_score,
-                    0.92,
-                )
-
-            elif (
-                routing_number_score == 1.0
-                and account_number_last4_score
-                == 1.0
-                and institution_name_score
-                >= 0.90
-            ):
-                match_score = max(
-                    match_score,
-                    0.82,
-                )
-
-            match_score = min(
-                match_score,
-                1.0,
-            )
-
-            # -------------------------------------------------
-            # Explainability signals
-            # -------------------------------------------------
-
-            signals.append(
-                self._build_signal(
-                    "account_id_match",
-                    account_id_score,
-                    domain_weights.get(
-                        "account_id_match",
-                        0.0,
-                    ),
-                    self._account_id_detail(
-                        account_id_a,
-                        account_id_b,
-                    ),
-                    signal_type="deterministic",
-                )
-            )
-
-            signals.append(
-                self._build_signal(
-                    "customer_id_match",
-                    customer_id_score,
-                    domain_weights.get(
-                        "customer_id_match",
-                        0.0,
-                    ),
-                    self._customer_id_detail(
-                        banking_customer_id_a,
-                        banking_customer_id_b,
-                    ),
-                    signal_type="deterministic",
-                )
-            )
-
-            signals.append(
-                self._build_signal(
-                    "sap_business_partner_id_match",
-                    sap_business_partner_id_score,
-                    domain_weights.get(
-                        "sap_business_partner_id_match",
-                        0.0,
-                    ),
-                    self._sap_business_partner_id_detail(
-                        sap_bp_id_a,
-                        sap_bp_id_b,
-                    ),
-                    signal_type="deterministic",
-                )
-            )
-
-            signals.append(
-                self._build_signal(
-                    "routing_number_match",
-                    routing_number_score,
-                    domain_weights.get(
-                        "routing_number_match",
-                        0.0,
-                    ),
-                    self._routing_number_detail(
-                        routing_number_a,
-                        routing_number_b,
-                    ),
-                    signal_type="deterministic",
-                )
-            )
-
-            signals.append(
-                self._build_signal(
-                    "account_number_last4_match",
-                    account_number_last4_score,
-                    domain_weights.get(
-                        "account_number_last4_match",
-                        0.0,
-                    ),
-                    self._account_last4_detail(
-                        account_last4_a,
-                        account_last4_b,
-                    ),
-                    signal_type="deterministic",
-                )
-            )
-
-            signals.append(
-                self._build_signal(
-                    "institution_name_similarity",
-                    institution_name_score,
-                    domain_weights.get(
-                        "institution_name_similarity",
-                        0.0,
-                    ),
-                    (
-                        "Compared financial institution names "
-                        f"'{institution_name_a or 'UNKNOWN'}' and "
-                        f"'{institution_name_b or 'UNKNOWN'}'."
-                    ),
-                    signal_type="probabilistic",
-                )
-            )
-
-            signals.append(
-                self._build_signal(
-                    "account_type_match",
-                    account_type_score,
-                    domain_weights.get(
-                        "account_type_match",
-                        0.0,
-                    ),
-                    (
-                        "Compared banking account types "
-                        f"'{account_type_a or 'UNKNOWN'}' and "
-                        f"'{account_type_b or 'UNKNOWN'}'."
-                    ),
-                    signal_type="deterministic",
-                )
-            )
-
-            signals.append(
-                self._build_signal(
-                    "currency_match",
-                    currency_score,
-                    domain_weights.get(
-                        "currency_match",
-                        0.0,
-                    ),
-                    (
-                        "Compared account currencies "
-                        f"'{currency_a or 'UNKNOWN'}' and "
-                        f"'{currency_b or 'UNKNOWN'}'."
-                    ),
-                    signal_type="deterministic",
-                )
-            )
-
-            signals.append(
-                self._build_signal(
-                    "email_match",
-                    email_score,
-                    domain_weights.get(
-                        "email_match",
-                        0.0,
-                    ),
-                    self._email_detail(
-                        banking_email_a,
-                        banking_email_b,
-                    ),
-                    match_level=(
-                        banking_email_match_level
-                    ),
-                    domain_trust=(
-                        banking_domain_trust_score
-                    ),
-                    signal_type="probabilistic",
-                )
-            )
-
-            signals.append(
-                self._build_signal(
-                    "phone_match",
-                    (
-                        phone_score
-                        if phone_score is not None
-                        else 0.5
-                    ),
-                    phone_weight,
-                    self._phone_detail(
-                        banking_phone_a,
-                        banking_phone_b,
-                    ),
-                    signal_type="deterministic",
-                )
-            )
-
-            signals.append(
-                self._build_signal(
-                    "source_trust",
-                    source_score,
-                    domain_weights.get(
-                        "source_trust",
-                        0.0,
-                    ),
-                    self._source_detail(
-                        record_a.source_system,
-                        record_b.source_system,
-                    ),
-                    signal_type="probabilistic",
-                )
-            )
-
-            raw_entity_score = round(
-                match_score
-                * risk_multiplier,
-                4,
-            )
 
         elif normalized_domain == "LOCATION":
-
-            signals = []
-
-            location_id_a = getattr(record_a, "location_id", None)
-            location_id_b = getattr(record_b, "location_id", None)
-            site_id_a = getattr(record_a, "site_id", None)
-            site_id_b = getattr(record_b, "site_id", None)
-            location_code_a = getattr(record_a, "location_code", None)
-            location_code_b = getattr(record_b, "location_code", None)
-            location_name_a = getattr(record_a, "location_name", None)
-            location_name_b = getattr(record_b, "location_name", None)
-            location_address_a = (
-                getattr(record_a, "location_address", None)
-                or getattr(record_a, "address", None)
-            )
-            location_address_b = (
-                getattr(record_b, "location_address", None)
-                or getattr(record_b, "address", None)
-            )
-            parent_location_id_a = getattr(record_a, "parent_location_id", None)
-            parent_location_id_b = getattr(record_b, "parent_location_id", None)
-            location_org_id_a = getattr(record_a, "organization_entity_id", None)
-            location_org_id_b = getattr(record_b, "organization_entity_id", None)
-
-            location_id_score = self._exact_match_score(location_id_a, location_id_b)
-            site_id_score = self._exact_match_score(site_id_a, site_id_b)
-            location_code_score = self._exact_match_score(location_code_a, location_code_b)
-            location_name_score = self._similarity(location_name_a, location_name_b)
-            address_score = SimilarityEngine.address_similarity(
-                location_address_a,
-                location_address_b,
-            )
-            parent_location_id_score = self._exact_match_score(
-                parent_location_id_a,
-                parent_location_id_b,
-            )
-            organization_entity_id_available = bool(
-                self._normalize_text(location_org_id_a)
-                and self._normalize_text(location_org_id_b)
+            location_result = score_location(
+                engine=self,
+                record_a=record_a,
+                record_b=record_b,
+                domain=domain,
+                domain_weights=domain_weights,
+                source_score=source_score,
+                learning_score=learning_score,
+                risk_multiplier=risk_multiplier,
+                address_match_insight=address_match_insight,
             )
 
-            organization_entity_id_score = (
-                self._exact_match_score(
-                    location_org_id_a,
-                    location_org_id_b,
-                )
-                if organization_entity_id_available
-                else None
-            )
-
-            match_score = (
-                location_id_score * domain_weights.get("location_id_match", 0.0)
-                + site_id_score * domain_weights.get("site_id_match", 0.0)
-                + location_code_score * domain_weights.get("location_code_match", 0.0)
-                + location_name_score * domain_weights.get("location_name_similarity", 0.0)
-                + address_score * domain_weights.get("address_similarity", 0.0)
-                + parent_location_id_score * domain_weights.get("parent_location_id_match", 0.0)
-                + (organization_entity_id_score
-                if organization_entity_id_score is not None
-                    else 0.0
-                ) * domain_weights.get(
-                    "organization_entity_id_match",
-                    0.0,
-                )
-                + source_score * domain_weights.get("source_trust", 0.0)
-                + learning_score * domain_weights.get("steward_learning", 0.0)
-            )
-
-            if location_id_score == 1.0 and site_id_score == 1.0:
-                match_score = max(match_score, 0.97)
-            elif site_id_score == 1.0 and address_score >= 0.95:
-                match_score = max(match_score, 0.92)
-            elif location_code_score == 1.0 and address_score >= 0.95:
-                match_score = max(match_score, 0.88)
-
-            match_score = min(match_score, 1.0)
-            name_score = location_name_score
-
-            for signal_name, score_value, weight_key, detail, signal_type in [
-                ("location_id_match", location_id_score, "location_id_match", f"Compared Location IDs '{location_id_a or 'UNKNOWN'}' and '{location_id_b or 'UNKNOWN'}'.", "deterministic"),
-                ("site_id_match", site_id_score, "site_id_match", f"Compared governed Site IDs '{site_id_a or 'UNKNOWN'}' and '{site_id_b or 'UNKNOWN'}'.", "deterministic"),
-                ("location_code_match", location_code_score, "location_code_match", f"Compared location codes '{location_code_a or 'UNKNOWN'}' and '{location_code_b or 'UNKNOWN'}'.", "deterministic"),
-                ("location_name_similarity", location_name_score, "location_name_similarity", f"Compared location names '{location_name_a or 'UNKNOWN'}' and '{location_name_b or 'UNKNOWN'}'.", "probabilistic"),
-                ("address_similarity", address_score, "address_similarity", self._address_detail(location_address_a, location_address_b, address_score, domain, address_match_insight), "probabilistic"),
-                ("parent_location_id_match", parent_location_id_score, "parent_location_id_match", f"Compared parent Location IDs '{parent_location_id_a or 'UNKNOWN'}' and '{parent_location_id_b or 'UNKNOWN'}'.", "deterministic"),
-                ("organization_entity_id_match", organization_entity_id_score,"organization_entity_id_match",(
-                f"Compared governing Organization entity IDs "f"'{location_org_id_a}' and '{location_org_id_b}'." if organization_entity_id_available               else "Governing Organization entity ID was not provided "
-            "for both records; this signal is unavailable."
-            ),
-            "deterministic",
-        ),
-                ("source_trust", source_score, "source_trust", self._source_detail(record_a.source_system, record_b.source_system), "probabilistic"),
-            ]:
-                signals.append(
-                    self._build_signal(
-                        signal_name,
-                        score_value,
-                        domain_weights.get(weight_key, 0.0),
-                        detail,
-                        signal_type=signal_type,
-                    )
-                )
-
-            raw_entity_score = round(match_score * risk_multiplier, 4)
+            signals = location_result["signals"]
+            match_score = location_result["match_score"]
+            name_score = location_result["name_score"]
+            address_score = location_result["address_score"]
+            raw_entity_score = location_result["raw_entity_score"]
 
         elif normalized_domain == "ORGANIZATION":
-
-            signals = []
-
-            organization_entity_id_a = getattr(record_a, "organization_entity_id", None)
-            organization_entity_id_b = getattr(record_b, "organization_entity_id", None)
-            organization_code_a = getattr(record_a, "organization_code", None)
-            organization_code_b = getattr(record_b, "organization_code", None)
-            organization_name_a = getattr(record_a, "organization_name", None)
-            organization_name_b = getattr(record_b, "organization_name", None)
-            organization_type_a = getattr(record_a, "organization_type", None)
-            organization_type_b = getattr(record_b, "organization_type", None)
-            parent_organization_id_a = getattr(record_a, "parent_organization_id", None)
-            parent_organization_id_b = getattr(record_b, "parent_organization_id", None)
-            organization_status_a = getattr(record_a, "organization_status", None)
-            organization_status_b = getattr(record_b, "organization_status", None)
-
-            organization_entity_id_score = self._exact_match_score(
-                organization_entity_id_a,
-                organization_entity_id_b,
-            )
-            organization_code_score = self._exact_match_score(
-                organization_code_a,
-                organization_code_b,
-            )
-            organization_name_score = self._similarity(
-                organization_name_a,
-                organization_name_b,
-            )
-            organization_type_score = self._exact_match_score(
-                organization_type_a,
-                organization_type_b,
-            )
-            parent_organization_id_score = self._exact_match_score(
-                parent_organization_id_a,
-                parent_organization_id_b,
-            )
-            organization_status_score = self._exact_match_score(
-                organization_status_a,
-                organization_status_b,
+            organization_result = score_organization(
+                engine=self,
+                record_a=record_a,
+                record_b=record_b,
+                domain_weights=domain_weights,
+                source_score=source_score,
+                learning_score=learning_score,
+                risk_multiplier=risk_multiplier,
             )
 
-            match_score = (
-                organization_entity_id_score * domain_weights.get("organization_entity_id_match", 0.0)
-                + organization_code_score * domain_weights.get("organization_code_match", 0.0)
-                + organization_name_score * domain_weights.get("organization_name_similarity", 0.0)
-                + organization_type_score * domain_weights.get("organization_type_match", 0.0)
-                + parent_organization_id_score * domain_weights.get("parent_organization_id_match", 0.0)
-                + organization_status_score * domain_weights.get("organization_status_match", 0.0)
-                + source_score * domain_weights.get("source_trust", 0.0)
-                + learning_score * domain_weights.get("steward_learning", 0.0)
-            )
+            signals = organization_result["signals"]
+            match_score = organization_result["match_score"]
+            name_score = organization_result["name_score"]
+            raw_entity_score = organization_result["raw_entity_score"]
 
-            if organization_entity_id_score == 1.0:
-                match_score = max(match_score, 0.96)
-            elif organization_code_score == 1.0 and organization_name_score >= 0.90:
-                match_score = max(match_score, 0.92)
-            elif organization_name_score >= 0.95 and organization_type_score == 1.0:
-                match_score = max(match_score, 0.85)
-
-            match_score = min(match_score, 1.0)
-            name_score = organization_name_score
-
-            for signal_name, score_value, weight_key, detail, signal_type in [
-                ("organization_entity_id_match", organization_entity_id_score, "organization_entity_id_match", f"Compared Organization entity IDs '{organization_entity_id_a or 'UNKNOWN'}' and '{organization_entity_id_b or 'UNKNOWN'}'.", "deterministic"),
-                ("organization_code_match", organization_code_score, "organization_code_match", f"Compared organization codes '{organization_code_a or 'UNKNOWN'}' and '{organization_code_b or 'UNKNOWN'}'.", "deterministic"),
-                ("organization_name_similarity", organization_name_score, "organization_name_similarity", f"Compared organization names '{organization_name_a or 'UNKNOWN'}' and '{organization_name_b or 'UNKNOWN'}'.", "probabilistic"),
-                ("organization_type_match", organization_type_score, "organization_type_match", f"Compared organization types '{organization_type_a or 'UNKNOWN'}' and '{organization_type_b or 'UNKNOWN'}'.", "deterministic"),
-                ("parent_organization_id_match", parent_organization_id_score, "parent_organization_id_match", f"Compared parent Organization IDs '{parent_organization_id_a or 'UNKNOWN'}' and '{parent_organization_id_b or 'UNKNOWN'}'.", "deterministic"),
-                ("organization_status_match", organization_status_score, "organization_status_match", f"Compared organization statuses '{organization_status_a or 'UNKNOWN'}' and '{organization_status_b or 'UNKNOWN'}'.", "deterministic"),
-                ("source_trust", source_score, "source_trust", self._source_detail(record_a.source_system, record_b.source_system), "probabilistic"),
-            ]:
-                signals.append(
-                    self._build_signal(
-                        signal_name,
-                        score_value,
-                        domain_weights.get(weight_key, 0.0),
-                        detail,
-                        signal_type=signal_type,
-                    )
-                )
-
-            raw_entity_score = round(match_score * risk_multiplier, 4)
+            organization_entity_id_score = organization_result[
+                "organization_entity_id_score"
+            ]
+            organization_code_score = organization_result[
+                "organization_code_score"
+            ]
+            organization_name_score = organization_result[
+                "organization_name_score"
+            ]
+            organization_type_score = organization_result[
+                "organization_type_score"
+            ]
+            parent_organization_id_score = organization_result[
+                "parent_organization_id_score"
+            ]
+            organization_status_score = organization_result[
+                "organization_status_score"
+            ]
             
         
         signal_scores = self._domain_signal_scores(
@@ -3397,426 +1636,57 @@ class EntityResolutionEngine:
         }
 
     def _build_signal_contributions(
-        self,
-        signal_scores: dict[str, float],
-        signal_weights: dict[str, float],
-    ) -> list[dict[str, float | str]]:
-        contributions: list[dict[str, float | str]] = []
-
-        for signal_key, score in signal_scores.items():
-            weight = self._safe_score(signal_weights.get(signal_key, 0.0))
-
-            # Ignore unavailable evidence
-            if score is None or weight == 0:
-                continue
-
-            safe_score = self._safe_score(score)
-            contribution = safe_score * weight
-
-            contributions.append(
-                {
-                    "signal_name": signal_key,
-                    "score": round(safe_score, 4),
-                    "weight": round(weight, 4),
-                    "contribution": round(contribution, 4),
-                    "contribution_pct": round(contribution * 100, 2),
-                }
+            self,
+            signal_scores: dict[str, float],
+            signal_weights: dict[str, float],
+        ) -> list[dict[str, float | str]]:
+            return build_signal_contributions(
+                signal_scores=signal_scores,
+                signal_weights=signal_weights,
+                safe_score_fn=self._safe_score,
             )
-
-        return contributions
 
     def _primary_signal_from_contributions(
         self,
         signal_contributions: list[dict[str, Any]],
     ) -> Optional[str]:
-        if not signal_contributions:
-            return None
-        strongest = max(
-            signal_contributions,
-            key=lambda item: float(item.get("contribution") or 0.0),
+        return primary_signal_from_contributions(
+            signal_contributions
         )
-        return str(strongest.get("signal_name"))
 
     def build_match_evidence_timeline(
-        self,
-        signals: list[dict[str, Any]],
-        decision_confidence_score: int,
-        automation_tier: str,
-        primary_signal: str | None,
-        composite_risk_score: int | None,
-        automation_readiness_score: int,
-        risk_flag: str | None,
-        effective_email_score: float,
-        recommended_action: str | None,
-        address_match_insight: str | None,
-        triggered_rules: list[str] | None,
-        automation_policy_status: str,
-        primary_risk_driver: str | None = None,
-        composite_risk_band: str | None = None,
-    ) -> list[dict[str, Any]]:
-        events: list[dict[str, Any]] = []
-
-        automation_readiness_score = float(
-        automation_readiness_score or 0
-    )
-
-        decision_confidence_score = float(
-        decision_confidence_score or 0
-    )
-
-        composite_risk_score = (
-           float(composite_risk_score or 0)
-            if composite_risk_score is not None
-        else 0
-)
-        deterministic_signal_names = {
-            "member_id_match",
-            "patient_id_match",
-            "phone_match",
-            "provider_id_match",
-            "supplier_id_match",
-            "product_id_match",
-            "gtin_match",
-            "sku_match",
-            "effective_lot_date_match",
-            "npi_match",
-            "tax_id_match",
-            "dob_match",
-            "contact_email_match",
-            "provider_email_match",
-            "account_id_match",
-            "banking_customer_id_match",
-            "sap_business_partner_id_match",
-            "routing_number_match",
-            "account_number_last4_match",
-            "institution_name_match",
-            "account_type_match",
-            "currency_match",
-            "account_status_match",
-            "email_match",
-            # Organization
-            "organization_entity_id_match",
-            "organization_code_match",
-            "organization_type_match",
-            "parent_organization_id_match",
-            "organization_status_match",
-
-            # Location
-            "location_id_match",
-            "site_id_match",
-            "location_code_match",
-            "location_type_match",
-            "parent_location_id_match",
-            "organization_entity_id_match",
-        }
-
-        supporting_signal_names = {
-            "address_similarity",
-            "name_similarity",
-            "specialty_similarity",
-            "source_trust",
-            "attribute_similarity",
-            "item_category_similarity",
-            "product_variant_similarity",
-            "phone_match",
-            "organization_name_similarity",
-            "location_name_similarity",
-        }
-
-        signal_display_map = {
-            "supplier_id_match": "Supplier ID",
-            "tax_id_match": "Tax ID",
-            "provider_id_match": "Provider ID",
-            "patient_id_match": "Patient ID",
-            "product_id_match": "Product ID",
-            "gtin_match": "GTIN",
-            "npi_match": "NPI",
-            "phone_match": "Phone",
-            "sku_match": "SKU",
-            "effective_lot_date_match": "Effective / Lot Date",
-            "attribute_similarity": "Product Attribute Similarity",
-            "product_variant_similarity": "Product Variant / Pack Size",
-            "item_category_similarity": "Item Category",
-            "member_id_match": "Member ID",
-            "dob_match": "Date of Birth",
-            "contact_email_match": "Contact Email",
-            "provider_email_match": "Provider Email",
-            "address_similarity": "Address Similarity",
-            "name_similarity": "Name Similarity",
-            "specialty_similarity": "Specialty Similarity",
-            "source_trust": "Source Trust",
-            "account_id_match": "Account ID",
-            "banking_customer_id_match": "Banking Customer ID",
-            "sap_business_partner_id_match": "SAP Business Partner ID",
-            "routing_number_match": "Routing Number",
-            "account_number_last4_match": "Account Number Last 4",
-            "institution_name_match": "Institution Name",
-            "account_type_match": "Account Type",
-            "currency_match": "Currency",
-            "account_status_match": "Account Status",
-            "email_match": "Email",
-            # Organization
-            "organization_entity_id_match": "Organization Entity ID",
-            "organization_code_match": "Organization Code",
-            "organization_name_similarity": "Organization Name Similarity",
-            "organization_type_match": "Organization Type",
-            "parent_organization_id_match": "Parent Organization ID",
-            "organization_status_match": "Organization Status",
-
-            # Location
-            "location_id_match": "Location ID",
-            "site_id_match": "Site ID",
-            "location_code_match": "Location Code",
-            "location_name_similarity": "Location Name Similarity",
-            "location_type_match": "Location Type",
-            "parent_location_id_match": "Parent Location ID",
-        }
-
-        timeline_signals = [
-            s
-            for s in signals
-            if s.get("signal_name") in deterministic_signal_names
-            or s.get("signal_name") in supporting_signal_names
-        ]
-
-        for signal in timeline_signals:
-            signal_name = signal.get("signal_name", "Signal")
-            display_name = signal_display_map.get(
-                signal_name,
-                signal_name.replace("_", " ").title(),
+            self,
+            signals: list[dict[str, Any]],
+            decision_confidence_score: int,
+            automation_tier: str,
+            primary_signal: str | None,
+            composite_risk_score: int | None,
+            automation_readiness_score: int,
+            risk_flag: str | None,
+            effective_email_score: float,
+            recommended_action: str | None,
+            address_match_insight: str | None,
+            triggered_rules: list[str] | None,
+            automation_policy_status: str,
+            primary_risk_driver: str | None = None,
+            composite_risk_band: str | None = None,
+        ) -> list[dict[str, Any]]:
+            return build_evidence_timeline(
+                signals=signals,
+                decision_confidence_score=decision_confidence_score,
+                automation_tier=automation_tier,
+                primary_signal=primary_signal,
+                composite_risk_score=composite_risk_score,
+                automation_readiness_score=automation_readiness_score,
+                risk_flag=risk_flag,
+                effective_email_score=effective_email_score,
+                recommended_action=recommended_action,
+                address_match_insight=address_match_insight,
+                triggered_rules=triggered_rules,
+                automation_policy_status=automation_policy_status,
+                primary_risk_driver=primary_risk_driver,
+                composite_risk_band=composite_risk_band,
             )
-            evidence_available = signal.get("evidence_available", True)
-
-            signal_score = float(
-                signal.get("signal_score")
-                if signal.get("signal_score") is not None
-                else signal.get("score") or 0
-            )
-
-            if not evidence_available:
-                title = f"{display_name} Evidence Unavailable"
-                status = "neutral"
-                tone = "neutral"
-
-            elif signal_name in {
-                "product_id_match",
-                "patient_id_match",
-                "provider_id_match",
-            }:
-                if signal_score >= 0.99:
-                    title = f"{display_name} Exact Match"
-                    status = "positive"
-                    tone = "positive"
-                elif signal_score >= 0.85:
-                    title = f"{display_name} Similar"
-                    status = "neutral"
-                    tone = "neutral"
-                else:
-                    title = f"{display_name} Not Matched"
-                    status = "warning"
-                    tone = "warning"
-
-            elif signal_name in deterministic_signal_names:
-                if signal_score >= 1.0:
-                    title = f"{display_name} Exact Match"
-                    status = "positive"
-                    tone = "positive"
-                else:
-                    organization_conflict_titles = {
-                        "organization_entity_id_match": "Organization Entity ID Conflict",
-                        "organization_code_match": "Organization Code Conflict",
-                        "organization_type_match": "Organization Type Conflict",
-                        "parent_organization_id_match": "Parent Organization IDs Differ",
-                        "organization_status_match": "Organization Status Difference",
-                    }
-                    title = organization_conflict_titles.get(
-                        signal_name,
-                        f"{display_name} Not Matched",
-                    )
-                    status = "warning"
-                    tone = "warning"
-
-            else:
-                if signal_score >= 0.85:
-                    title = f"{display_name} Strong"
-                    status = "positive"
-                    tone = "positive"
-                elif signal_score >= 0.70:
-                    title = f"{display_name} Partial"
-                    status = "neutral"
-                    tone = "neutral"
-                else:
-                    title = f"{display_name} Weak"
-                    status = "warning"
-                    tone = "warning"
-
-            events.append(
-                {
-                    "stage": "SIGNAL",
-                    "step": len(events) + 1,
-                    "title": title,
-                    "detail": signal.get("detail", f"{display_name} evaluated."),
-                    "status": status,
-                    "tone": tone,
-                    "signal_name": signal_name,
-                    "signal_score": signal_score,
-                }
-            )
-
-        if (
-            str(primary_risk_driver or "").strip().upper()
-            == "ORGANIZATION_HIERARCHY_CONFLICT"
-        ):
-            events.append(
-                {
-                    "stage": "RISK",
-                    "step": len(events) + 1,
-                    "title": "Parent-Child Organization Relationship Detected",
-                    "detail": (
-                        "One organization explicitly identifies the other as its "
-                        "parent organization. These records represent separate nodes "
-                        "in the organization hierarchy, not duplicate organizations."
-                    ),
-                    "status": "warning",
-                    "tone": "warning",
-                    "signal_name": "organization_hierarchy",
-                    "signal_score": 1.0,
-                }
-            )
-            events.append(
-                {
-                    "stage": "RISK",
-                    "step": len(events) + 1,
-                    "title": "Organization Hierarchy Conflict Prevents Merge",
-                    "detail": (
-                        "A parent and child organization cannot be merged as the same "
-                        "mastered entity. Merging them would collapse the organization "
-                        "hierarchy and corrupt entity identity."
-                    ),
-                    "status": "warning",
-                    "tone": "warning",
-                    "signal_name": "organization_hierarchy",
-                    "signal_score": 1.0,
-                }
-            )
-        if address_match_insight:
-            events.append(
-                {
-                    "step": len(events) + 1,
-                    "stage": "SIGNAL",
-                    "title": "Address Evidence Reviewed",
-                    "detail": address_match_insight,
-                    "tone": (
-                        "positive"
-                        if "support" in address_match_insight.lower()
-                        or "highly similar" in address_match_insight.lower()
-                        else "neutral"
-                    ),
-                    "signal_name": "address_similarity",
-                    "signal_score": 0.0,
-                    "policy_rule": None,
-                    "impact": "MEDIUM",
-                }
-            )
-
-        if triggered_rules:
-            events.append(
-                {
-                    "step": len(events) + 1,
-                    "stage": "POLICY",
-                    "title": "Policy Rules Applied",
-                    "detail": f"Triggered rules: {', '.join(triggered_rules)}.",
-                    "tone": "neutral",
-                    "signal_name": None,
-                    "signal_score": 0.0,
-                    "policy_rule": ",".join(triggered_rules),
-                    "impact": "HIGH",
-                }
-            )
-            
-            if composite_risk_score is not None:
-                normalized_risk_flag = (risk_flag or "").upper()
-
-            risk_detail = (
-                f"Composite risk scored {composite_risk_score}/100"
-                f"{f' ({composite_risk_band})' if composite_risk_band else ''}"
-                f" with risk flag {risk_flag or 'UNKNOWN'}."
-            )
-            if primary_risk_driver:
-                risk_detail += f" Primary risk driver: {primary_risk_driver}."
-                
-            events.append(
-                {
-                    "step": len(events) + 1,
-                    "stage": "RISK",
-                    "title": "Composite Risk Calculated",
-                    "detail": risk_detail,
-                    "tone": (
-                        "warning"
-                        if normalized_risk_flag in {
-                            "HIGH", 
-                            "CRITICAL", 
-                            "SEVERE", 
-                            "ELEVATED"
-                            }
-                        else "neutral"
-                    ),
-                    "signal_name": None,
-                    "signal_score": composite_risk_score / 100,
-                    "policy_rule": None,
-                    "impact": "HIGH",
-                }
-            )
-
-            events.append(
-            {
-                "step": len(events) + 1,
-                "stage": "AUTOMATION",
-                "title": "Automation Readiness Calculated",
-                "detail": (
-                    f"Automation readiness scored {automation_readiness_score}/100 "
-                    f"with status {automation_policy_status}."
-                ),
-                "tone": (
-                    "positive"
-                    if automation_readiness_score >= 85
-                    else "warning"
-                    if automation_readiness_score < 60
-                    else "neutral"
-                ),
-                "signal_name": primary_signal,
-                "signal_score": automation_readiness_score / 100,
-                "policy_rule": None,
-                "impact": "HIGH",
-            }
-        )
-
-            final_action = (recommended_action or "").upper()
-
-            events.append(
-            {
-                "step": len(events) + 1,
-                "stage": "DECISION",
-                "title": "Recommended Action Produced",
-                "detail": (
-                    f"The engine selected {recommended_action or automation_tier} "
-                    f"with decision confidence {decision_confidence_score}/100."
-                ),
-                "tone": (
-                    "positive"
-                    if final_action in {"APPROVE_MERGE", "AUTO_MERGE"}
-                    else "warning"
-                    if final_action in {"REJECT_MERGE", "BLOCK_MERGE"}
-                    else "neutral"
-                ),
-                "signal_name": primary_signal,
-                "signal_score": decision_confidence_score / 100,
-                "policy_rule": None,
-                "impact": "HIGH",
-            }
-        )
-    
-        return events
 
     def _resolve_weights(self, policy_config: Optional[dict[str, Any]]) -> dict[str, float]:
         domain = (policy_config or {}).get("domain", "CUSTOMER").upper()
@@ -3962,68 +1832,26 @@ class EntityResolutionEngine:
         return "LOW"
 
     def _build_signal(
-        self,
-        name: str,
-        score: float | None,
-        weight: float,
-        detail: str,
-        match_level: str | None = None,
-        signal_type: str = "probabilistic",
-        **kwargs,
-    ) -> dict[str, Any]:
-        evidence_available = score is not None
-        safe_score = self._safe_score(score) if evidence_available else 0.0
-
-        detail = detail or f"{name.replace('_', ' ').title()} was evaluated."
-        weighted_score = (
-            round(safe_score * weight, 4) if evidence_available else 0.0
-        )
-
-        signal_band = (
-            "UNAVAILABLE"
-            if not evidence_available
-            else (
-                match_level
-                or (
-                    "EXACT"
-                    if name
-                    in {
-                        "product_id_match",
-                        "sku_match",
-                        "patient_id_match",
-                        "provider_id_match",
-                        "human_id_match",
-                    }
-                    and safe_score >= 0.999
-                    else "SIMILAR"
-                    if name
-                    in {
-                        "product_id_match",
-                        "sku_match",
-                        "patient_id_match",
-                        "provider_id_match",
-                    }
-                    and safe_score >= 0.85
-                    else "DIFFERENT"
-                    if name in {"product_id_match", "sku_match"}
-                    else SimilarityEngine.similarity_band(safe_score)
-                )
-            )
-        )
-
-        return {
-            "signal_name": name,
-            "signal_score": round(safe_score, 4),
-            "signal_weight": round(weight, 4),
-            "weighted_score": weighted_score,
-            "evidence_available": evidence_available,
-            "detail": detail,
-            "signal_band": signal_band,
-            "signal_impact": self._signal_impact(safe_score),
-            "signal_type": signal_type,
+            self,
+            name: str,
+            score: float | None,
+            weight: float,
+            detail: str,
+            match_level: str | None = None,
+            signal_type: str = "probabilistic",
             **kwargs,
-        }
-
+        ) -> dict[str, Any]:
+            return build_signal(
+                name=name,
+                score=score,
+                weight=weight,
+                detail=detail,
+                safe_score_fn=self._safe_score,
+                signal_impact_fn=self._signal_impact,
+                match_level=match_level,
+                signal_type=signal_type,
+                **kwargs,
+            )
     def _signal_tone(
         self,
         signal_name: str,
