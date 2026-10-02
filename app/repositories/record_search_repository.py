@@ -158,6 +158,16 @@ class RecordSearchRepository:
             location_type = @location_type,
             location_address = @location_address,
             parent_location_id = @parent_location_id,
+
+            account_id = @account_id,
+            banking_customer_id = @banking_customer_id,
+            sap_business_partner_id = @sap_business_partner_id,
+            account_type = @account_type,
+            routing_number = @routing_number,
+            account_number_last4 = @account_number_last4,
+            institution_name = @institution_name,
+            currency = @currency,
+            account_status = @account_status,
             updated_at = @updated_at
 
         WHEN NOT MATCHED THEN
@@ -206,6 +216,15 @@ class RecordSearchRepository:
             location_type,
             location_address,
             parent_location_id,
+            account_id,
+            banking_customer_id,
+            sap_business_partner_id,
+            account_type,
+            routing_number,
+            account_number_last4,
+            institution_name,
+            currency,
+            account_status,
             search_text,
             record_origin,
             created_by,
@@ -259,6 +278,15 @@ class RecordSearchRepository:
             @location_type,
             @location_address,
             @parent_location_id,
+            @account_id,
+            @banking_customer_id,
+            @sap_business_partner_id,
+            @account_type,
+            @routing_number,
+            @account_number_last4,
+            @institution_name,
+            @currency,
+            @account_status,
 
             @search_text,
             @record_origin,
@@ -360,6 +388,15 @@ class RecordSearchRepository:
             "location_type",
             "location_address",
             "parent_location_id",
+            "account_id",
+            "banking_customer_id",
+            "sap_business_partner_id",
+            "account_type",
+            "routing_number",
+            "account_number_last4",
+            "institution_name",
+            "currency",
+            "account_status",
         ):
             params.append(
                 bigquery.ScalarQueryParameter(
@@ -431,6 +468,11 @@ class RecordSearchRepository:
                 "site_id",
                 "location_code",
             ],
+            "BANKING": [
+                "account_id",
+                "banking_customer_id",
+                "sap_business_partner_id",
+            ],
         }
 
         candidates = candidates_by_domain.get(
@@ -488,6 +530,7 @@ class RecordSearchRepository:
                 or record.get("location_id")
                 or "Location"
             ).strip()
+
 
         first_name = str(
             record.get("first_name")
@@ -572,6 +615,16 @@ class RecordSearchRepository:
             "location_type",
             "location_address",
             "parent_location_id",
+            # Banking
+            "account_id",
+            "banking_customer_id",
+            "sap_business_partner_id",
+            "account_type",
+            "routing_number",
+            "account_number_last4",
+            "institution_name",
+            "currency",
+            "account_status",
         )
 
         for field_name in searchable_fields:

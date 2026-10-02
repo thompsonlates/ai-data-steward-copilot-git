@@ -63,6 +63,26 @@ def score_location(
         location_name_a,
         location_name_b,
     )
+    normalized_location_name_a = engine._normalize_text(
+        location_name_a
+    )
+    normalized_location_name_b = engine._normalize_text(
+        location_name_b
+    )
+
+    if (
+        normalized_location_name_a
+        and normalized_location_name_b
+        and normalized_location_name_a
+        == normalized_location_name_b
+    ):
+        location_name_match_level = "EXACT"
+    elif location_name_score >= 0.80:
+        location_name_match_level = "SIMILAR"
+    elif location_name_score >= 0.60:
+        location_name_match_level = "FUZZY"
+    else:
+        location_name_match_level = "DIFFERENT"
 
     address_score = SimilarityEngine.address_similarity(
         location_address_a,
@@ -208,6 +228,11 @@ def score_location(
                 score_value,
                 domain_weights.get(weight_key, 0.0),
                 detail,
+                match_level=(
+                    location_name_match_level
+                    if signal_name == "location_name_similarity"
+                    else None
+                ),
                 signal_type=signal_type,
             )
         )

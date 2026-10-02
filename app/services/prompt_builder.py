@@ -2315,6 +2315,9 @@ Critical alignment rules:
 - Never say evidence strongly favors merge when deterministic identifiers, critical domain attributes, or weighted signals are materially conflicting.
 - If final confidence is low, automation readiness is low, or recommended_action is REVIEW_REQUIRED or BLOCK_MERGE, the explanation_summary must describe mixed, weak, or conflicting evidence.
 - If signal evidence shows low contribution from deterministic identifiers, do not describe the records as strong merge candidates even if match_score is high.
+- If structured signal evidence has evidence_available=false or signal_band=UNAVAILABLE, do not describe that signal as matching, similar, different, conflicting, corroborating, or supporting evidence.
+- When structured signal evidence explicitly marks a signal unavailable, do not independently infer a match, similarity, mismatch, or conflict for that signal from raw record values; state that the evidence is unavailable or omit that signal from the explanation.
+- When structured signal evidence marks an available signal as EXACT, STRONG, SIMILAR, DIFFERENT, or CONFLICT, describe that signal consistently with its structured signal band; never state or imply that an EXACT, STRONG, or SIMILAR signal returned no match, and never describe a DIFFERENT or CONFLICT signal as aligned.
 - Do not say signal evidence is empty when supplier_id, tax_id, supplier_name,contact_email, supplier_address, or source_system values are present.
 - If those values align, describe them as deterministic and supporting evidence.
 - If policy still requires review, say governance policy requires steward confirmation, not that evidence is empty.

@@ -824,6 +824,7 @@ def build_ai_insight_prompt(
     primary_signal: str | None,
     composite_risk_score: float | None,
     signal_contributions: list[dict] | None = None,
+    signal_packets: list[dict] | None = None,
     primary_risk_driver: str | None = None,
 ) -> str:
     return f"""
@@ -841,12 +842,16 @@ Primary Signal: {primary_signal}
 Composite Risk Score: {composite_risk_score}
 Primary Risk Driver: {primary_risk_driver}
 Signal Contributions: {signal_contributions or []}
+Structured Signal Evidence: {signal_packets or []}
 
 Requirements:
 - If Domain is ORGANIZATION and Primary Risk Driver is ORGANIZATION_HIERARCHY_CONFLICT, state that a deterministic parent-child hierarchy relationship has been confirmed and that the records are distinct organization hierarchy nodes.
 - Do not describe the hierarchy conflict as likely, possible, potential, suspected, or requiring further identity determination.
 - Explain that BLOCK_MERGE protects the mastered organization hierarchy because merging a parent and child would collapse separate hierarchy nodes and corrupt entity identity.
 - Do not instruct the steward to determine whether the organizations are distinct. Steward review may validate or override the governance action, but entity distinctness has already been established by the hierarchy relationship.
+- Treat Structured Signal Evidence as authoritative for whether each signal is exact, strong, similar, different, conflicting, or unavailable.
+- If structured signal evidence marks evidence_available=false or signal_band=UNAVAILABLE, do not describe that signal as matching, mismatching, conflicting, or supporting evidence.
+- Never state or imply that an EXACT, STRONG, or SIMILAR structured signal returned no match, and never describe a DIFFERENT or CONFLICT signal as aligned.
 - Decision Confidence above is the authoritative overall confidence for this match decision.
 - If you mention confidence, use Decision Confidence exactly as provided on the 0-100 scale.
 - Signal scores, signal weights, and signal contributions are individual evidence measurements, not overall decision confidence.

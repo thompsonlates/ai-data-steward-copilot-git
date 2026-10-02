@@ -1,7 +1,6 @@
 from typing import Any
 
 def build_evidence_timeline(
-    self,
     signals: list[dict[str, Any]],
     decision_confidence_score: int,
     automation_tier: str,

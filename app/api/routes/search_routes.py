@@ -110,6 +110,34 @@ async def search_records(
                     "parent_location_id": row.get(
                         "parent_location_id"
                     ),
+                                        # Banking entity fields
+                    "account_id": row.get(
+                        "account_id"
+                    ),
+                    "banking_customer_id": row.get(
+                        "banking_customer_id"
+                    ),
+                    "sap_business_partner_id": row.get(
+                        "sap_business_partner_id"
+                    ),
+                    "routing_number": row.get(
+                        "routing_number"
+                    ),
+                    "account_number_last4": row.get(
+                        "account_number_last4"
+                    ),
+                    "institution_name": row.get(
+                        "institution_name"
+                    ),
+                    "account_type": row.get(
+                        "account_type"
+                    ),
+                    "currency": row.get(
+                        "currency"
+                    ),
+                    "account_status": row.get(
+                        "account_status"
+                    ),
 
                     # Supplier fields
                     "supplier_name": row.get(

@@ -343,12 +343,6 @@ async def match_explain(
                     or 0
                 ),
                 risk_flag=response_risk_flag,
-                effective_email_score=float(
-                    entity_resolution.get(
-                        "effective_email_score"
-                    )
-                    or 0.0
-                ),
 
 
                 recommended_action=final_recommended_action,
@@ -479,10 +473,13 @@ async def match_explain(
                     triggered_rules=req.triggered_rules or [],
                     primary_signal=entity_resolution.get("primary_signal"),
                     composite_risk_score=(
-                        entity_resolution.get("composite_risk_score")
-                        or policy_rec.get("composite_risk_score")
+                    entity_resolution.get("composite_risk_score")
+                    or policy_rec.get("composite_risk_score")
                     ),
                     signal_contributions=entity_resolution.get("signal_contributions"),
+                    signal_packets=normalize_entity_resolution_signals(
+                        entity_resolution.get("signals")
+                ),
                     primary_risk_driver=primary_risk_driver,
                 )
         ai_insight = generate_text_insight(

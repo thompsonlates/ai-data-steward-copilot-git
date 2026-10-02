@@ -31,12 +31,6 @@ def score_provider(
 
     provider_email_score = 0.0
 
-    # Preserve existing pre-email specialty calculation.
-    specialty_score = engine._similarity(
-        getattr(record_a, "specialty", None),
-        getattr(record_b, "specialty", None),
-    )
-
     provider_email_match_level = "DIFFERENT"
     provider_domain_trust_score = 0.0
 
@@ -116,7 +110,7 @@ def score_provider(
         provider_name_b,
     )
 
-    # Preserve existing second specialty calculation.
+    # Provider specialty similarity.
     specialty_score = engine._similarity(
         getattr(record_a, "specialty", None),
         getattr(record_b, "specialty", None),
@@ -232,11 +226,7 @@ def score_provider(
     signals.append(
         engine._build_signal(
             "phone_match",
-            (
-                phone_score
-                if phone_score is not None
-                else 0.5
-            ),
+            phone_score,
             phone_weight,
             engine._phone_detail(
                 provider_phone_a,

@@ -91,7 +91,17 @@ class RecordSearchService:
             location_name,
             location_type,
             location_address,
-            parent_location_id
+            parent_location_id,
+            account_id,
+            banking_customer_id,
+            sap_business_partner_id,
+            account_type,
+            routing_number,
+            account_number_last4,
+            institution_name,
+            currency,
+            account_status
+
 
         FROM `api-project-503305938314.ai_data_steward_mvp.MDM_RECORD_SEARCH_INDEX`
         WHERE organization_id = @organization_id
