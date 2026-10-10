@@ -688,6 +688,7 @@ def build_quality_profile_config(
     source_name: str,
     business_key_field: str,
     mapped_fields: set[str],
+    profile_id: str | None = None,
     minimum_record_score: float = 80.0,
     field_overrides: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> QualityProfileConfig:
@@ -766,14 +767,25 @@ def build_quality_profile_config(
         domain=normalized_domain,
         mapped_fields=normalized_mapped_fields,
     )
+    normalized_profile_id = str(profile_id or "").strip() or None
+
+    if (
+        normalized_profile_id is not None
+        and not normalized_profile_id.startswith("prof_")
+    ):
+        raise ValueError(
+            "profile_id must use the prof_ profile identifier standard."
+        )
 
     return QualityProfileConfig(
         domain=normalized_domain,
         source_table=normalized_source_name,
         business_key_field=normalized_business_key,
         fields=fields,
+        profile_id=normalized_profile_id,
         cross_field_rules=cross_field_rules,
         minimum_record_score=float(
-            minimum_record_score
+        minimum_record_score
         ),
+        
     )

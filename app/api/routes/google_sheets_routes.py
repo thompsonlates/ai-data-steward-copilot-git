@@ -7,6 +7,10 @@ from app.api.route_dependencies import (
     _get_onedrive_connector,
 )
 
+from app.services.profile_rule_enhancement_service import (
+    ProfileRuleEnhancementService,
+)
+
 router = APIRouter()
 
 
@@ -182,54 +186,93 @@ def profile_google_sheet(
     normalized_domain = (
         req.domain.strip().upper()
     )
+    # ---------------------------------------------------------
+    # Durable governed profile identity
+    # ---------------------------------------------------------
+
+    if req.profile_id:
+        durable_profile = quality_profiler_repository.get_profile(
+            organization_id=organization_id,
+            profile_id=req.profile_id,
+        )
+
+        if durable_profile is None:
+            raise ValueError(
+                "Durable profile was not found for this organization."
+            )
+
+        profile_id = durable_profile["profile_id"]
+
+        if str(durable_profile.get("domain") or "").strip().upper() != normalized_domain:
+            raise ValueError(
+                "Durable profile domain does not match the requested domain."
+            )
+
+    else:
+        source_name = f"GOOGLE_SHEETS:{req.sheet_name}"
+
+        durable_profile = (
+            quality_profiler_repository.find_active_profile(
+                organization_id=organization_id,
+                domain=normalized_domain,
+                source_name=source_name,
+                business_key_field=req.business_key_field,
+            )
+        )
+
+        if durable_profile is None:
+            profile_name = (
+                (req.profile_name or "").strip()
+                or f"{normalized_domain} - {req.sheet_name}"
+            )
+
+            durable_profile = (
+                quality_profiler_repository.create_profile(
+                    organization_id=organization_id,
+                    profile_name=profile_name,
+                    domain=normalized_domain,
+                    source_name=source_name,
+                    business_key_field=req.business_key_field,
+                    created_by=str(
+                        getattr(current_user, "email", None)
+                        or getattr(current_user, "user_id", None)
+                        or "system"
+                    ),
+            )
+        )
+
+    profile_id = durable_profile["profile_id"]
 
     config = build_quality_profile_config(
-    domain=normalized_domain,
-    source_name=(
-        f"GOOGLE_SHEETS:{req.sheet_name}"
-    ),
-    business_key_field=req.business_key_field,
-    mapped_fields={
-        item.target_field
-        for item in req.column_mappings
-    },
-    minimum_record_score=85.0,
+        profile_id=profile_id,
+        domain=normalized_domain,
+        source_name=f"GOOGLE_SHEETS:{req.sheet_name}",
+        business_key_field=req.business_key_field,
+        mapped_fields={
+            item.target_field
+            for item in req.column_mappings
+        },
+        minimum_record_score=85.0,
+    )
+
+    profile_rule_enhancement_service = (
+    ProfileRuleEnhancementService(
+        quality_repository=quality_profiler_repository,
+    )
 )
 
     profiler = QualityProfilerService()
-    print(
-    "GOOGLE SHEETS UNIVERSAL SHADOW DEBUG:",
-    {
-        "env": os.getenv("ADMS_UNIVERSAL_PROFILE_RULES_SHADOW"),
-        "service_enabled": profiler.enable_universal_rules_shadow,
-    },
-)
+
 
     result = profiler.profile_rows(
         organization_id=organization_id,
         rows=normalized_rows,
         config=config,
-        source_name=(
-            f"GOOGLE_SHEETS:{req.sheet_name}"
-        ),
+        source_name=f"GOOGLE_SHEETS:{req.sheet_name}",
     )
 
-    logger.warning(
-    "GOOGLE SHEETS PROFILE MAPPING DEBUG "
-    "organization_id=%s "
-    "column_mappings=%r",
-    organization_id,
-    [
-        {
-            "source_column": item.source_column,
-            "target_field": item.target_field,
-        }
-        for item in req.column_mappings
-    ],
-)
-
     quality_profiler_repository.save_profile_result(
-    result=result,
+        result=result,
         column_mappings=[
             {
                 "source_column": item.source_column,
@@ -237,7 +280,7 @@ def profile_google_sheet(
             }
             for item in req.column_mappings
         ],
-)
+    )
 
     stage_table_id = (
         quality_profiler_repository
@@ -256,12 +299,159 @@ def profile_google_sheet(
     quality_profiler_repository.save_profile_source_context(
         organization_id=organization_id,
         profile_run_id=result.profile_run_id,
+        profile_id=profile_id,
         source_type="GOOGLE_SHEETS",
         connection_id=req.connection_id,
         spreadsheet_id=req.spreadsheet_url,
         sheet_name=req.sheet_name,
         header_row=req.header_row,
     )
+    # ---------------------------------------------------------
+    # Universal Intelligence - Profile Rule Pattern Discovery
+    # Run only after the profile run has been persisted and
+    # associated with its durable governed profile.
+    # ---------------------------------------------------------
+
+    print(
+        "UNIVERSAL DISCOVERY GATE DEBUG",
+        {
+            "enabled": result.universal_rules_shadow_enabled,
+            "shadow_is_none": (
+                result.universal_rules_shadow is None
+            ),
+            "shadow_type": type(
+                result.universal_rules_shadow
+            ).__name__,
+            "profile_id": profile_id,
+            "profile_run_id": result.profile_run_id,
+        },
+        flush=True,
+    )
+
+    if (
+        result.universal_rules_shadow_enabled
+        and result.universal_rules_shadow is not None
+    ):
+        values_by_field: dict[
+            str,
+            list[dict[str, Any]],
+        ] = {}
+
+        for field_config in config.fields:
+            field_name = str(
+                field_config.field_name or ""
+            ).strip().lower()
+
+            if not field_name:
+                continue
+
+            values_by_field[field_name] = [
+                {
+                    "source_row_id": str(
+                        row_index + 1
+                    ),
+                    "record_id": str(
+                        row.get(
+                            config.business_key_field
+                        )
+                        or ""
+                    ),
+                    "value": row.get(field_name),
+                }
+                for row_index, row in enumerate(
+                    normalized_rows
+                )
+            ]
+
+        candidate_opportunities = (
+            profile_rule_enhancement_service
+            .discover_rule_opportunities(
+                organization_id=organization_id,
+                profile_id=profile_id,
+                profile_run_id=result.profile_run_id,
+                values_by_field=values_by_field,
+            )
+        )
+        print(
+            "UNIVERSAL DISCOVERY RESULT DEBUG",
+            {
+                "opportunity_count": len(
+                    candidate_opportunities
+                ),
+                "opportunities": [
+                    {
+                        "field_name": item.field_name,
+                        "pattern_summary": (
+                            item.pattern_summary
+                        ),
+                        "affected_record_count": (
+                            item.affected_record_count
+                        ),
+                    }
+                    for item in candidate_opportunities
+                ],
+            },
+            flush=True,
+        )
+
+        result.universal_rules_shadow[
+            "candidate_opportunities"
+        ] = [
+            {
+                "field_name": item.field_name,
+                "pattern_summary": item.pattern_summary,
+                "affected_record_count": (
+                    item.affected_record_count
+                ),
+                "sample_values": item.sample_values,
+                "suggested_rule_type": (
+                    item.suggested_rule_type
+                ),
+                "evidence_examples": [
+                {
+                    "current_value": (
+                        evidence.current_value
+                    ),
+                    "proposed_value": (
+                        evidence.proposed_value
+                    ),
+                    "affected_record_count": (
+                        evidence.affected_record_count
+                    ),
+                }
+                    for evidence in item.evidence_examples
+            ],
+                "suggested_operator": (
+                    item.suggested_operator
+                ),
+                "suggested_comparison_value": (
+                    item.suggested_comparison_value
+                ),
+                "suggested_action": (
+                    item.suggested_action
+                ),
+                "suggested_replacement_value": (
+                    item.suggested_replacement_value
+                ),
+                "confidence": item.confidence,
+                "explanation": item.explanation,
+                "requires_steward_review": (
+                    item.requires_steward_review
+                ),
+            }
+            for item in candidate_opportunities
+            
+        ]
+
+        logger.info(
+            "Universal profile rule discovery complete. "
+            "organization_id=%s profile_id=%s "
+            "profile_run_id=%s opportunity_count=%s",
+            organization_id,
+            profile_id,
+            result.profile_run_id,
+            len(candidate_opportunities),
+        )
 
     logger.info(
         "Google Sheets DQ profile staging ready. "
@@ -275,6 +465,7 @@ def profile_google_sheet(
         "success": True,
         "organization_id": organization_id,
         "profile_run_id": result.profile_run_id,
+        "profile_id": profile_id,
         "universal_rules_shadow_enabled": (
             result.universal_rules_shadow_enabled
         ),

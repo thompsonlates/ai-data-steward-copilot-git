@@ -45,6 +45,7 @@ class RuleScope(str, Enum):
     SEMANTIC_TYPE = "SEMANTIC_TYPE"
     DOMAIN = "DOMAIN"
     ORGANIZATION = "ORGANIZATION"
+    PROFILE = "PROFILE"
 
 
 class RuleStatus(str, Enum):
@@ -101,6 +102,7 @@ _SCOPE_PRECEDENCE = {
     RuleScope.SEMANTIC_TYPE: 20,
     RuleScope.DOMAIN: 30,
     RuleScope.ORGANIZATION: 40,
+    RuleScope.PROFILE: 50,
 }
 
 
@@ -204,8 +206,9 @@ class ProfileRuleDefinition:
     # SEMANTIC_TYPE: semantic_types should be populated.
     # DOMAIN: domains should be populated.
     # ORGANIZATION: organization_id is required; domain/field selectors may
-    #               further narrow the tenant-specific standard.
+    # further narrow the tenant-specific standard.
     organization_id: str | None = None
+    profile_id: str | None = None
     domains: tuple[str, ...] = field(default_factory=tuple)
     semantic_types: tuple[str, ...] = field(default_factory=tuple)
     field_names: tuple[str, ...] = field(default_factory=tuple)
@@ -235,6 +238,7 @@ class ProfileRuleDefinition:
         object.__setattr__(self, "severity", _normalize_severity(self.severity))
         object.__setattr__(self, "description", _text(self.description))
         object.__setattr__(self, "organization_id", _text(self.organization_id) or None)
+        object.__setattr__(self, "profile_id", _text(self.profile_id) or None)
         object.__setattr__(self, "domains", _normalize_string_tuple(self.domains, upper=True))
         object.__setattr__(
             self,
@@ -289,6 +293,26 @@ class ProfileRuleDefinition:
             if not self.organization_id.startswith("org_"):
                 raise ValueError(
                     f"{self.rule_id}: organization_id must use the org_ tenant identifier."
+                )
+        if self.scope == RuleScope.PROFILE:
+            if not self.organization_id:
+                raise ValueError(
+                    f"{self.rule_id}: PROFILE scope requires organization_id."
+                )
+
+            if not self.organization_id.startswith("org_"):
+                raise ValueError(
+                    f"{self.rule_id}: organization_id must use the org_ tenant identifier."
+                )
+
+            if not self.profile_id:
+                raise ValueError(
+                    f"{self.rule_id}: PROFILE scope requires profile_id."
+                )
+
+            if not self.profile_id.startswith("prof_"):
+                raise ValueError(
+                    f"{self.rule_id}: profile_id must use the prof_ profile identifier."
                 )
 
     def _validate_lifecycle(self) -> None:
@@ -390,6 +414,7 @@ class ProfileRuleDefinition:
         *,
         organization_id: str,
         domain: str,
+        profile_id: str | None = None,
         field_name: str | None = None,
         semantic_type: str | None = None,
         at: datetime | None = None,
@@ -399,13 +424,21 @@ class ProfileRuleDefinition:
             return False
 
         effective_org = _text(organization_id)
+        effective_profile = _text(profile_id)
         effective_domain = _upper(domain)
         effective_field = _lower(field_name)
         effective_semantic = _upper(semantic_type)
 
-        if self.scope == RuleScope.ORGANIZATION:
+        if self.scope in {RuleScope.ORGANIZATION, RuleScope.PROFILE}:
             if self.organization_id != effective_org:
                 return False
+
+        if self.scope == RuleScope.PROFILE:
+            if not effective_profile:
+                        return False
+
+            if self.profile_id != effective_profile:
+                        return False
 
         if self.domains and effective_domain not in self.domains:
             return False
@@ -433,6 +466,7 @@ class ProfileRuleDefinition:
             "severity": self.severity,
             "description": self.description,
             "organization_id": self.organization_id,
+            "profile_id": self.profile_id,
             "domains": list(self.domains),
             "semantic_types": list(self.semantic_types),
             "field_names": list(self.field_names),
@@ -456,6 +490,7 @@ class ProfileRuleDefinition:
 class RuleResolutionContext:
     organization_id: str
     domain: str
+    profile_id: str | None = None
     mapped_fields: tuple[str, ...] = field(default_factory=tuple)
     semantic_types_by_field: Mapping[str, str] = field(default_factory=dict)
     as_of: datetime | None = None
@@ -473,6 +508,11 @@ class RuleResolutionContext:
         if not domain:
             raise ValueError("domain is required.")
 
+        profile_id = _text(self.profile_id)
+        if profile_id and not profile_id.startswith("prof_"):
+            raise ValueError(
+                "profile_id must use the prof_ profile identifier standard."
+            )
         mapped_fields = _normalize_string_tuple(self.mapped_fields, upper=False)
         semantic_types = {
             _lower(field_name): _upper(semantic_type)
@@ -486,6 +526,7 @@ class RuleResolutionContext:
         object.__setattr__(self, "domain", domain)
         object.__setattr__(self, "mapped_fields", mapped_fields)
         object.__setattr__(self, "semantic_types_by_field", semantic_types)
+        object.__setattr__(self, "profile_id", profile_id)
 
 
 @dataclass(frozen=True)
@@ -585,10 +626,12 @@ class ProfileRuleRegistry:
         *,
         organization_id: str,
         domain: str,
+        profile_id: str | None = None,
         at: datetime | None = None,
-    ) -> tuple[ProfileRuleDefinition, ...]:
+) -> tuple[ProfileRuleDefinition, ...]:
         effective_org = _text(organization_id)
         effective_domain = _upper(domain)
+        effective_profile = _text(profile_id)
 
         return tuple(
             rule
@@ -596,6 +639,7 @@ class ProfileRuleRegistry:
             if rule.matches_context(
                 organization_id=effective_org,
                 domain=effective_domain,
+                profile_id=effective_profile,
                 at=at,
             )
         )
@@ -622,8 +666,18 @@ class ProfileRuleRegistry:
                 continue
 
             # Tenant/domain gates that do not depend on a specific field.
-            if definition.scope == RuleScope.ORGANIZATION:
+            if definition.scope in {
+                RuleScope.ORGANIZATION,
+                RuleScope.PROFILE,
+            }:
                 if definition.organization_id != context.organization_id:
+                    continue
+
+            if definition.scope == RuleScope.PROFILE:
+                if not context.profile_id:
+                    continue
+
+                if definition.profile_id != context.profile_id:
                     continue
 
             if definition.domains and context.domain not in definition.domains:
@@ -660,12 +714,13 @@ class ProfileRuleRegistry:
                 semantic_type = context.semantic_types_by_field.get(field_name)
 
                 if not definition.matches_context(
-                    organization_id=context.organization_id,
-                    domain=context.domain,
-                    field_name=field_name,
-                    semantic_type=semantic_type,
-                    at=context.as_of,
-                ):
+                organization_id=context.organization_id,
+                domain=context.domain,
+                profile_id=context.profile_id,
+                field_name=field_name,
+                semantic_type=semantic_type,
+                at=context.as_of,
+            ):
                     continue
 
                 candidates.append(

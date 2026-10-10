@@ -12,6 +12,8 @@ from app.repositories.quality_profiler_repository import (
 )
 from app.services.llm_service import LLMService
 from app.services.prompt_builder import (
+    GOVERNED_FULL_NAME_STANDARDIZATION_REGEX,
+    GOVERNED_PRODUCT_VARIANT_STANDARDIZATION_REGEX,
     build_dq_ai_recommendation_prompt,
     build_dq_remediation_prompt,
 )
@@ -800,6 +802,47 @@ class DqAiRecommendationService:
                     "include remediation_sql."
                 )
 
+            # Validate the model-returned regex first. Even when a governed
+            # contract will replace it below, malformed model output must not
+            # silently bypass remediation artifact validation.
+            remediation_regex = (
+                self._validate_generated_remediation_regex(
+                    remediation_regex
+                )
+            )
+
+            normalized_field_name = str(
+                recommendation.get("field_name") or ""
+            ).strip().lower()
+
+            # ---------------------------------------------------------
+            # Governed deterministic REGEX enforcement
+            # ---------------------------------------------------------
+            # Claude may explain and recommend deterministic remediation,
+            # but it must not redefine an approved executable contract.
+            #
+            # The constants in prompt_builder.py are authoritative.
+            # Persist exactly the governed contract for supported rules so
+            # recommendation generation and governed execution cannot drift.
+            # ---------------------------------------------------------
+
+            if (
+                rule_id == "PRODUCT_VARIANT_STANDARDIZATION"
+                and normalized_field_name == "product_variant"
+            ):
+                remediation_regex = (
+                    GOVERNED_PRODUCT_VARIANT_STANDARDIZATION_REGEX
+                )
+
+            elif (
+                rule_id == "FULL_NAME_STANDARDIZATION"
+                and normalized_field_name == "full_name"
+            ):
+                remediation_regex = (
+                    GOVERNED_FULL_NAME_STANDARDIZATION_REGEX
+                )
+
+            # Validate the final artifact that will actually be persisted.
             remediation_regex = (
                 self._validate_generated_remediation_regex(
                     remediation_regex

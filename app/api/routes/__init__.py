@@ -27,6 +27,7 @@ from . import user_routes
 from . import entitlement_routes
 from . import search_routes
 from . import auth_routes
+from . import profile_rule_routes
 
 from app.api.routes.bigquery_routes import router as bigquery_router
 from app.api.routes.snowflake_routes import router as snowflake_router
@@ -57,3 +58,4 @@ router.include_router(user_routes.router)
 router.include_router(entitlement_routes.router)
 router.include_router(search_routes.router)
 router.include_router(auth_routes.router)
+router.include_router(profile_rule_routes.router)

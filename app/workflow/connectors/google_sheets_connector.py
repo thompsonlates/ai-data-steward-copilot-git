@@ -989,7 +989,7 @@ class GoogleSheetsConnector:
             f"{range_expression}"
         )
 
-        logger.info(
+        logger.warning(
             "Reading governed Google Sheets remediation column. "
             "spreadsheet_id=%s sheet_name=%s column_name=%s "
             "range=%s",
@@ -1170,7 +1170,7 @@ class GoogleSheetsConnector:
         # the safety preflight fail before Google can evaluate the request.
         # Chunking keeps the exact-cell formula guard while remaining safe for
         # executions with thousands of approved updates.
-        batch_size = 100
+        batch_size = 250
 
         for batch_start in range(
             0,
@@ -1180,6 +1180,37 @@ class GoogleSheetsConnector:
             range_batch = target_ranges[
                 batch_start:batch_start + batch_size
             ]
+
+            prepared_request = requests.Request(
+                "GET",
+                batch_get_url,
+                headers=self._headers(),
+                params=[
+                    ("majorDimension", "ROWS"),
+                    ("valueRenderOption", "FORMULA"),
+                    *[
+                        ("ranges", cell_range)
+                        for cell_range in range_batch
+                    ],
+                ],
+            ).prepare()
+            if len(prepared_request.url or "") > 12000:
+                raise RuntimeError(
+                    "Google Sheets governed preflight request exceeded "
+                    "the safe URL-size limit. "
+                    f"url_length={len(prepared_request.url or '')} "
+                    f"batch_count={len(range_batch)}"
+                )
+
+            print(
+                "GOOGLE SHEETS PREFLIGHT DEBUG "
+                f"batch_start={batch_start} "
+                f"batch_count={len(range_batch)} "
+                f"url_length={len(prepared_request.url or '')} "
+                f"first_range={range_batch[0] if range_batch else None} "
+                f"last_range={range_batch[-1] if range_batch else None}",
+                flush=True,
+            )
 
             batch_response = requests.get(
                 batch_get_url,
@@ -1301,6 +1332,7 @@ class GoogleSheetsConnector:
         updates: List[Dict[str, Any]],
         header_row: int = 1,
         max_updates: int = 5000,
+        safety_preflight_completed: bool = False,
     ) -> Dict[str, Any]:
         """
         Apply an exact set of steward-approved cell replacements to a normal
@@ -1368,28 +1400,34 @@ class GoogleSheetsConnector:
                 f"Too many cell updates. Maximum allowed is {max_updates}."
             )
 
-        safety = self.inspect_governed_write_safety(
-            spreadsheet_id=normalized_spreadsheet_id,
-            sheet_name=normalized_sheet_name,
-            updates=updates,
-            header_row=safe_header_row,
-            max_updates=max_updates,
-        )
-
-        if not safety.get("safe_to_write"):
-            reason = str(safety.get("reason") or "UNSAFE_WRITE_TARGET")
-            if reason == "TARGET_CELL_CONTAINS_FORMULA":
-                raise ValueError(
-                    "Governed Google Sheets remediation is blocked because one or more target cells contain formulas. Execute against physical source cells instead."
-                )
-            if reason == "SPILL_FORMULA_PRESENT":
-                raise ValueError(
-                    "Governed Google Sheets remediation is blocked because the worksheet contains a spill/array formula. Writing physical values could collapse formula output and cause #REF! errors. Execute against the underlying physical source worksheet instead."
-                )
-            raise ValueError(
-                "Governed Google Sheets remediation is blocked by write-safety preflight: "
-                f"{reason}."
+        if not safety_preflight_completed:
+            safety = self.inspect_governed_write_safety(
+                spreadsheet_id=normalized_spreadsheet_id,
+                sheet_name=normalized_sheet_name,
+                updates=updates,
+                header_row=safe_header_row,
+                max_updates=max_updates,
             )
+
+            if not safety.get("safe_to_write"):
+                reason = str(safety.get("reason") or "UNSAFE_WRITE_TARGET")
+
+                if reason == "TARGET_CELL_CONTAINS_FORMULA":
+                    raise ValueError(
+                        "Governed Google Sheets remediation is blocked because "
+                        "one or more target cells contain formulas."
+                    )
+
+                if reason == "SPILL_FORMULA_PRESENT":
+                    raise ValueError(
+                        "Governed Google Sheets remediation is blocked because "
+                        "the worksheet contains a spill/array formula."
+                    )
+
+                raise ValueError(
+                    "Governed Google Sheets remediation is blocked by "
+                    f"write-safety preflight: {reason}."
+                )
 
         metadata = self._get_spreadsheet_metadata(
             spreadsheet_id=normalized_spreadsheet_id

@@ -748,6 +748,7 @@ class DqExecutionResponse(
 
     recommendation_id: str
     profile_run_id: str
+    profile_id: str
 
     remediation_version_id: Optional[str] = None
 
@@ -825,6 +826,9 @@ class DqExecutionResponse(
 
     reprofile_required: Optional[bool] = None
     policy_verification_status: Optional[str] = None
+    cells_updated: Optional[int] = None
+    batch_count: Optional[int] = None
+    batch_sizes: Optional[List[int]] = None
 
     started_at: Optional[datetime] = None
     executed_at: Optional[datetime] = None
@@ -856,6 +860,12 @@ class GoogleSheetsProfileRequest(BaseModel):
     header_row: int = 1
     business_key_field: str
     column_mappings: list[GoogleSheetsColumnMapping]
+
+    # Durable governed profile identity.
+    # Omit profile_id for the first profiling run.
+    # Supply it on subsequent reprofile runs.
+    profile_id: str | None = None
+    profile_name: str | None = None
 
 class DatabricksPreviewRequest(BaseModel):
     connection_id: str = Field(min_length=1)
@@ -2387,6 +2397,26 @@ class UniversalProfileFindingResponse(BaseModel):
     remediation_type: str | None = None
 
 
+class UniversalProfileRuleOpportunityResponse(BaseModel):
+    field_name: str
+    pattern_summary: str
+    affected_record_count: int
+    sample_values: list[Any] = Field(
+        default_factory=list
+    )
+
+    suggested_rule_type: str
+    suggested_operator: str
+    suggested_comparison_value: Any | None = None
+
+    suggested_action: str
+    suggested_replacement_value: Any | None = None
+
+    confidence: float
+    explanation: str
+    requires_steward_review: bool = True
+
+
 class UniversalProfileRulesShadowResponse(BaseModel):
     mode: str = "SHADOW"
     authoritative: bool = False
@@ -2407,12 +2437,17 @@ class UniversalProfileRulesShadowResponse(BaseModel):
         UniversalProfileFindingResponse
     ] = Field(default_factory=list)
 
+    candidate_opportunities: list[
+        UniversalProfileRuleOpportunityResponse
+    ] = Field(default_factory=list)
+
 
 class UniversalProfileResponseMixin(BaseModel):
     universal_rules_shadow_enabled: bool = False
     universal_rules_shadow: (
         UniversalProfileRulesShadowResponse | None
     ) = None
+
 
 class GoogleSheetsProfileResponse(
     TenantScopedResponseModel,
@@ -2494,3 +2529,198 @@ class CsvProfileResponse(TenantScopedResponseModel,UniversalProfileResponseMixin
     source_type: str = "CSV"
 
     generated_at: Optional[datetime] = None
+
+# ============================================================
+# Profile Rule Enhancement
+# ============================================================
+
+ProfileRuleAction = Literal[
+    "STANDARDIZE_VALUE",
+    "REPLACE_VALUE",
+    "DELETE_VALUE",
+    "FLAG_FOR_REVIEW",
+]
+
+ProfileRuleOperator = Literal[
+    "CONTAINS",
+    "EQUALS",
+    "REGEX",
+    "IN",
+]
+
+class ProfileRuleDiscoveryCandidateRequest(BaseModel):
+    profile_id: str = Field(
+        ...,
+        pattern=r"^prof_",
+    )
+    profile_run_id: str = Field(
+        ...,
+        pattern=r"^dqp_",
+    )
+
+    field_name: str = Field(
+        ...,
+        min_length=1,
+        max_length=255,
+    )
+    pattern_summary: str = Field(
+        ...,
+        min_length=1,
+        max_length=500,
+    )
+
+    rule_type: str = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+    )
+    operator: ProfileRuleOperator
+    comparison_value: Any
+
+    remediation_action: ProfileRuleAction
+    replacement_value: Any | None = None
+
+    confidence: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+    )
+    explanation: str = Field(
+        ...,
+        min_length=1,
+        max_length=4000,
+    )
+
+
+class ProfileRuleAnalyzeRequest(BaseModel):
+    profile_id: str = Field(
+        ...,
+        pattern=r"^prof_",
+    )
+    profile_run_id: str = Field(
+        ...,
+        pattern=r"^dqp_",
+    )
+    instruction: str = Field(
+        ...,
+        min_length=3,
+        max_length=2000,
+    )
+
+
+class ProfileRuleCandidateResponse(
+    TenantScopedResponseModel
+):
+    candidate_id: str
+
+    profile_id: str
+    profile_run_id: str
+
+    domain: str
+    field_name: str
+
+    rule_name: str
+    rule_type: str
+
+    operator: ProfileRuleOperator
+    comparison_value: Any | None = None
+
+    remediation_action: ProfileRuleAction
+    replacement_value: Any | None = None
+
+    scope: Literal["PROFILE"] = "PROFILE"
+    status: Literal["CANDIDATE"] = "CANDIDATE"
+
+    steward_instruction: str
+    ai_explanation: str
+
+    created_at: datetime
+
+
+class ProfileRulePreviewItem(BaseModel):
+    source_row_id: str | None = None
+    record_id: str | None = None
+
+    field_name: str
+
+    current_value: Any | None = None
+    suggested_value: Any | None = None
+
+    suggested_action: ProfileRuleAction
+
+
+class ProfileRulePreviewResponse(
+    TenantScopedResponseModel
+):
+    candidate_id: str
+
+    profile_id: str
+    profile_run_id: str
+
+    field_name: str
+
+    records_evaluated: int = 0
+    affected_record_count: int = 0
+
+    preview: List[
+        ProfileRulePreviewItem
+    ] = Field(default_factory=list)
+
+    source_mutated: Literal[False] = False
+
+
+class ProfileRuleApproveRequest(BaseModel):
+    approved: Literal[True] = True
+
+
+class ProfileRuleApproveResponse(
+    TenantScopedResponseModel
+):
+    candidate_id: str
+    rule_id: str
+
+    profile_id: str
+    profile_run_id: str
+
+    scope: Literal["PROFILE"] = "PROFILE"
+    status: Literal["ACTIVE"] = "ACTIVE"
+
+    version: int
+
+    field_name: str
+    remediation_action: ProfileRuleAction
+
+    approved_by: str
+    approved_at: datetime
+
+    requires_reprofile: Literal[True] = True
+
+class ProfileRuleRejectRequest(BaseModel):
+    reason: str = Field(
+        ...,
+        min_length=3,
+        max_length=2000,
+    )
+    false_positive_source_row_ids: List[str] = Field(
+        default_factory=list,
+        max_length=100,
+    )
+    steward_guidance: str | None = Field(
+        default=None,
+        max_length=2000,
+    )
+
+
+class ProfileRuleRejectResponse(TenantScopedResponseModel):
+    candidate_id: str
+    profile_id: str
+    profile_run_id: str
+    status: Literal["REJECTED"] = "REJECTED"
+    false_positive_count: int = 0
+    rejected_by: str
+    rejected_at: datetime
+    rejection_reason: str
+    steward_guidance: str | None = None
+    rule_activated: Literal[False] = False
+    source_mutated: Literal[False] = False
+    requires_reprofile: Literal[False] = False

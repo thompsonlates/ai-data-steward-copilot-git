@@ -131,6 +131,7 @@ class QualityProfileConfig:
     business_key_field: str
 
     fields: Sequence[QualityFieldConfig]
+    profile_id: Optional[str] = None
 
     cross_field_rules: Sequence[CrossFieldRule] = field(
         default_factory=tuple
@@ -275,7 +276,7 @@ class QualityProfilerService:
         project_id: Optional[str] = None,
         universal_rules_engine: UniversalProfileRulesEngine | None = None,
         enable_universal_rules_shadow: Optional[bool] = None,
-    ) -> None:
+) -> None:
         self.client = client or bigquery.Client(
             project=project_id
         )
@@ -1230,9 +1231,17 @@ class QualityProfilerService:
 
             result.universal_rules_shadow = (
                 self._serialize_universal_rules_shadow(
-                    universal_result
+                    universal_result,
                 )
             )
+            
+            result.universal_rules_shadow = (
+                self._serialize_universal_rules_shadow(
+                    universal_result,
+                )
+            )
+            
+
 
             logger.info(
                 "Universal Profile Rules shadow evaluation complete. "
@@ -1278,6 +1287,7 @@ class QualityProfilerService:
 
         return self.universal_rules_engine.evaluate_profile(
             organization_id=organization_id,
+            profile_id=config.profile_id,
             domain=domain,
             profile_run_id=profile_run_id,
             rows=rows,
@@ -1291,6 +1301,8 @@ class QualityProfilerService:
     @staticmethod
     def _serialize_universal_rules_shadow(
         universal_result: UniversalProfileRuleResult,
+        *,
+        candidate_opportunities: Sequence[Any] = (),
     ) -> Dict[str, Any]:
         """
         Return a JSON-safe diagnostic payload for backend regression testing.
@@ -1346,6 +1358,41 @@ class QualityProfilerService:
                 universal_result.executed_rule_count
             ),
             "total_findings": universal_result.total_findings,
+            "candidate_opportunities": [
+    {
+            "field_name": item.field_name,
+            "pattern_summary": (
+                item.pattern_summary
+            ),
+            "affected_record_count": (
+                item.affected_record_count
+            ),
+            "sample_values": list(
+                item.sample_values
+            ),
+            "suggested_rule_type": (
+                item.suggested_rule_type
+            ),
+            "suggested_operator": (
+                item.suggested_operator
+            ),
+            "suggested_comparison_value": (
+                item.suggested_comparison_value
+            ),
+            "suggested_action": (
+                item.suggested_action
+            ),
+            "suggested_replacement_value": (
+                item.suggested_replacement_value
+            ),
+            "confidence": item.confidence,
+            "explanation": item.explanation,
+            "requires_steward_review": (
+                item.requires_steward_review
+            ),
+        }
+        for item in candidate_opportunities
+    ],
             "semantic_types": semantic_types,
             "findings": [
                 {

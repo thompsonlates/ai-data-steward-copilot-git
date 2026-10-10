@@ -8,6 +8,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from app.services.connections.connector_factory import EnterpriseConnectorFactory
+
 import requests
 import snowflake.connector
 from fastapi import HTTPException
@@ -1829,6 +1831,21 @@ class ConnectionService:
                     connection=connection,
                     credentials=credentials,
                 )
+
+            elif vendor in {"POSTGRESQL", "POSTGRES"}:
+                connector = EnterpriseConnectorFactory.create(
+                    connection=connection,
+                    credentials=credentials,
+                )
+
+                result = connector.test_connection()
+
+                if result.get("status") == "HEALTHY":
+                    success = True
+                    message = "PostgreSQL connection succeeded"
+                else:
+                    success = False
+                    message = "PostgreSQL connection test failed"
 
             else:
                 success = False

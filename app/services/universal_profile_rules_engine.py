@@ -1,4 +1,5 @@
 from __future__ import annotations
+import profile
 
 """
 Universal deterministic profile-rule engine for AI Data Steward Copilot.
@@ -126,6 +127,7 @@ class UniversalProfileRulesEngine:
         self,
         *,
         organization_id: str,
+        profile_id: str | None = None,
         domain: str,
         profile_run_id: str,
         rows: Sequence[Mapping[str, Any]],
@@ -139,6 +141,12 @@ class UniversalProfileRulesEngine:
         as_of: datetime | None = None,
     ) -> UniversalProfileRuleResult:
         org = self._require_org(organization_id)
+        profile = str(profile_id or "").strip() or None
+
+        if profile is not None and not profile.startswith("prof_"):
+            raise ValueError(
+                "profile_id must use the prof_ profile identifier standard."
+            )
         dom = self._require(domain, "domain").upper()
         run_id = self._require(profile_run_id, "profile_run_id")
         source = self._require(source_name, "source_name")
@@ -171,6 +179,7 @@ class UniversalProfileRulesEngine:
             context=RuleResolutionContext(
                 organization_id=org,
                 domain=dom,
+                profile_id=profile,
                 mapped_fields=fields,
                 semantic_types_by_field=semantic_types,
                 as_of=as_of,

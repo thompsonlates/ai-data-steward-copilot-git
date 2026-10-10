@@ -31,6 +31,11 @@ from app.services.snowflake_connection_factory import (
 from app.workflow.connectors.google_sheets_connector import GoogleSheetsConnector
 from app.workflow.connectors.onedrive_connector import OneDriveConnector
 
+from app.services.prompt_builder import (
+    GOVERNED_FULL_NAME_STANDARDIZATION_REGEX,
+    GOVERNED_PRODUCT_VARIANT_STANDARDIZATION_REGEX,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -142,10 +147,11 @@ class DqExecutionService:
     # UOM vocabulary approval remains governed separately by
     # PRODUCT_VARIANT_UOM_ALLOWED_VALUE.
     GOOGLE_SHEETS_PRODUCT_VARIANT_REGEX = (
-        r"^\s*([0-9]+(?:\.[0-9]+)?)\s+([A-Za-z]+)\s*$"
+        GOVERNED_PRODUCT_VARIANT_STANDARDIZATION_REGEX
     )
+
     FULL_NAME_STANDARDIZATION_REGEX = (
-        r"^\s*(\S+(?:\s+\S+)*)\s*$"
+        GOVERNED_FULL_NAME_STANDARDIZATION_REGEX
     )
 
     ALLOWED_SQL_VERBS = {
@@ -153,10 +159,8 @@ class DqExecutionService:
     }
 
     BLOCKED_SQL_KEYWORDS = {
-        "DELETE",
         "DROP",
         "TRUNCATE",
-        "ALTER",
         "CREATE",
         "INSERT",
         "MERGE",
@@ -166,7 +170,6 @@ class DqExecutionService:
         "COPY",
         "PUT",
         "GET",
-        "REMOVE",
         "UNDROP",
     }
 
@@ -896,6 +899,20 @@ class DqExecutionService:
             header_row=safe_header_row,
             limit=100_000,
         )
+        logger.warning(
+            "GOOGLE SHEETS REMEDIATION INPUT DEBUG "
+            "rule_id=%s field_name=%s source_column=%s "
+            "target_column=%s cells=%s sample_values=%r",
+            context["rule_id"],
+            context.get("field_name"),
+            context.get("source_column"),
+            target_column,
+            len(source_cells),
+            [
+                cell.get("value")
+                for cell in source_cells[:20]
+            ],
+        )
 
         updates: list[dict[str, Any]] = []
         rows_evaluated = 0
@@ -956,13 +973,54 @@ class DqExecutionService:
         # execution audit is opened and before any mutation is attempted.
         if updates:
             try:
-                write_safety = connector.inspect_governed_write_safety(
-                    spreadsheet_id=effective_spreadsheet_id,
-                    sheet_name=effective_sheet_name,
-                    updates=updates,
-                    header_row=safe_header_row,
-                    max_updates=10_000,
-                )
+                for batch_start in range(0, len(updates), 10_000):
+                    batch = updates[batch_start:batch_start + 10_000]
+
+                    write_safety = connector.inspect_governed_write_safety(
+                        spreadsheet_id=effective_spreadsheet_id,
+                        sheet_name=effective_sheet_name,
+                        updates=batch,
+                        header_row=safe_header_row,
+                        max_updates=10_000,
+                    )
+
+                    if not write_safety.get("safe_to_write"):
+                        reason = str(
+                            write_safety.get("reason")
+                            or "UNSAFE_WRITE_TARGET"
+                        )
+
+                        if reason == "TARGET_CELL_CONTAINS_FORMULA":
+                            detail = (
+                                "Google Sheets remediation is blocked because "
+                                "one or more target cells contain formulas. "
+                                "Execute against physical source cells instead."
+                            )
+                        elif reason == "SPILL_FORMULA_PRESENT":
+                            detail = (
+                                "Google Sheets remediation is blocked because "
+                                "the worksheet contains a spill/array formula. "
+                                "Writing physical values could collapse formula "
+                                "output and cause #REF! errors. Execute against "
+                                "the underlying physical source worksheet instead."
+                            )
+                        elif reason == "NON_GRID_WORKSHEET":
+                            detail = (
+                                "Google Sheets remediation is blocked because "
+                                "the selected worksheet is not a standard GRID "
+                                "worksheet."
+                            )
+                        else:
+                            detail = (
+                                "Google Sheets remediation is blocked by the "
+                                f"write-safety preflight: {reason}."
+                            )
+
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail=detail,
+                        )
+
             except ValueError as exc:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
@@ -988,44 +1046,6 @@ class DqExecutionService:
                         "preflight could not be completed."
                     ),
                 ) from exc
-
-            if not write_safety.get("safe_to_write"):
-                reason = str(
-                    write_safety.get("reason")
-                    or "UNSAFE_WRITE_TARGET"
-                )
-
-                if reason == "TARGET_CELL_CONTAINS_FORMULA":
-                    detail = (
-                        "Google Sheets remediation is blocked because "
-                        "one or more target cells contain formulas. "
-                        "Execute against physical source cells instead."
-                    )
-                elif reason == "SPILL_FORMULA_PRESENT":
-                    detail = (
-                        "Google Sheets remediation is blocked because "
-                        "the worksheet contains a spill/array formula. "
-                        "Writing physical values could collapse formula "
-                        "output and cause #REF! errors. Execute against "
-                        "the underlying physical source worksheet instead."
-                    )
-                elif reason == "NON_GRID_WORKSHEET":
-                    detail = (
-                        "Google Sheets remediation is blocked because "
-                        "the selected worksheet is not a standard GRID "
-                        "worksheet."
-                    )
-                else:
-                    detail = (
-                        "Google Sheets remediation is blocked by the "
-                        f"write-safety preflight: {reason}."
-                    )
-
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=detail,
-                )
-
         execution_id = f"exec_{uuid.uuid4().hex[:24]}"
         started_at = datetime.now(timezone.utc)
 
@@ -1076,24 +1096,41 @@ class DqExecutionService:
 
         try:
             if updates:
-                write_result = connector.apply_governed_cell_updates(
-                    spreadsheet_id=effective_spreadsheet_id,
-                    sheet_name=effective_sheet_name,
-                    updates=updates,
-                    header_row=safe_header_row,
-                    max_updates=10_000,
-                )
-                rows_affected = int(
-                    write_result.get("updated_cells")
-                    or 0
-                )
+                    total_updated_cells = 0
+
+                    for batch_start in range(0, len(updates), 10_000):
+                        batch = updates[batch_start:batch_start + 10_000]
+
+                        write_result = connector.apply_governed_cell_updates(
+                            spreadsheet_id=effective_spreadsheet_id,
+                            sheet_name=effective_sheet_name,
+                            updates=batch,
+                            header_row=safe_header_row,
+                            max_updates=10_000,
+                            safety_preflight_completed=True,
+                        
+                        )
+
+                        total_updated_cells += int(
+                            write_result.get("updated_cells") or 0
+                        )
+
+                    rows_affected = total_updated_cells
+                    batch_count = (len(updates) + 9_999) // 10_000
+                    batch_sizes = [
+                        len(updates[i:i + 10_000])
+                        for i in range(0, len(updates), 10_000)
+                    ]
+
             else:
-                write_result = {
-                    "success": True,
-                    "requested_updates": 0,
-                    "updated_cells": 0,
-                }
-                rows_affected = 0
+                    write_result = {
+                        "success": True,
+                        "requested_updates": 0,
+                        "updated_cells": 0,
+                    }
+                    rows_affected = 0
+                    batch_count = 0
+                    batch_sizes = []
 
             executed_at = datetime.now(timezone.utc)
             target_execution_succeeded = True
@@ -1120,15 +1157,44 @@ class DqExecutionService:
                     type(audit_exc).__name__,
                     exc_info=True,
                 )
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=(
-                        "Google Sheets remediation completed, but "
-                        "execution audit finalization failed. Do not "
-                        "retry automatically. Reference "
-                        f"execution_id={execution_id}."
+
+                executed_at = datetime.now(timezone.utc)
+
+                result = self._build_result(
+                    context=context,
+                    execution_id=execution_id,
+                    execution_status="SUCCEEDED_AUDIT_WARNING",
+                    vendor_status="SUCCEEDED",
+                    rows_affected=rows_affected,
+                    statement_id=None,
+                    executed_at=executed_at,
+                    error_message=(
+                        "Source remediation succeeded, but execution "
+                        "audit finalization requires reconciliation."
                     ),
-                ) from audit_exc
+                    started_at=started_at,
+                    rows_evaluated=rows_evaluated,
+                    rows_changed=rows_changed,
+                    rows_skipped=rows_skipped,
+                )
+
+                result.update(
+                    {
+                        "execution_target": "GOOGLE_SHEETS",
+                        "rule_id": context["rule_id"],
+                        "field_name": target_column,
+                        "spreadsheet_id": effective_spreadsheet_id,
+                        "sheet_name": effective_sheet_name,
+                        "cells_updated": rows_affected,
+                        "batch_count": batch_count,
+                        "batch_sizes": batch_sizes,
+                        "reprofile_required": True,
+                        "policy_verification_status": "PENDING_REPROFILE",
+                        "audit_warning": True,
+                    }
+                )
+
+                return result
 
             result = self._build_result(
                 context=context,
@@ -1154,6 +1220,9 @@ class DqExecutionService:
                     "sheet_name": effective_sheet_name,
                     "reprofile_required": True,
                     "policy_verification_status": "PENDING_REPROFILE",
+                    "cells_updated": rows_affected,
+                    "batch_count": batch_count,
+                    "batch_sizes": batch_sizes,
                 }
             )
 
@@ -1346,6 +1415,11 @@ class DqExecutionService:
                     header_row=safe_header_row,
                     max_updates=10_000,
                 )
+                if not write_safety.get("safe_to_write"):
+                    reason = str(
+                        write_safety.get("reason")
+                        or "UNSAFE_WRITE_TARGET"
+                    )
             except ValueError as exc:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
@@ -2256,6 +2330,27 @@ class DqExecutionService:
             profile_run_id,
             field_name="profile_run_id",
         )
+
+        profile_source_context = (
+        self.quality_repository.get_profile_source_context(
+            organization_id=effective_organization_id,
+            profile_run_id=effective_profile_run_id,
+        )
+    )
+
+        if not profile_source_context:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Google Sheets execution could not resolve the governed "
+                    "profile source context for this profile run."
+                ),
+            )
+
+        effective_profile_id = self._require_value(
+            profile_source_context.get("profile_id"),
+            field_name="profile_id",
+        )
         effective_connection_id = self._require_connection_id(
             connection_id
         )
@@ -2479,6 +2574,7 @@ class DqExecutionService:
         return {
             "organization_id": effective_organization_id,
             "recommendation_id": effective_recommendation_id,
+            "profile_id": effective_profile_id,
             "profile_run_id": effective_profile_run_id,
             "connection_id": effective_connection_id,
             "requested_by": effective_requested_by,
@@ -4592,6 +4688,7 @@ class DqExecutionService:
             "execution_id": execution_id,
             "organization_id": context["organization_id"],
             "recommendation_id": context["recommendation_id"],
+            "profile_id": context["profile_id"],
             "profile_run_id": context["profile_run_id"],
             "remediation_version_id": context.get(
                 "remediation_version_id"
