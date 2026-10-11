@@ -311,7 +311,7 @@ class HealthCheckConfigInput(BaseModel):
     method: Literal["GET", "POST", "HEAD"] = "GET"
 
 
-    
+
 class ConnectionCredentialInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1345,7 +1345,7 @@ class MatchExplainRequest(BaseModel):
     default_factory=list,
     description="List of match rules triggered by the matching engine",
     )
-    
+
     requested_by: Optional[str] = Field(None,description="Identifier of requesting steward/system",
 )
 
@@ -1530,11 +1530,11 @@ class MatchExplainResponse(TenantScopedResponseModel):
         None,
         description="Estimated override likelihood",
     )
-    
+
     signal_weights: Optional[Dict[str, float]] = None
     signal_contributions: Optional[List[Dict[str, Any]]] = None
 
-  
+
 # -------------------------------------------------------------------
 # Policy config models
 # -------------------------------------------------------------------

@@ -40,7 +40,7 @@ class QualityProfilerRepository:
         )
 
         self.project_id = project_id
-        
+
         self.dataset = dataset
 
         self.findings_table_id = (
@@ -238,7 +238,7 @@ class QualityProfilerRepository:
         self.client.query(create_sql).result()
 
     def get_profile_rule_by_candidate(
-        self, 
+        self,
         *,
         organization_id: str,
         profile_id: str,
@@ -1491,7 +1491,7 @@ class QualityProfilerRepository:
                 )
 
             return persisted_rule
-    
+
 
     def _ensure_profile_source_context_table(self) -> None:
             create_sql = f"""
@@ -1730,7 +1730,7 @@ class QualityProfilerRepository:
         ORDER BY updated_at DESC
         LIMIT 1
         """
-        
+
         query_parameters = [
             bigquery.ScalarQueryParameter(
                 "organization_id", "STRING", normalized_org
@@ -4104,13 +4104,13 @@ class QualityProfilerRepository:
             bigquery.ScalarQueryParameter(
                 "source_table", "STRING", result.source_table
             ),
-            
+
             bigquery.ScalarQueryParameter(
                 "column_mappings_json",
                 "STRING",
                 json.dumps(column_mappings or []),
             ),
-            
+
             bigquery.ScalarQueryParameter("domain", "STRING", result.domain),
             bigquery.ScalarQueryParameter(
                 "total_records", "INT64", result.total_records
@@ -4620,7 +4620,7 @@ class QualityProfilerRepository:
             observed_to_proposed[observed] = proposed
 
         return rows
-    
+
     def get_profile_rule_compliance_inputs(
         self,
         *,
@@ -5879,7 +5879,7 @@ class QualityProfilerRepository:
             "generated_at":
                 now,
         }
-    
+
     def reset_remediation_approval_for_new_version(
         self,
         *,
