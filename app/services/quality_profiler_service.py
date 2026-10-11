@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
 
+from botocore import client, config
 from google.cloud import bigquery
 
 from app.services.universal_profile_rules_engine import (
@@ -16,6 +17,9 @@ from app.services.universal_profile_rules_engine import (
     UniversalProfileRulesEngine,
 )
 
+from app.services.profile_rule_exception_service import (
+    ProfileRuleExceptionResolver,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -275,8 +279,9 @@ class QualityProfilerService:
         client: bigquery.Client | None = None,
         project_id: Optional[str] = None,
         universal_rules_engine: UniversalProfileRulesEngine | None = None,
+        quality_repository: Any | None = None,
         enable_universal_rules_shadow: Optional[bool] = None,
-) -> None:
+    ) -> None:
         self.client = client or bigquery.Client(
             project=project_id
         )
@@ -285,23 +290,22 @@ class QualityProfilerService:
             universal_rules_engine
             or UniversalProfileRulesEngine()
         )
+        self.quality_repository = quality_repository
 
-        if enable_universal_rules_shadow is None:
-            enable_universal_rules_shadow = str(
+        if enable_universal_rules_shadow is not None:
+            self.enable_universal_rules_shadow = (
+                enable_universal_rules_shadow
+            )
+        else:
+            self.enable_universal_rules_shadow = (
                 os.getenv(
                     "ADMS_UNIVERSAL_PROFILE_RULES_SHADOW",
                     "false",
                 )
-            ).strip().lower() in {
-                "1",
-                "true",
-                "yes",
-                "on",
-            }
-
-        self.enable_universal_rules_shadow = bool(
-            enable_universal_rules_shadow
-        )
+                .strip()
+                .lower()
+                in {"1", "true", "yes", "on"}
+            )
 
     # ---------------------------------------------------------
     # Tenant safety
@@ -1228,21 +1232,11 @@ class QualityProfilerService:
                     config=config,
                 )
             )
-
             result.universal_rules_shadow = (
                 self._serialize_universal_rules_shadow(
                     universal_result,
                 )
             )
-            
-            result.universal_rules_shadow = (
-                self._serialize_universal_rules_shadow(
-                    universal_result,
-                )
-            )
-            
-
-
             logger.info(
                 "Universal Profile Rules shadow evaluation complete. "
                 "organization_id=%s profile_run_id=%s domain=%s "
@@ -1285,7 +1279,26 @@ class QualityProfilerService:
             str(business_key_field).strip().lower()
         )
 
-        return self.universal_rules_engine.evaluate_profile(
+        if self.quality_repository is None:
+            active_exceptions = []
+        else:
+            active_exceptions = (
+                self.quality_repository.list_active_profile_rule_exceptions(
+                    organization_id=organization_id,
+                    profile_id=config.profile_id,
+                )
+            )
+
+        exception_resolver = ProfileRuleExceptionResolver(
+            active_exceptions
+        )
+        evaluation_engine = UniversalProfileRulesEngine(
+            rule_registry=self.universal_rules_engine.rule_registry,
+            semantic_type_engine=self.universal_rules_engine.semantic_type_engine,
+            exception_resolver=exception_resolver,
+        )
+
+        return evaluation_engine.evaluate_profile(
             organization_id=organization_id,
             profile_id=config.profile_id,
             domain=domain,

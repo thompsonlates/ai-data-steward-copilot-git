@@ -1,5 +1,6 @@
 from __future__ import annotations
 import profile
+from unittest import result
 
 """
 Universal deterministic profile-rule engine for AI Data Steward Copilot.
@@ -29,6 +30,10 @@ from app.services.profile_rule_registry import (
 from app.services.semantic_type_engine import (
     SemanticTypeEngine,
     SemanticTypeInference,
+)
+
+from app.services.profile_rule_exception_service import (
+    ProfileRuleExceptionResolver,
 )
 
 
@@ -119,9 +124,11 @@ class UniversalProfileRulesEngine:
         *,
         rule_registry: ProfileRuleRegistry | None = None,
         semantic_type_engine: SemanticTypeEngine | None = None,
+        exception_resolver: ProfileRuleExceptionResolver | None = None,
     ) -> None:
         self.rule_registry = rule_registry or ProfileRuleRegistry()
         self.semantic_type_engine = semantic_type_engine or SemanticTypeEngine()
+        self.exception_resolver = exception_resolver or ProfileRuleExceptionResolver(exceptions=[])
 
     def evaluate_profile(
         self,
@@ -343,11 +350,45 @@ class UniversalProfileRulesEngine:
                 continue
 
             failed += 1
-            row_id, record_id = self._identity(row, index, key_field)
-            findings.append(self._finding(
-                org, domain, run_id, source, rule, row_id, record_id,
-                result.message, result.observed, result.proposed
-            ))
+
+            exception_match = None
+
+            if self.exception_resolver is not None:
+                exception_match = self.exception_resolver.resolve_exact_value(
+                    rule_id=rule.definition.rule_id,
+                    rule_version=rule.definition.version,
+                    field_name=rule.field_name,
+                    observed_value=result.observed,
+                )
+
+            if exception_match is not None:
+                # The governed rule still failed.
+                #
+                # The ACTIVE steward exception changes only the governance
+                # disposition of this exact finding. It does not convert the
+                # failed DQ evaluation into a passed evaluation.
+                continue
+
+            row_id, record_id = self._identity(
+                row,
+                index,
+                key_field,
+            )
+
+            findings.append(
+                self._finding(
+                    org,
+                    domain,
+                    run_id,
+                    source,
+                    rule,
+                    row_id,
+                    record_id,
+                    result.message,
+                    result.observed,
+                    result.proposed,
+                )
+            )
 
         return findings, self._execution(
             org, domain, run_id, source, rule,

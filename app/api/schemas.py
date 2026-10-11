@@ -2373,6 +2373,12 @@ class UniversalSemanticTypeResponse(BaseModel):
     reason: str | None = None
     requires_review: bool = False
 
+class ProfileRuleGovernanceIdentityResponse(BaseModel):
+    candidate_id: str
+    profile_id: str
+    field_name: str
+    logical_key: str
+
 
 class UniversalProfileFindingResponse(BaseModel):
     rule_id: str
@@ -2591,6 +2597,55 @@ class ProfileRuleDiscoveryCandidateRequest(BaseModel):
         max_length=4000,
     )
 
+class ProfileRuleExceptionCreateRequest(BaseModel):
+    profile_id: str
+    rule_id: str
+    rule_version: int
+    field_name: str
+    match_type: Literal["EXACT_VALUE"] = "EXACT_VALUE"
+    match_value: Any
+    reason: str
+
+
+class ProfileRuleExceptionDeactivateRequest(BaseModel):
+    profile_id: str
+    reason: str
+
+class ActiveProfileRuleResponse(BaseModel):
+    rule_id: str
+    version: int
+    logical_key: str
+    scope: str
+    family: str
+    evaluator: str
+    status: str
+    severity: str
+    domain: str
+    field_name: str
+    description: str | None = None
+    remediation_available: bool
+    remediation_type: str | None = None
+
+
+class ProfileRuleExceptionResponse(BaseModel):
+    exception_id: str
+    organization_id: str
+    profile_id: str
+    rule_id: str
+    rule_version: int
+    field_name: str
+    match_type: str
+    match_value: Any
+    reason: str
+    status: str
+    created_by: str | None = None
+    created_at: datetime | None = None
+    approved_by: str | None = None
+    approved_at: datetime | None = None
+    deactivated_by: str | None = None
+    deactivated_at: datetime | None = None
+    deactivation_reason: str | None = None
+
 
 class ProfileRuleAnalyzeRequest(BaseModel):
     profile_id: str = Field(
@@ -2678,6 +2733,7 @@ class ProfileRuleApproveResponse(
 ):
     candidate_id: str
     rule_id: str
+    logical_key: str
 
     profile_id: str
     profile_run_id: str
@@ -2713,6 +2769,7 @@ class ProfileRuleRejectRequest(BaseModel):
 
 class ProfileRuleRejectResponse(TenantScopedResponseModel):
     candidate_id: str
+    logical_key: str
     profile_id: str
     profile_run_id: str
     status: Literal["REJECTED"] = "REJECTED"

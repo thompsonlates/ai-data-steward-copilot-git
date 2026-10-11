@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from app.api.schemas import ProfileRuleGovernanceIdentityResponse
 from app.repositories.quality_profiler_repository import (
     QualityProfilerRepository,
 )
@@ -839,6 +840,9 @@ class ProfileRuleEnhancementService:
                     candidate.get("profile_run_id") or ""
                 ).strip(),
                 "rule_id": activated_rule_id,
+                "logical_key": str(
+                    existing_rule.get("logical_key") or ""
+                ).strip(),
                 "version": activated_rule_version,
                 "scope": str(
                     existing_rule.get("scope") or "PROFILE"
@@ -958,6 +962,15 @@ class ProfileRuleEnhancementService:
         activated_rule_version = int(
             persisted_rule.get("version") or 0
         )
+        activated_logical_key = str(
+        persisted_rule.get("logical_key") or ""
+        ).strip()
+
+        if not activated_logical_key:
+                raise RuntimeError(
+                    "Persisted governed profile rule is missing "
+                    "logical_key."
+                )
 
         if not activated_rule_id:
             raise RuntimeError(
@@ -1029,6 +1042,7 @@ class ProfileRuleEnhancementService:
                 candidate.get("profile_run_id") or ""
             ).strip(),
             "rule_id": activated_rule_id,
+            "logical_key": activated_logical_key,
             "version": activated_rule_version,
             "scope": "PROFILE",
             "status": "ACTIVE",
@@ -1113,6 +1127,55 @@ class ProfileRuleEnhancementService:
         raise ValueError(
             "The governed profile execution contains no "
             f"source-column mapping for '{normalized_field}'."
+        )
+
+    def resolve_candidate_governance_identity(
+        self,
+        *,
+        organization_id: str,
+        candidate_id: str,
+        resolved_by: str,
+    ) -> ProfileRuleGovernanceIdentityResponse:
+        """
+        Resolve a persisted profile-rule candidate to its canonical
+        governed identity without activating or mutating governance.
+
+        This reuses the same governed compiler used during approval.
+        """
+        candidate = (
+            self.quality_repository
+            .get_profile_rule_candidate(
+                organization_id=organization_id,
+                candidate_id=candidate_id,
+            )
+        )
+
+        if not candidate:
+            raise ValueError(
+                "Profile rule candidate was not found."
+            )
+
+        definition = self._candidate_to_profile_rule_definition(
+            candidate=candidate,
+            organization_id=organization_id,
+            approved_by=resolved_by,
+        )
+
+        logical_key = str(
+            definition.logical_key or ""
+        ).strip()
+
+        if not logical_key:
+            raise RuntimeError(
+                "Governed profile rule compiler did not produce "
+                "a logical_key."
+            )
+
+        return ProfileRuleGovernanceIdentityResponse(
+            candidate_id=candidate_id,
+            profile_id=definition.profile_id,
+            field_name=definition.field_names[0],
+            logical_key=logical_key,
         )
 
     # ============================================================

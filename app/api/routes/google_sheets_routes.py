@@ -261,7 +261,9 @@ def profile_google_sheet(
     )
 )
 
-    profiler = QualityProfilerService()
+    profiler = QualityProfilerService(
+        quality_repository=quality_profiler_repository,
+    )
 
 
     result = profiler.profile_rows(

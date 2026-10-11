@@ -81,6 +81,9 @@ class QualityProfilerRepository:
         self.profile_rule_config_table_id = (
             f"{project_id}.{dataset}.DQ_PROFILE_RULE_CONFIG"
         )
+        self.profile_rule_exception_table_id = (
+            f"{project_id}.{dataset}.DQ_PROFILE_RULE_EXCEPTIONS"
+        )
 
 
         self.profile_stage_prefix = "DQ_PROFILE_STAGE"
@@ -313,137 +316,200 @@ class QualityProfilerRepository:
 
         return rule
 
-    def create_active_profile_rule(
+    def list_active_profile_rules(
         self,
         *,
         organization_id: str,
         profile_id: str,
-        source_candidate_id: str,
-        logical_key: str,
-        family: str,
-        evaluator: str,
-        domain: str,
-        field_name: str,
-        parameters: dict[str, Any] | None,
-        severity: str,
-        description: str,
-        remediation_available: bool,
-        remediation_type: str | None,
-        approved_by: str,
-    ) -> dict[str, Any]:
+        field_name: str | None = None,
+    ) -> list[dict[str, Any]]:
         organization_id = self._require_organization_id(
             organization_id
         )
         profile_id = self._require_profile_id(profile_id)
 
-        normalized_candidate_id = str(
-            source_candidate_id or ""
-        ).strip()
-
-        if not normalized_candidate_id.startswith("prc_"):
-            raise ValueError(
-                "source_candidate_id must use the prc_ "
-                "identifier standard."
-            )
-
-        normalized_logical_key = str(
-            logical_key or ""
-        ).strip().upper()
-
-        normalized_family = str(
-            family or ""
-        ).strip().upper()
-
-        normalized_evaluator = str(
-            evaluator or ""
-        ).strip().upper()
-
-        normalized_domain = str(
-            domain or ""
-        ).strip().upper()
-
-        normalized_field = str(
-            field_name or ""
-        ).strip().lower()
-
-        normalized_severity = str(
-            severity or "MEDIUM"
-        ).strip().upper()
-
-        normalized_description = str(
-            description or ""
-        ).strip()
-
-        normalized_remediation_type = (
-            str(remediation_type or "").strip().upper()
-            or None
-        )
-
-        normalized_approved_by = str(
-            approved_by or ""
-        ).strip()
-
-        if not normalized_logical_key:
-            raise ValueError("logical_key is required.")
-
-        if not normalized_family:
-            raise ValueError("family is required.")
-
-        if not normalized_evaluator:
-            raise ValueError("evaluator is required.")
-
-        if not normalized_domain:
-            raise ValueError("domain is required.")
-
-        if not normalized_field:
-            raise ValueError("field_name is required.")
-
-        if not normalized_approved_by:
-            raise ValueError("approved_by is required.")
-
-        if normalized_severity not in {
-            "LOW",
-            "MEDIUM",
-            "HIGH",
-            "CRITICAL",
-        }:
-            raise ValueError(
-                "severity must be LOW, MEDIUM, HIGH, or CRITICAL."
-            )
-
-        if remediation_available and not normalized_remediation_type:
-            raise ValueError(
-                "remediation_available requires remediation_type."
-            )
-
-        safe_parameters = (
-            parameters
-            if isinstance(parameters, dict)
-            else {}
-        )
-
-        parameters_json = json.dumps(
-            safe_parameters,
-            ensure_ascii=False,
-            sort_keys=True,
-            default=str,
+        normalized_field = (
+            str(field_name or "").strip().lower()
+            if field_name is not None
+            else None
         )
 
         self._ensure_profile_rule_config_table()
 
-        # A candidate may activate only one governed rule.
-        existing_sql = f"""
+        field_filter = ""
+        query_parameters = [
+            bigquery.ScalarQueryParameter(
+                "organization_id",
+                "STRING",
+                organization_id,
+            ),
+            bigquery.ScalarQueryParameter(
+                "profile_id",
+                "STRING",
+                profile_id,
+            ),
+        ]
+
+        if normalized_field:
+            field_filter = "AND field_name = @field_name"
+            query_parameters.append(
+                bigquery.ScalarQueryParameter(
+                    "field_name",
+                    "STRING",
+                    normalized_field,
+                )
+            )
+
+        sql = f"""
         SELECT *
         FROM `{self.profile_rule_config_table_id}`
         WHERE organization_id = @organization_id
         AND profile_id = @profile_id
-        AND source_candidate_id = @source_candidate_id
+        AND status = 'ACTIVE'
+        {field_filter}
+        ORDER BY field_name, logical_key, version DESC
+        """
+
+        rows = list(
+            self.client.query(
+                sql,
+                job_config=bigquery.QueryJobConfig(
+                    query_parameters=query_parameters
+                ),
+            ).result()
+        )
+
+        rules = [dict(row) for row in rows]
+
+        for rule in rules:
+            if (
+                str(
+                    rule.get("organization_id") or ""
+                ).strip()
+                != organization_id
+                or str(
+                    rule.get("profile_id") or ""
+                ).strip()
+                != profile_id
+            ):
+                raise RuntimeError(
+                    "Governed profile rule crossed its expected "
+                    "tenant/profile boundary."
+                )
+
+        return rules
+
+    def _ensure_profile_rule_exception_table(self) -> None:
+        create_sql = f"""
+        CREATE TABLE IF NOT EXISTS
+        `{self.profile_rule_exception_table_id}` (
+            exception_id STRING NOT NULL,
+            organization_id STRING NOT NULL,
+            profile_id STRING NOT NULL,
+
+            rule_id STRING NOT NULL,
+            rule_version INT64 NOT NULL,
+            field_name STRING NOT NULL,
+
+            match_type STRING NOT NULL,
+            match_value_json STRING NOT NULL,
+
+            reason STRING NOT NULL,
+            status STRING NOT NULL,
+
+            created_by STRING NOT NULL,
+            created_at TIMESTAMP NOT NULL,
+
+            approved_by STRING NOT NULL,
+            approved_at TIMESTAMP NOT NULL,
+
+            deactivated_by STRING,
+            deactivated_at TIMESTAMP,
+            deactivation_reason STRING,
+
+            effective_from TIMESTAMP NOT NULL,
+            effective_to TIMESTAMP
+        )
+        PARTITION BY DATE(created_at)
+        CLUSTER BY organization_id, profile_id, rule_id, exception_id
+        """
+        self.client.query(create_sql).result()
+
+    def create_active_profile_rule_exception(
+        self,
+        *,
+        organization_id: str,
+        profile_id: str,
+        rule_id: str,
+        rule_version: int,
+        field_name: str,
+        match_type: str,
+        match_value: Any,
+        reason: str,
+        approved_by: str,
+    ) -> dict[str, Any]:
+        organization_id = self._require_organization_id(organization_id)
+        profile_id = self._require_profile_id(profile_id)
+
+        normalized_rule_id = str(rule_id or "").strip()
+        normalized_field_name = str(field_name or "").strip()
+        normalized_match_type = str(match_type or "").strip().upper()
+        normalized_reason = str(reason or "").strip()
+        normalized_approved_by = str(approved_by or "").strip()
+
+        if not normalized_rule_id.startswith("PROFILE_"):
+            raise ValueError(
+                "rule_id must reference a governed PROFILE_ rule."
+            )
+
+        try:
+            normalized_rule_version = int(rule_version)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("rule_version must be a positive integer.") from exc
+
+        if normalized_rule_version < 1:
+            raise ValueError("rule_version must be a positive integer.")
+
+        if not normalized_field_name:
+            raise ValueError("field_name is required.")
+
+        # V1 intentionally supports only exact-value exceptions.
+        if normalized_match_type != "EXACT_VALUE":
+            raise ValueError(
+                "Unsupported profile rule exception match_type. "
+                "V1 supports EXACT_VALUE only."
+            )
+
+        if match_value is None:
+            raise ValueError(
+                "match_value is required for an EXACT_VALUE exception."
+            )
+
+        if not normalized_reason:
+            raise ValueError("reason is required.")
+
+        if not normalized_approved_by:
+            raise ValueError("approved_by is required.")
+
+        self._ensure_profile_rule_config_table()
+        self._ensure_profile_rule_exception_table()
+
+        # The exception may only reference the exact governed rule version
+        # inside the same tenant/profile boundary.
+        rule_sql = f"""
+        SELECT *
+        FROM `{self.profile_rule_config_table_id}`
+        WHERE organization_id = @organization_id
+        AND profile_id = @profile_id
+        AND rule_id = @rule_id
+        AND version = @rule_version
+        AND status = 'ACTIVE'
         LIMIT 1
         """
 
-        existing_rows = list(
+        rule_rows = list(
             self.client.query(
-                existing_sql,
+                rule_sql,
                 job_config=bigquery.QueryJobConfig(
                     query_parameters=[
                         bigquery.ScalarQueryParameter(
@@ -457,38 +523,736 @@ class QualityProfilerRepository:
                             profile_id,
                         ),
                         bigquery.ScalarQueryParameter(
-                            "source_candidate_id",
+                            "rule_id",
                             "STRING",
-                            normalized_candidate_id,
+                            normalized_rule_id,
+                        ),
+                        bigquery.ScalarQueryParameter(
+                            "rule_version",
+                            "INT64",
+                            normalized_rule_version,
                         ),
                     ]
                 ),
             ).result()
         )
 
-        if existing_rows:
+        if not rule_rows:
             raise ValueError(
-                "Profile rule candidate has already activated "
-                "a governed rule."
+                "ACTIVE governed profile rule/version was not found "
+                "inside the requested tenant/profile boundary."
             )
 
-        # Rule identity is generated by the platform, never supplied
-        # by the browser or invented by the approval route.
-        rule_id = f"PROFILE_{uuid.uuid4().hex[:20].upper()}"
+        governed_rule = dict(rule_rows[0])
 
-        # Versions are scoped to the governed logical rule for this
-        # tenant/profile. The first approved version is 1.
-        version_sql = f"""
-        SELECT COALESCE(MAX(version), 0) + 1 AS next_version
-        FROM `{self.profile_rule_config_table_id}`
+        governed_field = str(
+            governed_rule.get("field_name") or ""
+        ).strip()
+
+        if governed_field != normalized_field_name:
+            raise ValueError(
+                "Exception field_name does not match the governed rule."
+            )
+
+        match_value_json = json.dumps(
+            match_value,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+
+        # Do not create duplicate ACTIVE exceptions for the same exact
+        # governed rule version/value.
+        duplicate_sql = f"""
+        SELECT *
+        FROM `{self.profile_rule_exception_table_id}`
         WHERE organization_id = @organization_id
         AND profile_id = @profile_id
-        AND logical_key = @logical_key
+        AND rule_id = @rule_id
+        AND rule_version = @rule_version
+        AND field_name = @field_name
+        AND match_type = 'EXACT_VALUE'
+        AND match_value_json = @match_value_json
+        AND status = 'ACTIVE'
+        AND (effective_to IS NULL OR effective_to > CURRENT_TIMESTAMP())
+        ORDER BY created_at DESC
+        LIMIT 1
         """
 
-        version_rows = list(
+        duplicate_rows = list(
             self.client.query(
-                version_sql,
+                duplicate_sql,
+                job_config=bigquery.QueryJobConfig(
+                    query_parameters=[
+                        bigquery.ScalarQueryParameter(
+                            "organization_id",
+                            "STRING",
+                            organization_id,
+                        ),
+                        bigquery.ScalarQueryParameter(
+                            "profile_id",
+                            "STRING",
+                            profile_id,
+                        ),
+                        bigquery.ScalarQueryParameter(
+                            "rule_id",
+                            "STRING",
+                            normalized_rule_id,
+                        ),
+                        bigquery.ScalarQueryParameter(
+                            "rule_version",
+                            "INT64",
+                            normalized_rule_version,
+                        ),
+                        bigquery.ScalarQueryParameter(
+                            "field_name",
+                            "STRING",
+                            normalized_field_name,
+                        ),
+                        bigquery.ScalarQueryParameter(
+                            "match_value_json",
+                            "STRING",
+                            match_value_json,
+                        ),
+                    ]
+                ),
+            ).result()
+        )
+
+        if duplicate_rows:
+            return dict(duplicate_rows[0])
+
+        exception_id = f"pre_{uuid.uuid4().hex[:20]}"
+
+        insert_sql = f"""
+        INSERT INTO `{self.profile_rule_exception_table_id}` (
+            exception_id,
+            organization_id,
+            profile_id,
+            rule_id,
+            rule_version,
+            field_name,
+            match_type,
+            match_value_json,
+            reason,
+            status,
+            created_by,
+            created_at,
+            approved_by,
+            approved_at,
+            effective_from
+        )
+        VALUES (
+            @exception_id,
+            @organization_id,
+            @profile_id,
+            @rule_id,
+            @rule_version,
+            @field_name,
+            'EXACT_VALUE',
+            @match_value_json,
+            @reason,
+            'ACTIVE',
+            @approved_by,
+            CURRENT_TIMESTAMP(),
+            @approved_by,
+            CURRENT_TIMESTAMP(),
+            CURRENT_TIMESTAMP()
+        )
+        """
+
+        insert_job = self.client.query(
+            insert_sql,
+            job_config=bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter(
+                        "exception_id", "STRING", exception_id
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "organization_id", "STRING", organization_id
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "profile_id", "STRING", profile_id
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "rule_id", "STRING", normalized_rule_id
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "rule_version",
+                        "INT64",
+                        normalized_rule_version,
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "field_name",
+                        "STRING",
+                        normalized_field_name,
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "match_value_json",
+                        "STRING",
+                        match_value_json,
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "reason", "STRING", normalized_reason
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "approved_by",
+                        "STRING",
+                        normalized_approved_by,
+                    ),
+                ]
+            ),
+        )
+
+        insert_job.result()
+
+        persisted = self.get_profile_rule_exception(
+            organization_id=organization_id,
+            profile_id=profile_id,
+            exception_id=exception_id,
+        )
+
+        if persisted is None:
+            raise RuntimeError(
+                "Profile rule exception insert completed but the "
+                "persisted exception could not be reloaded."
+            )
+
+        return persisted
+
+
+    def get_profile_rule_exception(
+        self,
+        *,
+        organization_id: str,
+        profile_id: str,
+        exception_id: str,
+    ) -> dict[str, Any] | None:
+        organization_id = self._require_organization_id(organization_id)
+        profile_id = self._require_profile_id(profile_id)
+
+        normalized_exception_id = str(exception_id or "").strip()
+
+        if not normalized_exception_id.startswith("pre_"):
+            raise ValueError(
+                "exception_id must use the pre_ identifier standard."
+            )
+
+        self._ensure_profile_rule_exception_table()
+
+        sql = f"""
+        SELECT *
+        FROM `{self.profile_rule_exception_table_id}`
+        WHERE organization_id = @organization_id
+        AND profile_id = @profile_id
+        AND exception_id = @exception_id
+        LIMIT 1
+        """
+
+        rows = list(
+            self.client.query(
+                sql,
+                job_config=bigquery.QueryJobConfig(
+                    query_parameters=[
+                        bigquery.ScalarQueryParameter(
+                            "organization_id",
+                            "STRING",
+                            organization_id,
+                        ),
+                        bigquery.ScalarQueryParameter(
+                            "profile_id",
+                            "STRING",
+                            profile_id,
+                        ),
+                        bigquery.ScalarQueryParameter(
+                            "exception_id",
+                            "STRING",
+                            normalized_exception_id,
+                        ),
+                    ]
+                ),
+            ).result()
+        )
+
+        if not rows:
+            # Distinguish a genuinely unknown exception from an attempt
+            # to access an existing exception through the wrong
+            # tenant/profile boundary.
+            boundary_sql = f"""
+            SELECT organization_id, profile_id
+            FROM `{self.profile_rule_exception_table_id}`
+            WHERE exception_id = @exception_id
+            LIMIT 1
+            """
+
+            boundary_rows = list(
+                self.client.query(
+                    boundary_sql,
+                    job_config=bigquery.QueryJobConfig(
+                        query_parameters=[
+                            bigquery.ScalarQueryParameter(
+                                "exception_id",
+                                "STRING",
+                                normalized_exception_id,
+                            ),
+                        ]
+                    ),
+                ).result()
+            )
+
+            if boundary_rows:
+                raise ValueError(
+                    "Profile rule exception exists outside the requested "
+                    "tenant/profile boundary."
+                )
+
+            return None
+
+        result = dict(rows[0])
+
+        # Defense in depth.
+        if (
+            str(result.get("organization_id") or "").strip()
+            != organization_id
+            or str(result.get("profile_id") or "").strip()
+            != profile_id
+        ):
+            raise RuntimeError(
+                "Profile rule exception crossed tenant/profile boundary."
+            )
+
+        return result
+
+
+    def list_active_profile_rule_exceptions(
+        self,
+        *,
+        organization_id: str,
+        profile_id: str,
+        rule_id: str | None = None,
+        rule_version: int | None = None,
+    ) -> list[dict[str, Any]]:
+        organization_id = self._require_organization_id(organization_id)
+        profile_id = self._require_profile_id(profile_id)
+
+        normalized_rule_id = (
+            str(rule_id or "").strip() if rule_id is not None else None
+        )
+
+        normalized_rule_version = None
+
+        if rule_version is not None:
+            try:
+                normalized_rule_version = int(rule_version)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "rule_version must be a positive integer."
+                ) from exc
+
+            if normalized_rule_version < 1:
+                raise ValueError(
+                    "rule_version must be a positive integer."
+                )
+
+        if normalized_rule_id is not None:
+            if not normalized_rule_id.startswith("PROFILE_"):
+                raise ValueError(
+                    "rule_id must reference a governed PROFILE_ rule."
+                )
+
+        if (
+            normalized_rule_version is not None
+            and normalized_rule_id is None
+        ):
+            raise ValueError(
+                "rule_id is required when rule_version is supplied."
+            )
+
+        self._ensure_profile_rule_exception_table()
+
+        rule_filter = ""
+        parameters = [
+            bigquery.ScalarQueryParameter(
+                "organization_id", "STRING", organization_id
+            ),
+            bigquery.ScalarQueryParameter(
+                "profile_id", "STRING", profile_id
+            ),
+        ]
+
+        if normalized_rule_id is not None:
+            rule_filter += "\nAND rule_id = @rule_id"
+            parameters.append(
+                bigquery.ScalarQueryParameter(
+                    "rule_id", "STRING", normalized_rule_id
+                )
+            )
+
+        if normalized_rule_version is not None:
+            rule_filter += "\nAND rule_version = @rule_version"
+            parameters.append(
+                bigquery.ScalarQueryParameter(
+                    "rule_version",
+                    "INT64",
+                    normalized_rule_version,
+                )
+            )
+
+        sql = f"""
+        SELECT *
+        FROM `{self.profile_rule_exception_table_id}`
+        WHERE organization_id = @organization_id
+        AND profile_id = @profile_id
+        AND status = 'ACTIVE'
+        AND effective_from <= CURRENT_TIMESTAMP()
+        AND (effective_to IS NULL OR effective_to > CURRENT_TIMESTAMP())
+        {rule_filter}
+        ORDER BY created_at ASC, exception_id ASC
+        """
+
+        rows = list(
+            self.client.query(
+                sql,
+                job_config=bigquery.QueryJobConfig(
+                    query_parameters=parameters
+                ),
+            ).result()
+        )
+
+        results = [dict(row) for row in rows]
+
+        for result in results:
+            if (
+                str(result.get("organization_id") or "").strip()
+                != organization_id
+                or str(result.get("profile_id") or "").strip()
+                != profile_id
+            ):
+                raise RuntimeError(
+                    "Profile rule exception crossed "
+                    "tenant/profile boundary."
+                )
+
+        return results
+
+
+    def deactivate_profile_rule_exception(
+            self,
+            *,
+            organization_id: str,
+            profile_id: str,
+            exception_id: str,
+            deactivated_by: str,
+            reason: str,
+        ) -> dict[str, Any]:
+            organization_id = self._require_organization_id(organization_id)
+            profile_id = self._require_profile_id(profile_id)
+
+            normalized_exception_id = str(exception_id or "").strip()
+            normalized_deactivated_by = str(deactivated_by or "").strip()
+            normalized_reason = str(reason or "").strip()
+
+            if not normalized_exception_id.startswith("pre_"):
+                raise ValueError(
+                    "exception_id must use the pre_ identifier standard."
+                )
+
+            if not normalized_deactivated_by:
+                raise ValueError("deactivated_by is required.")
+
+            if not normalized_reason:
+                raise ValueError("deactivation reason is required.")
+
+            self._ensure_profile_rule_exception_table()
+
+            sql = f"""
+            UPDATE `{self.profile_rule_exception_table_id}`
+            SET
+                status = 'INACTIVE',
+                deactivated_by = @deactivated_by,
+                deactivated_at = CURRENT_TIMESTAMP(),
+                deactivation_reason = @deactivation_reason,
+                effective_to = CURRENT_TIMESTAMP()
+            WHERE organization_id = @organization_id
+            AND profile_id = @profile_id
+            AND exception_id = @exception_id
+            AND status = 'ACTIVE'
+            AND effective_to IS NULL
+            """
+
+            job = self.client.query(
+                sql,
+                job_config=bigquery.QueryJobConfig(
+                    query_parameters=[
+                        bigquery.ScalarQueryParameter(
+                            "organization_id",
+                            "STRING",
+                            organization_id,
+                        ),
+                        bigquery.ScalarQueryParameter(
+                            "profile_id",
+                            "STRING",
+                            profile_id,
+                        ),
+                        bigquery.ScalarQueryParameter(
+                            "exception_id",
+                            "STRING",
+                            normalized_exception_id,
+                        ),
+                        bigquery.ScalarQueryParameter(
+                            "deactivated_by",
+                            "STRING",
+                            normalized_deactivated_by,
+                        ),
+                        bigquery.ScalarQueryParameter(
+                            "deactivation_reason",
+                            "STRING",
+                            normalized_reason,
+                        ),
+                    ]
+                ),
+            )
+
+            job.result()
+
+            if job.num_dml_affected_rows != 1:
+                raise ValueError(
+                    "ACTIVE profile rule exception was not found "
+                    "inside the requested tenant/profile boundary."
+                )
+
+            persisted = self.get_profile_rule_exception(
+                organization_id=organization_id,
+                profile_id=profile_id,
+                exception_id=normalized_exception_id,
+            )
+
+            if persisted is None:
+                raise RuntimeError(
+                    "Profile rule exception was deactivated but could "
+                    "not be reloaded."
+                )
+
+            return persisted
+
+    def create_active_profile_rule(
+            self,
+            *,
+            organization_id: str,
+            profile_id: str,
+            source_candidate_id: str,
+            logical_key: str,
+            family: str,
+            evaluator: str,
+            domain: str,
+            field_name: str,
+            parameters: dict[str, Any] | None,
+            severity: str,
+            description: str,
+            remediation_available: bool,
+            remediation_type: str | None,
+            approved_by: str,
+        ) -> dict[str, Any]:
+            organization_id = self._require_organization_id(
+                organization_id
+            )
+            profile_id = self._require_profile_id(profile_id)
+
+            normalized_candidate_id = str(
+                source_candidate_id or ""
+            ).strip()
+
+            if not normalized_candidate_id.startswith("prc_"):
+                raise ValueError(
+                    "source_candidate_id must use the prc_ "
+                    "identifier standard."
+                )
+
+            normalized_logical_key = str(
+                logical_key or ""
+            ).strip().upper()
+
+            normalized_family = str(
+                family or ""
+            ).strip().upper()
+
+            normalized_evaluator = str(
+                evaluator or ""
+            ).strip().upper()
+
+            normalized_domain = str(
+                domain or ""
+            ).strip().upper()
+
+            normalized_field = str(
+                field_name or ""
+            ).strip().lower()
+
+            normalized_severity = str(
+                severity or "MEDIUM"
+            ).strip().upper()
+
+            normalized_description = str(
+                description or ""
+            ).strip()
+
+            normalized_remediation_type = (
+                str(remediation_type or "").strip().upper()
+                or None
+            )
+
+            normalized_approved_by = str(
+                approved_by or ""
+            ).strip()
+
+            if not normalized_logical_key:
+                raise ValueError("logical_key is required.")
+
+            if not normalized_family:
+                raise ValueError("family is required.")
+
+            if not normalized_evaluator:
+                raise ValueError("evaluator is required.")
+
+            if not normalized_domain:
+                raise ValueError("domain is required.")
+
+            if not normalized_field:
+                raise ValueError("field_name is required.")
+
+            if not normalized_approved_by:
+                raise ValueError("approved_by is required.")
+
+            if normalized_severity not in {
+                "LOW",
+                "MEDIUM",
+                "HIGH",
+                "CRITICAL",
+            }:
+                raise ValueError(
+                    "severity must be LOW, MEDIUM, HIGH, or CRITICAL."
+                )
+
+            if remediation_available and not normalized_remediation_type:
+                raise ValueError(
+                    "remediation_available requires remediation_type."
+                )
+
+            safe_parameters = (
+                parameters
+                if isinstance(parameters, dict)
+                else {}
+            )
+
+            parameters_json = json.dumps(
+                safe_parameters,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+
+            self._ensure_profile_rule_config_table()
+
+            # A candidate may activate only one governed rule.
+            existing_sql = f"""
+            SELECT *
+            FROM `{self.profile_rule_config_table_id}`
+            WHERE organization_id = @organization_id
+            AND profile_id = @profile_id
+            AND source_candidate_id = @source_candidate_id
+            LIMIT 1
+            """
+
+            existing_rows = list(
+                self.client.query(
+                    existing_sql,
+                    job_config=bigquery.QueryJobConfig(
+                        query_parameters=[
+                            bigquery.ScalarQueryParameter(
+                                "organization_id",
+                                "STRING",
+                                organization_id,
+                            ),
+                            bigquery.ScalarQueryParameter(
+                                "profile_id",
+                                "STRING",
+                                profile_id,
+                            ),
+                            bigquery.ScalarQueryParameter(
+                                "source_candidate_id",
+                                "STRING",
+                                normalized_candidate_id,
+                            ),
+                        ]
+                    ),
+                ).result()
+            )
+
+            if existing_rows:
+                raise ValueError(
+                    "Profile rule candidate has already activated "
+                    "a governed rule."
+                )
+
+            # Rule identity is generated by the platform, never supplied
+            # by the browser or invented by the approval route.
+            rule_id = f"PROFILE_{uuid.uuid4().hex[:20].upper()}"
+
+            # Versions are scoped to the governed logical rule for this
+            # tenant/profile. The first approved version is 1.
+            version_sql = f"""
+            SELECT COALESCE(MAX(version), 0) + 1 AS next_version
+            FROM `{self.profile_rule_config_table_id}`
+            WHERE organization_id = @organization_id
+            AND profile_id = @profile_id
+            AND logical_key = @logical_key
+            """
+
+            version_rows = list(
+                self.client.query(
+                    version_sql,
+                    job_config=bigquery.QueryJobConfig(
+                        query_parameters=[
+                            bigquery.ScalarQueryParameter(
+                                "organization_id",
+                                "STRING",
+                                organization_id,
+                            ),
+                            bigquery.ScalarQueryParameter(
+                                "profile_id",
+                                "STRING",
+                                profile_id,
+                            ),
+                            bigquery.ScalarQueryParameter(
+                                "logical_key",
+                                "STRING",
+                                normalized_logical_key,
+                            ),
+                        ]
+                    ),
+                ).result()
+            )
+
+            if not version_rows:
+                raise RuntimeError(
+                    "Unable to determine governed profile rule version."
+                )
+
+            version = int(version_rows[0]["next_version"])
+
+            retire_sql = f"""
+            UPDATE `{self.profile_rule_config_table_id}`
+            SET
+                status = 'INACTIVE',
+                effective_to = CURRENT_TIMESTAMP()
+            WHERE organization_id = @organization_id
+            AND profile_id = @profile_id
+            AND logical_key = @logical_key
+            AND status = 'ACTIVE'
+            """
+
+            retire_job = self.client.query(
+                retire_sql,
                 job_config=bigquery.QueryJobConfig(
                     query_parameters=[
                         bigquery.ScalarQueryParameter(
@@ -508,441 +1272,434 @@ class QualityProfilerRepository:
                         ),
                     ]
                 ),
-            ).result()
-        )
+            )
+            retire_job.result()
 
-        if not version_rows:
-            raise RuntimeError(
-                "Unable to determine governed profile rule version."
+            insert_sql = f"""
+            INSERT INTO `{self.profile_rule_config_table_id}` (
+                organization_id,
+                profile_id,
+                rule_id,
+                version,
+                logical_key,
+                scope,
+                family,
+                evaluator,
+                status,
+                severity,
+                description,
+                domain,
+                field_name,
+                parameters_json,
+                deterministic,
+                remediation_available,
+                remediation_type,
+                origin,
+                source_candidate_id,
+                created_by,
+                created_at,
+                approved_by,
+                approved_at,
+                activated_by,
+                activated_at,
+                effective_from,
+                effective_to
+            )
+            VALUES (
+                @organization_id,
+                @profile_id,
+                @rule_id,
+                @version,
+                @logical_key,
+                'PROFILE',
+                @family,
+                @evaluator,
+                'ACTIVE',
+                @severity,
+                @description,
+                @domain,
+                @field_name,
+                @parameters_json,
+                TRUE,
+                @remediation_available,
+                @remediation_type,
+                'STEWARD_APPROVED',
+                @source_candidate_id,
+                @approved_by,
+                CURRENT_TIMESTAMP(),
+                @approved_by,
+                CURRENT_TIMESTAMP(),
+                @approved_by,
+                CURRENT_TIMESTAMP(),
+                CURRENT_TIMESTAMP(),
+                NULL
+            )
+            """
+
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter(
+                        "organization_id",
+                        "STRING",
+                        organization_id,
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "profile_id",
+                        "STRING",
+                        profile_id,
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "rule_id",
+                        "STRING",
+                        rule_id,
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "version",
+                        "INT64",
+                        version,
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "logical_key",
+                        "STRING",
+                        normalized_logical_key,
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "family",
+                        "STRING",
+                        normalized_family,
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "evaluator",
+                        "STRING",
+                        normalized_evaluator,
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "severity",
+                        "STRING",
+                        normalized_severity,
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "description",
+                        "STRING",
+                        normalized_description or None,
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "domain",
+                        "STRING",
+                        normalized_domain,
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "field_name",
+                        "STRING",
+                        normalized_field,
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "parameters_json",
+                        "STRING",
+                        parameters_json,
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "remediation_available",
+                        "BOOL",
+                        bool(remediation_available),
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "remediation_type",
+                        "STRING",
+                        normalized_remediation_type,
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "source_candidate_id",
+                        "STRING",
+                        normalized_candidate_id,
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "approved_by",
+                        "STRING",
+                        normalized_approved_by,
+                    ),
+                ]
             )
 
-        version = int(version_rows[0]["next_version"])
+            query_job = self.client.query(
+                insert_sql,
+                job_config=job_config,
+            )
+            query_job.result()
 
-        insert_sql = f"""
-        INSERT INTO `{self.profile_rule_config_table_id}` (
-            organization_id,
-            profile_id,
-            rule_id,
-            version,
-            logical_key,
-            scope,
-            family,
-            evaluator,
-            status,
-            severity,
-            description,
-            domain,
-            field_name,
-            parameters_json,
-            deterministic,
-            remediation_available,
-            remediation_type,
-            origin,
-            source_candidate_id,
-            created_by,
-            created_at,
-            approved_by,
-            approved_at,
-            activated_by,
-            activated_at,
-            effective_from,
-            effective_to
-        )
-        VALUES (
-            @organization_id,
-            @profile_id,
-            @rule_id,
-            @version,
-            @logical_key,
-            'PROFILE',
-            @family,
-            @evaluator,
-            'ACTIVE',
-            @severity,
-            @description,
-            @domain,
-            @field_name,
-            @parameters_json,
-            TRUE,
-            @remediation_available,
-            @remediation_type,
-            'STEWARD_APPROVED',
-            @source_candidate_id,
-            @approved_by,
-            CURRENT_TIMESTAMP(),
-            @approved_by,
-            CURRENT_TIMESTAMP(),
-            @approved_by,
-            CURRENT_TIMESTAMP(),
-            CURRENT_TIMESTAMP(),
-            NULL
-        )
-        """
+            if int(query_job.num_dml_affected_rows or 0) != 1:
+                raise RuntimeError(
+                    "Unable to persist the ACTIVE governed profile rule."
+                )
 
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter(
-                    "organization_id",
-                    "STRING",
-                    organization_id,
-                ),
-                bigquery.ScalarQueryParameter(
-                    "profile_id",
-                    "STRING",
-                    profile_id,
-                ),
-                bigquery.ScalarQueryParameter(
-                    "rule_id",
-                    "STRING",
-                    rule_id,
-                ),
-                bigquery.ScalarQueryParameter(
-                    "version",
-                    "INT64",
-                    version,
-                ),
-                bigquery.ScalarQueryParameter(
-                    "logical_key",
-                    "STRING",
-                    normalized_logical_key,
-                ),
-                bigquery.ScalarQueryParameter(
-                    "family",
-                    "STRING",
-                    normalized_family,
-                ),
-                bigquery.ScalarQueryParameter(
-                    "evaluator",
-                    "STRING",
-                    normalized_evaluator,
-                ),
-                bigquery.ScalarQueryParameter(
-                    "severity",
-                    "STRING",
-                    normalized_severity,
-                ),
-                bigquery.ScalarQueryParameter(
-                    "description",
-                    "STRING",
-                    normalized_description or None,
-                ),
-                bigquery.ScalarQueryParameter(
-                    "domain",
-                    "STRING",
-                    normalized_domain,
-                ),
-                bigquery.ScalarQueryParameter(
-                    "field_name",
-                    "STRING",
-                    normalized_field,
-                ),
-                bigquery.ScalarQueryParameter(
-                    "parameters_json",
-                    "STRING",
-                    parameters_json,
-                ),
-                bigquery.ScalarQueryParameter(
-                    "remediation_available",
-                    "BOOL",
-                    bool(remediation_available),
-                ),
-                bigquery.ScalarQueryParameter(
-                    "remediation_type",
-                    "STRING",
-                    normalized_remediation_type,
-                ),
-                bigquery.ScalarQueryParameter(
-                    "source_candidate_id",
-                    "STRING",
-                    normalized_candidate_id,
-                ),
-                bigquery.ScalarQueryParameter(
-                    "approved_by",
-                    "STRING",
-                    normalized_approved_by,
-                ),
-            ]
-        )
+            persisted_sql = f"""
+            SELECT *
+            FROM `{self.profile_rule_config_table_id}`
+            WHERE organization_id = @organization_id
+            AND profile_id = @profile_id
+            AND rule_id = @rule_id
+            AND version = @version
+            LIMIT 1
+            """
 
-        query_job = self.client.query(
-            insert_sql,
-            job_config=job_config,
-        )
-        query_job.result()
-
-        if int(query_job.num_dml_affected_rows or 0) != 1:
-            raise RuntimeError(
-                "Unable to persist the ACTIVE governed profile rule."
+            persisted_rows = list(
+                self.client.query(
+                    persisted_sql,
+                    job_config=bigquery.QueryJobConfig(
+                        query_parameters=[
+                            bigquery.ScalarQueryParameter(
+                                "organization_id",
+                                "STRING",
+                                organization_id,
+                            ),
+                            bigquery.ScalarQueryParameter(
+                                "profile_id",
+                                "STRING",
+                                profile_id,
+                            ),
+                            bigquery.ScalarQueryParameter(
+                                "rule_id",
+                                "STRING",
+                                rule_id,
+                            ),
+                            bigquery.ScalarQueryParameter(
+                                "version",
+                                "INT64",
+                                version,
+                            ),
+                        ]
+                    ),
+                ).result()
             )
 
-        persisted_sql = f"""
-        SELECT *
-        FROM `{self.profile_rule_config_table_id}`
-        WHERE organization_id = @organization_id
-        AND profile_id = @profile_id
-        AND rule_id = @rule_id
-        AND version = @version
-        LIMIT 1
-        """
+            if not persisted_rows:
+                raise RuntimeError(
+                    "Governed profile rule was inserted but "
+                    "could not be reloaded."
+                )
 
-        persisted_rows = list(
-            self.client.query(
-                persisted_sql,
-                job_config=bigquery.QueryJobConfig(
-                    query_parameters=[
-                        bigquery.ScalarQueryParameter(
-                            "organization_id",
-                            "STRING",
-                            organization_id,
-                        ),
-                        bigquery.ScalarQueryParameter(
-                            "profile_id",
-                            "STRING",
-                            profile_id,
-                        ),
-                        bigquery.ScalarQueryParameter(
-                            "rule_id",
-                            "STRING",
-                            rule_id,
-                        ),
-                        bigquery.ScalarQueryParameter(
-                            "version",
-                            "INT64",
-                            version,
-                        ),
-                    ]
-                ),
-            ).result()
-        )
+            persisted_rule = dict(persisted_rows[0])
 
-        if not persisted_rows:
-            raise RuntimeError(
-                "Governed profile rule was inserted but "
-                "could not be reloaded."
-            )
+            if (
+                str(persisted_rule.get("organization_id") or "").strip()
+                != organization_id
+                or str(persisted_rule.get("profile_id") or "").strip()
+                != profile_id
+            ):
+                raise RuntimeError(
+                    "Governed profile rule crossed tenant/profile boundary."
+                )
 
-        persisted_rule = dict(persisted_rows[0])
-
-        if (
-            str(persisted_rule.get("organization_id") or "").strip()
-            != organization_id
-            or str(persisted_rule.get("profile_id") or "").strip()
-            != profile_id
-        ):
-            raise RuntimeError(
-                "Governed profile rule crossed tenant/profile boundary."
-            )
-
-        return persisted_rule
+            return persisted_rule
     
 
     def _ensure_profile_source_context_table(self) -> None:
-        create_sql = f"""
-        CREATE TABLE IF NOT EXISTS `{self.profile_source_context_table_id}` (
-            organization_id STRING NOT NULL,
-            profile_run_id STRING NOT NULL,
-            profile_id STRING,
-            source_type STRING NOT NULL,
-            connection_id STRING NOT NULL,
-            project_id STRING,
-            dataset_id STRING,
-            table_id STRING,
-            database_name STRING,
-            schema_name STRING,
-            table_name STRING,
-            spreadsheet_id STRING,
-            drive_id STRING,
-            item_id STRING,
-            sheet_name STRING,
-            header_row INT64,
-            created_at TIMESTAMP NOT NULL,
-            updated_at TIMESTAMP NOT NULL,
-            PRIMARY KEY (organization_id, profile_run_id) NOT ENFORCED
-        )
-        PARTITION BY DATE(created_at)
-        CLUSTER BY organization_id, profile_run_id
-        """
-        self.client.query(create_sql).result()
+            create_sql = f"""
+            CREATE TABLE IF NOT EXISTS `{self.profile_source_context_table_id}` (
+                organization_id STRING NOT NULL,
+                profile_run_id STRING NOT NULL,
+                profile_id STRING,
+                source_type STRING NOT NULL,
+                connection_id STRING NOT NULL,
+                project_id STRING,
+                dataset_id STRING,
+                table_id STRING,
+                database_name STRING,
+                schema_name STRING,
+                table_name STRING,
+                spreadsheet_id STRING,
+                drive_id STRING,
+                item_id STRING,
+                sheet_name STRING,
+                header_row INT64,
+                created_at TIMESTAMP NOT NULL,
+                updated_at TIMESTAMP NOT NULL,
+                PRIMARY KEY (organization_id, profile_run_id) NOT ENFORCED
+            )
+            PARTITION BY DATE(created_at)
+            CLUSTER BY organization_id, profile_run_id
+            """
+            self.client.query(create_sql).result()
 
-        # CREATE TABLE IF NOT EXISTS does not evolve an existing table.
-        # Add new source-neutral target columns and relax the two spreadsheet-
-        # only fields when upgrading an installation created by an older build.
-        table = self.client.get_table(self.profile_source_context_table_id)
-        fields = {field.name: field for field in table.schema}
+            # CREATE TABLE IF NOT EXISTS does not evolve an existing table.
+            # Add new source-neutral target columns and relax the two spreadsheet-
+            # only fields when upgrading an installation created by an older build.
+            table = self.client.get_table(self.profile_source_context_table_id)
+            fields = {field.name: field for field in table.schema}
 
-        for column_name in (
-            "profile_id",
-            "project_id", "dataset_id", "table_id",
-            "database_name", "schema_name", "table_name",
-        ):
-            if column_name not in fields:
-                self.client.query(
-                    f"ALTER TABLE `{self.profile_source_context_table_id}` "
-                    f"ADD COLUMN {column_name} STRING"
-                ).result()
+            for column_name in (
+                "profile_id",
+                "project_id", "dataset_id", "table_id",
+                "database_name", "schema_name", "table_name",
+            ):
+                if column_name not in fields:
+                    self.client.query(
+                        f"ALTER TABLE `{self.profile_source_context_table_id}` "
+                        f"ADD COLUMN {column_name} STRING"
+                    ).result()
 
-        for column_name in ("sheet_name", "header_row"):
-            field = fields.get(column_name)
-            if field is not None and field.mode == "REQUIRED":
-                self.client.query(
-                    f"ALTER TABLE `{self.profile_source_context_table_id}` "
-                    f"ALTER COLUMN {column_name} DROP NOT NULL"
-                ).result()
+            for column_name in ("sheet_name", "header_row"):
+                field = fields.get(column_name)
+                if field is not None and field.mode == "REQUIRED":
+                    self.client.query(
+                        f"ALTER TABLE `{self.profile_source_context_table_id}` "
+                        f"ALTER COLUMN {column_name} DROP NOT NULL"
+                    ).result()
 
 
     def save_profile_source_context(
-        self,
-        *,
-        organization_id: str,
-        profile_run_id: str,
-        profile_id: str | None = None,
-        source_type: str,
-        connection_id: str,
-        sheet_name: str | None = None,
-        header_row: int | None = None,
-        project_id: str | None = None,
-        dataset_id: str | None = None,
-        table_id: str | None = None,
-        database_name: str | None = None,
-        schema_name: str | None = None,
-        table_name: str | None = None,
-        spreadsheet_id: str | None = None,
-        drive_id: str | None = None,
-        item_id: str | None = None,
-    ) -> None:
-        """Persist the exact tenant-bound source target used by a profile."""
-        organization_id = self._require_organization_id(organization_id)
-        profile_run_id = self._require_profile_run_id(profile_run_id)
-        normalized_source_type = str(source_type or "").strip().upper()
-        normalized_connection_id = str(connection_id or "").strip()
-        normalized_sheet_name = str(sheet_name or "").strip()
-        safe_header_row = (
-            max(1, int(header_row))
-            if header_row is not None
-            else None
-        )
-        normalized_profile_id = (
-            self._require_profile_id(profile_id)
-            if profile_id
-            else None
-        )
-
-        if normalized_source_type not in {
-            "GOOGLE_SHEETS",
-            "ONEDRIVE_EXCEL",
-            "BIGQUERY",
-            "SNOWFLAKE",
-            "AZURE_SQL",
-        }:
-            raise ValueError("Unsupported profile source context type.")
-        if not normalized_connection_id:
-            raise ValueError("connection_id is required.")
-        normalized_project_id = str(project_id or "").strip() or None
-        normalized_dataset_id = str(dataset_id or "").strip() or None
-        normalized_table_id = str(table_id or "").strip() or None
-        normalized_database_name = str(database_name or "").strip() or None
-        normalized_schema_name = str(schema_name or "").strip() or None
-        normalized_table_name = str(table_name or "").strip() or None
-
-        normalized_spreadsheet_id = str(spreadsheet_id or "").strip() or None
-        normalized_drive_id = str(drive_id or "").strip() or None
-        normalized_item_id = str(item_id or "").strip() or None
-
-        if normalized_source_type in {
-            "GOOGLE_SHEETS",
-            "ONEDRIVE_EXCEL",
-        }:
-            if not normalized_sheet_name:
-                raise ValueError("sheet_name is required for spreadsheet sources.")
-            if safe_header_row is None:
-                safe_header_row = 1
-
-        if normalized_source_type == "GOOGLE_SHEETS" and not normalized_spreadsheet_id:
-            raise ValueError("spreadsheet_id is required for Google Sheets.")
-        if normalized_source_type == "ONEDRIVE_EXCEL" and (
-            not normalized_drive_id or not normalized_item_id
-        ):
-            raise ValueError("drive_id and item_id are required for OneDrive Excel.")
-        if normalized_source_type == "BIGQUERY" and not all(
-            [normalized_project_id, normalized_dataset_id, normalized_table_id]
-        ):
-            raise ValueError(
-                "project_id, dataset_id, and table_id are required for BigQuery."
+            self,
+            *,
+            organization_id: str,
+            profile_run_id: str,
+            profile_id: str | None = None,
+            source_type: str,
+            connection_id: str,
+            sheet_name: str | None = None,
+            header_row: int | None = None,
+            project_id: str | None = None,
+            dataset_id: str | None = None,
+            table_id: str | None = None,
+            database_name: str | None = None,
+            schema_name: str | None = None,
+            table_name: str | None = None,
+            spreadsheet_id: str | None = None,
+            drive_id: str | None = None,
+            item_id: str | None = None,
+        ) -> None:
+            """Persist the exact tenant-bound source target used by a profile."""
+            organization_id = self._require_organization_id(organization_id)
+            profile_run_id = self._require_profile_run_id(profile_run_id)
+            normalized_source_type = str(source_type or "").strip().upper()
+            normalized_connection_id = str(connection_id or "").strip()
+            normalized_sheet_name = str(sheet_name or "").strip()
+            safe_header_row = (
+                max(1, int(header_row))
+                if header_row is not None
+                else None
             )
-        if normalized_source_type == "SNOWFLAKE" and not all(
-            [normalized_database_name, normalized_schema_name, normalized_table_name]
-        ):
-            raise ValueError(
-                "database_name, schema_name, and table_name are required for Snowflake."
-            )
-        if normalized_source_type == "AZURE_SQL" and not all(
-            [normalized_database_name, normalized_schema_name, normalized_table_name]
-        ):
-            raise ValueError(
-                "database_name, schema_name, and table_name are required for Azure SQL."
+            normalized_profile_id = (
+                self._require_profile_id(profile_id)
+                if profile_id
+                else None
             )
 
-        self._ensure_profile_source_context_table()
+            if normalized_source_type not in {
+                "GOOGLE_SHEETS",
+                "ONEDRIVE_EXCEL",
+                "BIGQUERY",
+                "SNOWFLAKE",
+                "AZURE_SQL",
+            }:
+                raise ValueError("Unsupported profile source context type.")
+            if not normalized_connection_id:
+                raise ValueError("connection_id is required.")
+            normalized_project_id = str(project_id or "").strip() or None
+            normalized_dataset_id = str(dataset_id or "").strip() or None
+            normalized_table_id = str(table_id or "").strip() or None
+            normalized_database_name = str(database_name or "").strip() or None
+            normalized_schema_name = str(schema_name or "").strip() or None
+            normalized_table_name = str(table_name or "").strip() or None
 
-        merge_sql = f"""
-        MERGE `{self.profile_source_context_table_id}` AS target
-        USING (
-            SELECT @organization_id AS organization_id,
-                   @profile_run_id AS profile_run_id
-        ) AS source
-        ON target.organization_id = source.organization_id
-           AND target.profile_run_id = source.profile_run_id
-        WHEN MATCHED THEN UPDATE SET
-            source_type = @source_type,
-            connection_id = @connection_id,
-            profile_id = @profile_id,
-            project_id = @project_id,
-            dataset_id = @dataset_id,
-            table_id = @table_id,
-            database_name = @database_name,
-            schema_name = @schema_name,
-            table_name = @table_name,
-            spreadsheet_id = @spreadsheet_id,
-            drive_id = @drive_id,
-            item_id = @item_id,
-            sheet_name = @sheet_name,
-            header_row = @header_row,
-            updated_at = CURRENT_TIMESTAMP()
-        WHEN NOT MATCHED THEN INSERT (
-            organization_id, profile_run_id, profile_id, source_type, connection_id,
-            project_id, dataset_id, table_id,
-            database_name, schema_name, table_name,
-            spreadsheet_id, drive_id, item_id, sheet_name, header_row,
-            created_at, updated_at
-        ) VALUES (
-            @organization_id, @profile_run_id, @profile_id, @source_type, @connection_id,
-            @project_id, @dataset_id, @table_id,
-            @database_name, @schema_name, @table_name,
-            @spreadsheet_id, @drive_id, @item_id, @sheet_name, @header_row,
-            CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
-        )
-        """
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter("organization_id", "STRING", organization_id),
-                bigquery.ScalarQueryParameter("profile_run_id", "STRING", profile_run_id),
-                bigquery.ScalarQueryParameter("profile_id", "STRING", normalized_profile_id),
-                bigquery.ScalarQueryParameter("source_type", "STRING", normalized_source_type),
-                bigquery.ScalarQueryParameter("connection_id", "STRING", normalized_connection_id),
-                bigquery.ScalarQueryParameter("project_id", "STRING", normalized_project_id),
-                bigquery.ScalarQueryParameter("dataset_id", "STRING", normalized_dataset_id),
-                bigquery.ScalarQueryParameter("table_id", "STRING", normalized_table_id),
-                bigquery.ScalarQueryParameter("database_name", "STRING", normalized_database_name),
-                bigquery.ScalarQueryParameter("schema_name", "STRING", normalized_schema_name),
-                bigquery.ScalarQueryParameter("table_name", "STRING", normalized_table_name),
-                bigquery.ScalarQueryParameter("spreadsheet_id", "STRING", normalized_spreadsheet_id),
-                bigquery.ScalarQueryParameter("drive_id", "STRING", normalized_drive_id),
-                bigquery.ScalarQueryParameter("item_id", "STRING", normalized_item_id),
-                bigquery.ScalarQueryParameter("sheet_name", "STRING", normalized_sheet_name),
-                bigquery.ScalarQueryParameter("header_row", "INT64", safe_header_row),
-            ]
-        )
-        self.client.query(merge_sql, job_config=job_config).result()
+            normalized_spreadsheet_id = str(spreadsheet_id or "").strip() or None
+            normalized_drive_id = str(drive_id or "").strip() or None
+            normalized_item_id = str(item_id or "").strip() or None
+
+            if normalized_source_type in {
+                "GOOGLE_SHEETS",
+                "ONEDRIVE_EXCEL",
+            }:
+                if not normalized_sheet_name:
+                    raise ValueError("sheet_name is required for spreadsheet sources.")
+                if safe_header_row is None:
+                    safe_header_row = 1
+
+            if normalized_source_type == "GOOGLE_SHEETS" and not normalized_spreadsheet_id:
+                raise ValueError("spreadsheet_id is required for Google Sheets.")
+            if normalized_source_type == "ONEDRIVE_EXCEL" and (
+                not normalized_drive_id or not normalized_item_id
+            ):
+                raise ValueError("drive_id and item_id are required for OneDrive Excel.")
+            if normalized_source_type == "BIGQUERY" and not all(
+                [normalized_project_id, normalized_dataset_id, normalized_table_id]
+            ):
+                raise ValueError(
+                    "project_id, dataset_id, and table_id are required for BigQuery."
+                )
+            if normalized_source_type == "SNOWFLAKE" and not all(
+                [normalized_database_name, normalized_schema_name, normalized_table_name]
+            ):
+                raise ValueError(
+                    "database_name, schema_name, and table_name are required for Snowflake."
+                )
+            if normalized_source_type == "AZURE_SQL" and not all(
+                [normalized_database_name, normalized_schema_name, normalized_table_name]
+            ):
+                raise ValueError(
+                    "database_name, schema_name, and table_name are required for Azure SQL."
+                )
+
+            self._ensure_profile_source_context_table()
+
+            merge_sql = f"""
+            MERGE `{self.profile_source_context_table_id}` AS target
+            USING (
+                SELECT @organization_id AS organization_id,
+                    @profile_run_id AS profile_run_id
+            ) AS source
+            ON target.organization_id = source.organization_id
+            AND target.profile_run_id = source.profile_run_id
+            WHEN MATCHED THEN UPDATE SET
+                source_type = @source_type,
+                connection_id = @connection_id,
+                profile_id = @profile_id,
+                project_id = @project_id,
+                dataset_id = @dataset_id,
+                table_id = @table_id,
+                database_name = @database_name,
+                schema_name = @schema_name,
+                table_name = @table_name,
+                spreadsheet_id = @spreadsheet_id,
+                drive_id = @drive_id,
+                item_id = @item_id,
+                sheet_name = @sheet_name,
+                header_row = @header_row,
+                updated_at = CURRENT_TIMESTAMP()
+            WHEN NOT MATCHED THEN INSERT (
+                organization_id, profile_run_id, profile_id, source_type, connection_id,
+                project_id, dataset_id, table_id,
+                database_name, schema_name, table_name,
+                spreadsheet_id, drive_id, item_id, sheet_name, header_row,
+                created_at, updated_at
+            ) VALUES (
+                @organization_id, @profile_run_id, @profile_id, @source_type, @connection_id,
+                @project_id, @dataset_id, @table_id,
+                @database_name, @schema_name, @table_name,
+                @spreadsheet_id, @drive_id, @item_id, @sheet_name, @header_row,
+                CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
+            )
+            """
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("organization_id", "STRING", organization_id),
+                    bigquery.ScalarQueryParameter("profile_run_id", "STRING", profile_run_id),
+                    bigquery.ScalarQueryParameter("profile_id", "STRING", normalized_profile_id),
+                    bigquery.ScalarQueryParameter("source_type", "STRING", normalized_source_type),
+                    bigquery.ScalarQueryParameter("connection_id", "STRING", normalized_connection_id),
+                    bigquery.ScalarQueryParameter("project_id", "STRING", normalized_project_id),
+                    bigquery.ScalarQueryParameter("dataset_id", "STRING", normalized_dataset_id),
+                    bigquery.ScalarQueryParameter("table_id", "STRING", normalized_table_id),
+                    bigquery.ScalarQueryParameter("database_name", "STRING", normalized_database_name),
+                    bigquery.ScalarQueryParameter("schema_name", "STRING", normalized_schema_name),
+                    bigquery.ScalarQueryParameter("table_name", "STRING", normalized_table_name),
+                    bigquery.ScalarQueryParameter("spreadsheet_id", "STRING", normalized_spreadsheet_id),
+                    bigquery.ScalarQueryParameter("drive_id", "STRING", normalized_drive_id),
+                    bigquery.ScalarQueryParameter("item_id", "STRING", normalized_item_id),
+                    bigquery.ScalarQueryParameter("sheet_name", "STRING", normalized_sheet_name),
+                    bigquery.ScalarQueryParameter("header_row", "INT64", safe_header_row),
+                ]
+            )
+            self.client.query(merge_sql, job_config=job_config).result()
 
     def get_profile_source_context(
         self,
@@ -2020,19 +2777,19 @@ class QualityProfilerRepository:
 
     @staticmethod
     def _require_profile_run_id(
-        profile_run_id: str,
-    ) -> str:
-        normalized = str(profile_run_id or "").strip()
+            profile_run_id: str,
+        ) -> str:
+            normalized = str(profile_run_id or "").strip()
 
-        if not normalized:
-            raise ValueError("profile_run_id is required.")
+            if not normalized:
+                raise ValueError("profile_run_id is required.")
 
-        if not normalized.startswith("dqp_"):
-            raise ValueError(
-                "profile_run_id must use the dqp_ identifier standard."
-            )
+            if not normalized.startswith("dqp_"):
+                raise ValueError(
+                    "profile_run_id must use the dqp_ identifier standard."
+                )
 
-        return normalized
+            return normalized
 
     @staticmethod
     def _require_profile_id(profile_id: str) -> str:
@@ -4663,6 +5420,8 @@ class QualityProfilerRepository:
         safety_status: str,
         reasoning_summary: str | None,
         steward_approval_required: bool,
+        transformation_spec: dict[str, Any] | None = None,
+        artifact_hash: str | None = None,
     ) -> None:
         organization_id = (
             self._require_organization_id(
@@ -4688,6 +5447,10 @@ class QualityProfilerRepository:
                 @remediation_regex,
             remediation_artifact_type =
                 @artifact_type,
+            remediation_transformation_spec =
+                PARSE_JSON(@transformation_spec),
+            remediation_artifact_hash =
+                @artifact_hash,
             remediation_sql_dialect =
                 @sql_dialect,
             remediation_safety_status =
@@ -4747,6 +5510,25 @@ class QualityProfilerRepository:
                 "recommendation_id",
                 "STRING",
                 recommendation_id,
+            ),
+            bigquery.ScalarQueryParameter(
+                "transformation_spec",
+                "STRING",
+                (
+                    json.dumps(
+                        transformation_spec,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    )
+                    if transformation_spec is not None
+                    else None
+                ),
+            ),
+            bigquery.ScalarQueryParameter(
+                "artifact_hash",
+                "STRING",
+                artifact_hash,
             ),
         ]
 
@@ -4816,6 +5598,8 @@ class QualityProfilerRepository:
         *,
         organization_id: str,
         recommendation_id: str,
+        transformation_spec: dict[str, Any] | None = None,
+        artifact_hash: str | None = None,
         profile_run_id: str | None,
         artifact_type: str | None,
         remediation_sql: str | None,

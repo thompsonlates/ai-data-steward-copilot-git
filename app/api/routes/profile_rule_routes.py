@@ -15,7 +15,13 @@ from app.api.schemas import (
     ProfileRuleApproveRequest,
     ProfileRuleApproveResponse,
     ProfileRuleDiscoveryCandidateRequest,
+    ProfileRuleExceptionCreateRequest,
+    ProfileRuleExceptionDeactivateRequest,
+    ProfileRuleExceptionResponse,
+ActiveProfileRuleResponse,
+ProfileRuleGovernanceIdentityResponse,
 )
+
 from app.services.profile_rule_enhancement_service import (
     ProfileRuleEnhancementService,
 )
@@ -49,6 +55,172 @@ def _decode_json_value(value: Any) -> Any:
         return json.loads(value)
     except (TypeError, json.JSONDecodeError):
         return value
+
+def _profile_rule_exception_response(
+        row: dict[str, Any],
+    ) -> ProfileRuleExceptionResponse:
+        return ProfileRuleExceptionResponse(
+            exception_id=row["exception_id"],
+            organization_id=row["organization_id"],
+            profile_id=row["profile_id"],
+            rule_id=row["rule_id"],
+            rule_version=int(row["rule_version"]),
+            field_name=row["field_name"],
+            match_type=row["match_type"],
+            match_value=_decode_json_value(
+                row.get("match_value_json")
+            ),
+            reason=row["reason"],
+            status=row["status"],
+            created_by=row.get("created_by"),
+            created_at=row.get("created_at"),
+            approved_by=row.get("approved_by"),
+            approved_at=row.get("approved_at"),
+            deactivated_by=row.get("deactivated_by"),
+            deactivated_at=row.get("deactivated_at"),
+            deactivation_reason=row.get("deactivation_reason"),
+        )
+
+@router.post(
+    "/exceptions",
+    response_model=ProfileRuleExceptionResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_profile_rule_exception(
+    request: ProfileRuleExceptionCreateRequest,
+    current_user: AuthUser = Depends(
+        require_active_product_access
+    ),
+) -> ProfileRuleExceptionResponse:
+    organization_id = require_current_organization_id(
+        current_user
+    )
+
+    approved_by = str(
+        current_user.email or ""
+    ).strip()
+
+    if not approved_by:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Authenticated user email is required "
+                "to approve a steward exception."
+            ),
+        )
+
+    try:
+        exception = (
+            quality_profiler_repository
+            .create_active_profile_rule_exception(
+                organization_id=organization_id,
+                profile_id=request.profile_id,
+                rule_id=request.rule_id,
+                rule_version=request.rule_version,
+                field_name=request.field_name,
+                match_type=request.match_type,
+                match_value=request.match_value,
+                reason=request.reason,
+                approved_by=approved_by,
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+
+    return _profile_rule_exception_response(
+        exception
+    )
+
+
+@router.get(
+    "/exceptions",
+    response_model=list[ProfileRuleExceptionResponse],
+)
+def list_profile_rule_exceptions(
+    profile_id: str,
+    rule_id: str | None = None,
+    rule_version: int | None = None,
+    current_user: AuthUser = Depends(
+        require_active_product_access
+    ),
+) -> list[ProfileRuleExceptionResponse]:
+    organization_id = require_current_organization_id(
+        current_user
+    )
+
+    try:
+        exceptions = (
+            quality_profiler_repository
+            .list_active_profile_rule_exceptions(
+                organization_id=organization_id,
+                profile_id=profile_id,
+                rule_id=rule_id,
+                rule_version=rule_version,
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    return [
+        _profile_rule_exception_response(row)
+        for row in exceptions
+    ]
+
+
+@router.post(
+    "/exceptions/{exception_id}/deactivate",
+    response_model=ProfileRuleExceptionResponse,
+)
+def deactivate_profile_rule_exception(
+    exception_id: str,
+    request: ProfileRuleExceptionDeactivateRequest,
+    current_user: AuthUser = Depends(
+        require_active_product_access
+    ),
+) -> ProfileRuleExceptionResponse:
+    organization_id = require_current_organization_id(
+        current_user
+    )
+
+    deactivated_by = str(
+        current_user.email or ""
+    ).strip()
+
+    if not deactivated_by:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Authenticated user email is required "
+                "to deactivate a steward exception."
+            ),
+        )
+
+    try:
+        exception = (
+            quality_profiler_repository
+            .deactivate_profile_rule_exception(
+                organization_id=organization_id,
+                profile_id=request.profile_id,
+                exception_id=exception_id,
+                deactivated_by=deactivated_by,
+                reason=request.reason,
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+
+    return _profile_rule_exception_response(
+        exception
+    )
 
 @router.post(
     "/discovery-candidates",
@@ -135,11 +307,18 @@ def create_discovery_candidate(
         )
 
     except ValueError as exc:
+        import traceback
+        print(
+            "[DISCOVERY CANDIDATE 400]",
+            repr(exc),
+            flush=True,
+        )
+        traceback.print_exc()
+
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=400,
             detail=str(exc),
         ) from exc
-
 @router.post(
     "/analyze",
     response_model=ProfileRuleCandidateResponse,
@@ -860,6 +1039,90 @@ def reject_profile_rule_candidate(
         requires_reprofile=False,
     )
 
+@router.get(
+    "/active",
+    response_model=list[ActiveProfileRuleResponse],
+)
+def list_active_profile_rules(
+    profile_id: str,
+    field_name: str | None = None,
+    current_user: AuthUser = Depends(
+        require_active_product_access
+    ),
+):
+    organization_id = require_current_organization_id(
+        current_user
+    )
+
+    rows = (
+        quality_profiler_repository
+        .list_active_profile_rules(
+            organization_id=organization_id,
+            profile_id=profile_id,
+            field_name=field_name,
+        )
+    )
+
+    return [
+        ActiveProfileRuleResponse(
+            rule_id=row["rule_id"],
+            version=int(row["version"]),
+            logical_key=row["logical_key"],
+            scope=row["scope"],
+            family=row["family"],
+            evaluator=row["evaluator"],
+            status=row["status"],
+            severity=row["severity"],
+            domain=row["domain"],
+            field_name=row["field_name"],
+            description=row.get("description"),
+            remediation_available=bool(
+                row.get("remediation_available")
+            ),
+            remediation_type=row.get(
+                "remediation_type"
+            ),
+        )
+        for row in rows
+    ]
+
+@router.get(
+    "/candidates/{candidate_id}/governance-identity",
+    response_model=ProfileRuleGovernanceIdentityResponse,
+)
+def resolve_profile_rule_governance_identity(
+    candidate_id: str,
+    current_user: AuthUser = Depends(
+        require_active_product_access
+    ),
+):
+    organization_id = require_current_organization_id(
+        current_user
+    )
+
+    resolved_by = str(
+        current_user.email
+        or current_user.user_id
+        or ""
+    ).strip()
+
+    if not resolved_by:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Authenticated user identity is required "
+                "for governance resolution."
+            ),
+        )
+
+    return profile_rule_enhancement_service.resolve_candidate_governance_identity(
+        organization_id=organization_id,
+        candidate_id=candidate_id,
+        resolved_by=resolved_by,
+    )
+
+
+
 @router.post(
     "/{candidate_id}/approve",
     response_model=ProfileRuleApproveResponse,
@@ -904,6 +1167,7 @@ def approve_profile_rule_candidate(
             candidate_id=result["candidate_id"],
             rule_id=result["rule_id"],
             profile_id=result["profile_id"],
+            logical_key=result["logical_key"],
             profile_run_id=result["profile_run_id"],
             scope=result["scope"],
             status=result["status"],
